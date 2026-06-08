@@ -19,6 +19,18 @@ def require_worker_token(authorization: str | None = Header(default=None)) -> No
         raise HTTPException(status_code=401, detail="Invalid worker token")
 
 
+def generate_worker_registration_code() -> str:
+    return f"wrc_{secrets.token_urlsafe(24)}"
+
+
+def generate_worker_token() -> str:
+    return f"wkt_{secrets.token_urlsafe(40)}"
+
+
+def hash_worker_secret(value: str) -> str:
+    return hmac.new(settings.app_secret_key.encode("utf-8"), value.encode("utf-8"), hashlib.sha256).hexdigest()
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
     digest = hashlib.pbkdf2_hmac(

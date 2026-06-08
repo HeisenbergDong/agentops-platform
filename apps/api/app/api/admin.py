@@ -5,8 +5,9 @@ from sqlalchemy.orm import Session
 from app.api.auth import serialize_user
 from app.api.deps import require_admin
 from app.core.security import hash_password
-from app.db.models import User
+from app.db.models import User, WorkerRegistrationCode
 from app.db.repositories.users import get_user_by_email, list_users
+from app.db.repositories.workers import bind_worker, create_registration_code, list_registration_codes
 from app.db.session import get_db
 
 router = APIRouter()
@@ -24,6 +25,15 @@ class UpdateUserRequest(BaseModel):
     password: str | None = None
     role: str | None = None
     is_active: bool | None = None
+
+
+class CreateWorkerRegistrationCodeRequest(BaseModel):
+    assigned_user_id: str | None = None
+    expires_minutes: int = 60
+
+
+class BindWorkerRequest(BaseModel):
+    user_id: str | None = None
 
 
 @router.get("/users")
@@ -58,6 +68,64 @@ def admin_create_user(
     db.commit()
     db.refresh(user)
     return serialize_user(user)
+
+
+@router.post("/worker-registration-codes")
+def admin_create_worker_registration_code(
+    payload: CreateWorkerRegistrationCodeRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    assigned_user_id = payload.assigned_user_id
+    if assigned_user_id and not db.get(User, assigned_user_id):
+        raise HTTPException(status_code=404, detail="Assigned user not found")
+    code, row = create_registration_code(
+        db,
+        created_by=admin.id,
+        assigned_user_id=assigned_user_id,
+        expires_minutes=max(5, min(payload.expires_minutes, 24 * 60)),
+    )
+    return {"registration_code": code, "record": serialize_registration_code(row)}
+
+
+@router.get("/worker-registration-codes")
+def admin_list_worker_registration_codes(
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    return [serialize_registration_code(item) for item in list_registration_codes(db)]
+
+
+@router.patch("/workers/{worker_id}/bind")
+def admin_bind_worker(
+    worker_id: str,
+    payload: BindWorkerRequest,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    if payload.user_id and not db.get(User, payload.user_id):
+        raise HTTPException(status_code=404, detail="User not found")
+    worker = bind_worker(db, worker_id=worker_id, user_id=payload.user_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return {
+        "id": worker.id,
+        "worker_id": worker.worker_id,
+        "user_id": worker.user_id,
+        "status": worker.status,
+    }
+
+
+def serialize_registration_code(item: WorkerRegistrationCode) -> dict:
+    return {
+        "id": item.id,
+        "assigned_user_id": item.assigned_user_id,
+        "expires_at": item.expires_at.isoformat(),
+        "used_at": item.used_at.isoformat() if item.used_at else None,
+        "used_by_worker_id": item.used_by_worker_id,
+        "status": item.status,
+        "created_at": item.created_at.isoformat(),
+    }
 
 
 @router.patch("/users/{user_id}")

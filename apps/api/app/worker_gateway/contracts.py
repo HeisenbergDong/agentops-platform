@@ -39,7 +39,41 @@ class WorkerResult(BaseModel):
 class WorkerHeartbeat(BaseModel):
     worker_id: str
     machine_name: str
+    display_name: str = ""
+    worker_type: str = "windows_trae"
+    machine_fingerprint: str = ""
+    version: str = ""
     supported_apps: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
     current_stage: str = "idle"
     current_window_title: str = ""
     busy: bool = False
+
+
+class WorkerRegisterRequest(BaseModel):
+    registration_code: str
+    worker_id: str = ""
+    display_name: str = ""
+    worker_type: str = "windows_trae"
+    machine_name: str
+    machine_fingerprint: str = ""
+    version: str = ""
+    supported_apps: list[str] = Field(default_factory=list)
+    capabilities: list[str] = Field(default_factory=list)
+
+
+class CreateWorkerCommandRequest(BaseModel):
+    type: WorkerCommandType = WorkerCommandType.DIAGNOSE_UI
+    payload: dict[str, Any] = Field(default_factory=dict)
+    job_id: str | None = None
+    round_id: str | None = None
+
+
+class WorkerLogEntry(BaseModel):
+    command_id: str | None = None
+    job_id: str | None = None
+    round_id: str | None = None
+    level: str = "info"
+    stage: str = "worker"
+    message: str
+    extra: dict[str, Any] = Field(default_factory=dict)

@@ -31,6 +31,26 @@ def ensure_schema_extensions() -> None:
         statements.append("alter table users add column auth_token_version integer not null default 0")
     if "last_login_at" not in columns:
         statements.append("alter table users add column last_login_at timestamp with time zone null")
+    if "workers" in inspector.get_table_names():
+        worker_columns = {item["name"] for item in inspector.get_columns("workers")}
+        if "token_hash" not in worker_columns:
+            statements.append("alter table workers add column token_hash varchar(128) not null default ''")
+        if "display_name" not in worker_columns:
+            statements.append("alter table workers add column display_name varchar(255) not null default ''")
+        if "worker_type" not in worker_columns:
+            statements.append("alter table workers add column worker_type varchar(64) not null default 'windows_trae'")
+        if "machine_fingerprint" not in worker_columns:
+            statements.append("alter table workers add column machine_fingerprint varchar(512) not null default ''")
+        if "version" not in worker_columns:
+            statements.append("alter table workers add column version varchar(64) not null default ''")
+        if "capabilities" not in worker_columns:
+            statements.append("alter table workers add column capabilities json not null default '[]'::json")
+        if "status" not in worker_columns:
+            statements.append("alter table workers add column status varchar(32) not null default 'online'")
+        if "registered_at" not in worker_columns:
+            statements.append("alter table workers add column registered_at timestamp with time zone not null default now()")
+        if "revoked_at" not in worker_columns:
+            statements.append("alter table workers add column revoked_at timestamp with time zone null")
     if not statements:
         return
     with engine.begin() as connection:

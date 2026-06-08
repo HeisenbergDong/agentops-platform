@@ -9,6 +9,8 @@ from app.db.models.entities import (
     User,
     UserConfig,
     Worker,
+    WorkerCommand,
+    WorkerRegistrationCode,
 )
 
 __all__ = [
@@ -22,4 +24,6 @@ __all__ = [
     "User",
     "UserConfig",
     "Worker",
+    "WorkerCommand",
+    "WorkerRegistrationCode",
 ]

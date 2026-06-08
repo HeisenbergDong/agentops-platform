@@ -36,12 +36,51 @@ class Worker(IdMixin, TimestampMixin, Base):
 
     worker_id: Mapped[str] = mapped_column(String(128), unique=True, index=True)
     user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    token_hash: Mapped[str] = mapped_column(String(128), default="", index=True)
+    display_name: Mapped[str] = mapped_column(String(255), default="")
+    worker_type: Mapped[str] = mapped_column(String(64), default="windows_trae")
     machine_name: Mapped[str] = mapped_column(String(255))
+    machine_fingerprint: Mapped[str] = mapped_column(String(512), default="")
+    version: Mapped[str] = mapped_column(String(64), default="")
     supported_apps: Mapped[list[str]] = mapped_column(JSON, default=list)
+    capabilities: Mapped[list[str]] = mapped_column(JSON, default=list)
+    status: Mapped[str] = mapped_column(String(32), default="online", index=True)
     current_stage: Mapped[str] = mapped_column(String(128), default="idle")
     current_window_title: Mapped[str] = mapped_column(String(512), default="")
     busy: Mapped[bool] = mapped_column(Boolean, default=False)
     last_seen_at: Mapped[datetime] = mapped_column(default=now_utc)
+    registered_at: Mapped[datetime] = mapped_column(default=now_utc)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class WorkerRegistrationCode(IdMixin, TimestampMixin, Base):
+    __tablename__ = "worker_registration_codes"
+
+    code_hash: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    created_by: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    assigned_user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True))
+    used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    used_by_worker_id: Mapped[str | None] = mapped_column(String(128), nullable=True)
+    status: Mapped[str] = mapped_column(String(32), default="active", index=True)
+
+
+class WorkerCommand(IdMixin, TimestampMixin, Base):
+    __tablename__ = "worker_commands"
+
+    worker_id: Mapped[str] = mapped_column(String(128), index=True)
+    user_id: Mapped[str | None] = mapped_column(ForeignKey("users.id"), nullable=True)
+    job_id: Mapped[str | None] = mapped_column(ForeignKey("jobs.id"), nullable=True)
+    round_id: Mapped[str | None] = mapped_column(ForeignKey("task_rounds.id"), nullable=True)
+    command_type: Mapped[str] = mapped_column(String(128))
+    payload: Mapped[dict] = mapped_column(JSON, default=dict)
+    status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
+    attempts: Mapped[int] = mapped_column(Integer, default=0)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    message: Mapped[str] = mapped_column(Text, default="")
+    result: Mapped[dict] = mapped_column(JSON, default=dict)
+    error: Mapped[str] = mapped_column(Text, default="")
 
 
 class RuleVersion(IdMixin, TimestampMixin, Base):
