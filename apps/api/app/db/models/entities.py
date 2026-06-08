@@ -122,6 +122,18 @@ class UserRuleFile(IdMixin, TimestampMixin, Base):
     config: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class RoleChatMessage(IdMixin, TimestampMixin, Base):
+    __tablename__ = "role_chat_messages"
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    role_key: Mapped[str] = mapped_column(String(128), index=True)
+    sender: Mapped[str] = mapped_column(String(32), default="user")
+    message: Mapped[str] = mapped_column(Text, default="")
+    mode: Mapped[str] = mapped_column(String(64), default="record_only")
+    target_rule: Mapped[str] = mapped_column(String(255), default="")
+    action: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RuleVersion(IdMixin, TimestampMixin, Base):
     __tablename__ = "rule_versions"
 

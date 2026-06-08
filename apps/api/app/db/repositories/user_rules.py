@@ -2,6 +2,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.db.models import UserRuleFile
+from app.db.models.base import now_utc
 from app.services.rules.loader import RuleLoader
 
 
@@ -72,6 +73,21 @@ def create_user_rule_file(db: Session, user_id: str, name: str, content: str) ->
 
 def update_user_rule_file(db: Session, item: UserRuleFile, content: str) -> UserRuleFile:
     item.content = content
+    db.commit()
+    db.refresh(item)
+    return item
+
+
+def append_user_rule_note(
+    db: Session,
+    item: UserRuleFile,
+    note: str,
+    heading: str = "Manual Capability Note",
+) -> UserRuleFile:
+    stamp = now_utc().replace(microsecond=0).isoformat()
+    clean_note = note.strip()
+    block = f"\n\n## {heading} - {stamp}\n\n{clean_note}\n"
+    item.content = f"{item.content.rstrip()}{block}"
     db.commit()
     db.refresh(item)
     return item

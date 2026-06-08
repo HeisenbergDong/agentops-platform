@@ -68,6 +68,31 @@ body,
   cursor: pointer;
 }
 
+.chat-panel {
+  min-height: 260px;
+  max-height: 360px;
+  overflow: auto;
+  border: 1px solid #edf0f5;
+  border-radius: 6px;
+  padding: 12px;
+  background: #fff;
+}
+
+.chat-message {
+  margin-bottom: 12px;
+  padding: 10px;
+  border-radius: 6px;
+  background: #f5f7fb;
+}
+
+.chat-message.user {
+  background: #eef4ff;
+}
+
+.chat-message.assistant {
+  background: #f6ffed;
+}
+
 .center-screen,
 .login-screen {
   min-height: 100vh;
