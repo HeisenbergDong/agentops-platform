@@ -83,6 +83,18 @@ class WorkerCommand(IdMixin, TimestampMixin, Base):
     error: Mapped[str] = mapped_column(Text, default="")
 
 
+class RoleTemplate(IdMixin, TimestampMixin, Base):
+    __tablename__ = "role_templates"
+
+    role_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    purpose: Mapped[str] = mapped_column(Text, default="")
+    rules: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    model_config_key: Mapped[str] = mapped_column(String(128), default="default")
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RuleVersion(IdMixin, TimestampMixin, Base):
     __tablename__ = "rule_versions"
 

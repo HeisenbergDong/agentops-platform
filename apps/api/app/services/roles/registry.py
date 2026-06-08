@@ -1,4 +1,4 @@
-from dataclasses import dataclass
+from dataclasses import asdict, dataclass
 
 
 @dataclass(frozen=True)
@@ -7,6 +7,11 @@ class RoleDefinition:
     name: str
     rules: list[str]
     purpose: str
+    enabled: bool = True
+    model_config_key: str = "default"
+
+    def to_dict(self) -> dict:
+        return asdict(self)
 
 
 ROLE_REGISTRY: list[RoleDefinition] = [
@@ -14,49 +19,49 @@ ROLE_REGISTRY: list[RoleDefinition] = [
         key="orchestrator",
         name="主调度角色",
         rules=["01_global_rules.md", "02_orchestrator_rules.md", "12_state_machine_rules.yaml"],
-        purpose="Owns state transitions and decides which role or worker command runs next.",
+        purpose="负责状态流转、任务拆解，并决定下一步调用哪个角色或 Worker。",
     ),
     RoleDefinition(
         key="rule_collector",
         name="规则采集角色",
         rules=["00_framework_capabilities.md", "03_rule_collector_rules.md"],
-        purpose="Reads online or local documents and turns them into rule change proposals.",
+        purpose="读取在线或本地需求文档，拆分并生成规则修改建议。",
     ),
     RoleDefinition(
         key="prompt_writer",
-        name="写提示词角色",
+        name="提示词编写角色",
         rules=["01_global_rules.md", "04_prompt_generation_rules.md"],
-        purpose="Generates first-round, follow-up, and bugfix prompts.",
+        purpose="根据用户配置、规则和上下文生成首轮、追问、修复类 Prompt。",
     ),
     RoleDefinition(
         key="product_reviewer",
         name="成果检查角色",
         rules=["06_product_review_rules.md", "07_browser_acceptance_rules.md"],
-        purpose="Reviews code, build/test evidence, screenshots, and browser acceptance.",
+        purpose="检查代码、构建测试证据、截图和浏览器验收结果。",
     ),
     RoleDefinition(
         key="dissatisfaction_writer",
         name="不满意原因角色",
         rules=["08_dissatisfaction_reason_rules.md"],
-        purpose="Writes human-style dissatisfaction reasons from real evidence.",
+        purpose="根据真实证据生成结构化、自然的不满意原因。",
     ),
     RoleDefinition(
         key="github_submitter",
         name="GitHub 提交角色",
         rules=["09_github_rules.md"],
-        purpose="Prepares and validates GitHub submission decisions.",
+        purpose="根据任务和规则决定提交目标、分支、commit、push 和结果链接。",
     ),
     RoleDefinition(
         key="feishu_writer",
         name="飞书写入角色",
         rules=["10_feishu_write_rules.md"],
-        purpose="Maps fields, validates data, uploads attachments, and writes Feishu records.",
+        purpose="刷新飞书 token、发现资源、映射字段并写入多维表格。",
     ),
     RoleDefinition(
         key="worker_controller",
-        name="Windows Worker 角色",
+        name="Worker 控制角色",
         rules=["11_worker_trae_cn_rules.md"],
-        purpose="Decides safe Trae CN GUI actions from screenshots and UI signals.",
+        purpose="根据截图、日志和 UI 信号决定 Trae CN / Windows Worker 的安全操作。",
     ),
 ]
 

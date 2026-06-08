@@ -6,6 +6,7 @@ from app.db.models.base import now_utc
 from app.db.session import Base, engine
 from app.core.config import settings
 from app.core.security import hash_password
+from app.db.repositories.roles import ensure_role_templates
 from app.services.rules.loader import RuleLoader
 
 
@@ -121,3 +122,4 @@ def bootstrap_database() -> None:
         admin = ensure_admin_user(db)
         ensure_dev_user(db)
         ensure_initial_rule_version(db, admin)
+        ensure_role_templates(db)
