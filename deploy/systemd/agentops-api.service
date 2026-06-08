@@ -1,0 +1,16 @@
+[Unit]
+Description=AgentOps Platform API
+After=network-online.target docker.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+WorkingDirectory=/opt/agentops-platform/apps/api
+Environment=PYTHONUNBUFFERED=1
+EnvironmentFile=-/opt/agentops-platform/.env
+ExecStart=/opt/agentops-platform/apps/api/.venv/bin/uvicorn app.main:app --host 127.0.0.1 --port 8000
+Restart=always
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
