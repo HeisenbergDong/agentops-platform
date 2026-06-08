@@ -6,11 +6,21 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
 from app.db.models import Job, User
-from app.db.repositories.jobs import add_log, create_job, current_job, latest_round, list_logs
+from app.db.repositories.jobs import (
+    add_log,
+    cleanup_user_runtime_state,
+    create_job,
+    current_active_job,
+    current_job,
+    latest_round,
+    list_logs,
+)
 from app.db.repositories.rules import active_rule_version
+from app.db.repositories.workers import create_worker_command, get_worker_by_worker_id
 from app.db.session import get_db
 from app.services.orchestrator.states import JobState
 from app.services.user_settings import load_user_settings, readiness
+from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType
 
 router = APIRouter()
 
@@ -21,12 +31,25 @@ class StartJobRequest(BaseModel):
 
 @router.post("/start")
 def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    directions = [item.strip() for item in payload.directions if item.strip()]
+    if not directions:
+        raise HTTPException(status_code=400, detail="At least one direction is required")
+    cleanup = cleanup_user_runtime_state(db, user.id)
     rule_version = active_rule_version(db)
     job = create_job(
         db,
         user_id=user.id,
-        directions=payload.directions,
+        directions=directions,
         rule_version_id=rule_version.id if rule_version else None,
+    )
+    round_ = latest_round(db, job.id)
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.CLEANING_OLD_RUNTIME,
+        message="Start requested; old runtime logs, attachments, errors, and pending worker commands were cleaned.",
+        extra=cleanup,
     )
     settings_status = readiness(load_user_settings(db, user.id))
     message = "User settings loaded for this job."
@@ -40,7 +63,25 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
         level="warning" if not settings_status["complete"] else "info",
         extra=settings_status,
     )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.LOADING_RULES,
+        message="User roles and rule files are ready for orchestration.",
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GENERATING_PROMPT,
+        message="Prompt generation is the next scheduler step.",
+    )
+    job.status = JobState.GENERATING_PROMPT
+    if round_:
+        round_.status = JobState.GENERATING_PROMPT
     db.commit()
+    db.refresh(job)
     return serialize_job(db, job)
 
 
@@ -50,10 +91,12 @@ def continue_job(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    job = current_job(db, user.id)
+    job = current_active_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to continue."}
     round_ = latest_round(db, job.id)
+    if job.status == JobState.STOPPED:
+        return {"status": "no_job", "message": "Stopped jobs cannot be continued; start a new job."}
     add_log(
         db,
         job_id=job.id,
@@ -61,7 +104,11 @@ def continue_job(
         stage=JobState.LOADING_RULES,
         message="Continue requested; existing state preserved.",
     )
+    job.status = JobState.LOADING_RULES
+    if round_:
+        round_.status = JobState.LOADING_RULES
     db.commit()
+    db.refresh(job)
     return serialize_job(db, job)
 
 
@@ -71,7 +118,7 @@ def stop_job(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    job = current_job(db, user.id)
+    job = current_active_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to stop."}
     job.status = JobState.STOPPED
@@ -85,6 +132,25 @@ def stop_job(
         stage=JobState.STOPPED,
         message="Stop requested; scheduler and worker should stop current activity.",
     )
+    command = enqueue_stop_worker_command(db, user.id, job.id, round_.id if round_ else None)
+    if command:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="worker_stop_command",
+            message="Stop command queued for bound worker.",
+            extra={"worker_id": command.worker_id, "command_id": command.id},
+        )
+    else:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="worker_stop_command",
+            message="No bound worker found; scheduler state stopped only.",
+            level="warning",
+        )
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -149,3 +215,24 @@ def serialize_log(item) -> dict:
         "extra": item.extra,
         "created_at": item.created_at.isoformat(),
     }
+
+
+def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id: str | None):
+    settings = load_user_settings(db, user_id)
+    worker_id = settings.get("worker", {}).get("worker_id")
+    if not worker_id:
+        return None
+    worker = get_worker_by_worker_id(db, worker_id)
+    if not worker or worker.user_id != user_id:
+        return None
+    return create_worker_command(
+        db,
+        worker_id=worker.worker_id,
+        user_id=user_id,
+        payload=CreateWorkerCommandRequest(
+            type=WorkerCommandType.STOP_CURRENT_TASK,
+            job_id=job_id,
+            round_id=round_id,
+            payload={"reason": "user_stop"},
+        ),
+    )

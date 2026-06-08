@@ -1,8 +1,11 @@
-from sqlalchemy import desc, select
+from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Job, RuntimeLog, TaskRound
+from app.db.models import Attachment, AutomationError, Job, RuntimeLog, TaskRound, WorkerCommand
 from app.services.orchestrator.states import JobState
+
+TERMINAL_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
+ACTIVE_COMMAND_STATES = {"queued", "claimed", "running"}
 
 
 def create_job(db: Session, user_id: str, directions: list[str], rule_version_id: str | None) -> Job:
@@ -37,6 +40,64 @@ def current_job(db: Session, user_id: str) -> Job | None:
         .order_by(desc(Job.created_at))
         .limit(1)
     )
+
+
+def current_active_job(db: Session, user_id: str) -> Job | None:
+    return db.scalar(
+        select(Job)
+        .where(Job.user_id == user_id, Job.status.not_in([str(item) for item in TERMINAL_STATES]))
+        .order_by(desc(Job.created_at))
+        .limit(1)
+    )
+
+
+def cleanup_user_runtime_state(db: Session, user_id: str) -> dict:
+    jobs = list(db.scalars(select(Job).where(Job.user_id == user_id)).all())
+    job_ids = [job.id for job in jobs]
+    stopped_jobs = 0
+    for job in jobs:
+        if job.status not in TERMINAL_STATES:
+            job.status = JobState.STOPPED
+            stopped_jobs += 1
+
+    cancelled_commands = 0
+    commands = list(
+        db.scalars(
+            select(WorkerCommand).where(
+                WorkerCommand.user_id == user_id,
+                WorkerCommand.status.in_(ACTIVE_COMMAND_STATES),
+            )
+        ).all()
+    )
+    for command in commands:
+        command.status = "cancelled"
+        command.message = "Cancelled by Start cleanup."
+        cancelled_commands += 1
+
+    deleted_logs = 0
+    deleted_errors = 0
+    deleted_attachments = 0
+    if job_ids:
+        deleted_logs = db.execute(delete(RuntimeLog).where(RuntimeLog.job_id.in_(job_ids))).rowcount or 0
+        deleted_errors = db.execute(delete(AutomationError).where(AutomationError.job_id.in_(job_ids))).rowcount or 0
+        deleted_attachments = (
+            db.execute(
+                delete(Attachment).where(
+                    (Attachment.user_id == user_id) | (Attachment.job_id.in_(job_ids))
+                )
+            ).rowcount
+            or 0
+        )
+    else:
+        deleted_attachments = db.execute(delete(Attachment).where(Attachment.user_id == user_id)).rowcount or 0
+
+    return {
+        "stopped_jobs": stopped_jobs,
+        "cancelled_commands": cancelled_commands,
+        "deleted_logs": deleted_logs,
+        "deleted_errors": deleted_errors,
+        "deleted_attachments": deleted_attachments,
+    }
 
 
 def latest_round(db: Session, job_id: str) -> TaskRound | None:
