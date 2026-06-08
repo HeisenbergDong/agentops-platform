@@ -10,6 +10,7 @@ from app.db.repositories.jobs import add_log, create_job, current_job, latest_ro
 from app.db.repositories.rules import active_rule_version
 from app.db.session import get_db
 from app.services.orchestrator.states import JobState
+from app.services.user_settings import load_user_settings, readiness
 
 router = APIRouter()
 
@@ -27,6 +28,19 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
         directions=payload.directions,
         rule_version_id=rule_version.id if rule_version else None,
     )
+    settings_status = readiness(load_user_settings(db, user.id))
+    message = "User settings loaded for this job."
+    if not settings_status["complete"]:
+        message = "User settings are incomplete; scheduler will continue with warnings."
+    add_log(
+        db,
+        job_id=job.id,
+        stage="user_settings",
+        message=message,
+        level="warning" if not settings_status["complete"] else "info",
+        extra=settings_status,
+    )
+    db.commit()
     return serialize_job(db, job)
 
 

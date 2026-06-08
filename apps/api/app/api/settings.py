@@ -1,23 +1,19 @@
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel, Field
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
-from app.core.secrets import mask_secret, open_secret, seal_secret
 from app.db.models import User
-from app.db.repositories.users import list_user_configs, upsert_user_config
 from app.db.session import get_db
+from app.services.feishu.discovery import FeishuDiscoveryError, discover_feishu_resources
+from app.services.user_settings import (
+    load_user_settings,
+    public_user_settings,
+    readiness,
+    save_user_settings,
+)
 
 router = APIRouter()
-
-SECRET_FIELDS = {
-    "model": {"api_key"},
-    "github": {"token"},
-    "feishu": {"app_secret"},
-    "webhook": {"secret"},
-}
-
-CATEGORIES = ("model", "github", "feishu", "webhook", "trae")
 
 
 class SettingsUpdate(BaseModel):
@@ -25,13 +21,18 @@ class SettingsUpdate(BaseModel):
     github: dict = Field(default_factory=dict)
     feishu: dict = Field(default_factory=dict)
     webhook: dict = Field(default_factory=dict)
+    worker: dict = Field(default_factory=dict)
+    defaults: dict = Field(default_factory=dict)
     trae: dict = Field(default_factory=dict)
 
 
 @router.get("")
 def get_settings(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
-    configs = {item.category: item.data for item in list_user_configs(db, user.id)}
-    return {category: _public_config(category, configs.get(category, {})) for category in CATEGORIES}
+    configs = load_user_settings(db, user.id)
+    return {
+        "sections": public_user_settings(configs),
+        "readiness": readiness(configs),
+    }
 
 
 @router.put("")
@@ -40,34 +41,30 @@ def save_settings(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    existing = {item.category: item.data for item in list_user_configs(db, user.id)}
-    incoming = payload.model_dump()
-    for category in CATEGORIES:
-        merged = dict(existing.get(category, {}))
-        for key, value in incoming.get(category, {}).items():
-            if key.endswith("_configured") or key.endswith("_mask"):
-                continue
-            if key in SECRET_FIELDS.get(category, set()):
-                if value:
-                    merged[key] = seal_secret(str(value))
-                continue
-            merged[key] = value
-        upsert_user_config(db, user.id, category, merged)
+    save_user_settings(db, user.id, payload.model_dump())
     db.commit()
     return get_settings(user, db)
 
 
-def _public_config(category: str, data: dict) -> dict:
-    result: dict = {}
-    secret_fields = SECRET_FIELDS.get(category, set())
-    for key, value in data.items():
-        if key in secret_fields:
-            plain = open_secret(value)
-            result[f"{key}_configured"] = bool(plain)
-            result[f"{key}_mask"] = mask_secret(plain)
-        else:
-            result[key] = value
-    for key in secret_fields:
-        result.setdefault(f"{key}_configured", False)
-        result.setdefault(f"{key}_mask", "")
-    return result
+@router.post("/feishu/discover")
+def discover_feishu(
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    configs = load_user_settings(db, user.id)
+    feishu = dict(configs.get("feishu", {}))
+    try:
+        discovered = discover_feishu_resources(feishu)
+    except FeishuDiscoveryError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Feishu discovery failed: {exc}") from exc
+    feishu.update(discovered)
+    save_user_settings(db, user.id, {"feishu": feishu}, allow_internal=True)
+    db.commit()
+    configs = load_user_settings(db, user.id)
+    return {
+        "status": "ok",
+        "feishu": public_user_settings(configs)["feishu"],
+        "resources": configs.get("feishu", {}).get("discovered_resources", {}),
+    }
