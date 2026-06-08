@@ -1,6 +1,6 @@
-import { PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
+import { CloudSyncOutlined, PlusOutlined, ReloadOutlined, SaveOutlined } from "@ant-design/icons";
 import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
-import { Button, Card, Col, Form, Input, List, Modal, Row, Space, Tag, Typography, message } from "antd";
+import { Alert, Button, Card, Col, Form, Input, List, Modal, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
 
@@ -31,12 +31,36 @@ type CreateRuleValues = {
   content: string;
 };
 
+type CollectValues = {
+  source_type: "url" | "text";
+  source: string;
+};
+
+type RuleChange = {
+  rule_name: string;
+  title: string;
+  reason: string;
+  content: string;
+};
+
+type CollectProposal = {
+  status: string;
+  summary: string;
+  changes: RuleChange[];
+  warnings: string[];
+  model?: string;
+  wire_api?: string;
+};
+
 export function RulesPage() {
   const queryClient = useQueryClient();
   const [activeRule, setActiveRule] = useState<Rule | null>(null);
   const [createOpen, setCreateOpen] = useState(false);
+  const [collectOpen, setCollectOpen] = useState(false);
+  const [proposal, setProposal] = useState<CollectProposal | null>(null);
   const [form] = Form.useForm<RuleFormValues>();
   const [createForm] = Form.useForm<CreateRuleValues>();
+  const [collectForm] = Form.useForm<CollectValues>();
 
   const rules = useQuery({
     queryKey: ["rules"],
@@ -98,6 +122,27 @@ export function RulesPage() {
     }
   });
 
+  const collectRules = useMutation({
+    mutationFn: async (values: CollectValues) => (await api.post<CollectProposal>("/rules/collect", values)).data,
+    onSuccess: (data) => {
+      setProposal(data);
+      message.success("采集提案已生成");
+    }
+  });
+
+  const applyProposal = useMutation({
+    mutationFn: async () => (await api.post("/rules/collect/apply", { changes: proposal?.changes || [] })).data,
+    onSuccess: async () => {
+      message.success("规则提案已应用");
+      setCollectOpen(false);
+      setProposal(null);
+      await queryClient.invalidateQueries({ queryKey: ["rules"] });
+      if (activeRule?.name) {
+        await queryClient.invalidateQueries({ queryKey: ["rules", activeRule.name] });
+      }
+    }
+  });
+
   return (
     <Space direction="vertical" size={16} className="page">
       <Typography.Title level={3}>规则中心</Typography.Title>
@@ -114,9 +159,14 @@ export function RulesPage() {
           <Card
             title="我的规则文件"
             extra={
-              <Button icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>
-                新建
-              </Button>
+              <Space>
+                <Button icon={<CloudSyncOutlined />} onClick={() => setCollectOpen(true)}>
+                  采集
+                </Button>
+                <Button icon={<PlusOutlined />} onClick={() => setCreateOpen(true)}>
+                  新建
+                </Button>
+              </Space>
             }
           >
             <List
@@ -178,6 +228,7 @@ export function RulesPage() {
           </Card>
         </Col>
       </Row>
+
       <Modal
         title="新建规则文件"
         open={createOpen}
@@ -193,6 +244,86 @@ export function RulesPage() {
             <Input.TextArea rows={8} spellCheck={false} />
           </Form.Item>
         </Form>
+      </Modal>
+
+      <Modal
+        title="采集规则"
+        open={collectOpen}
+        width={820}
+        onCancel={() => {
+          setCollectOpen(false);
+          setProposal(null);
+        }}
+        footer={[
+          <Button key="cancel" onClick={() => setCollectOpen(false)}>
+            关闭
+          </Button>,
+          <Button key="collect" loading={collectRules.isPending} onClick={() => collectForm.submit()}>
+            生成提案
+          </Button>,
+          <Button
+            key="apply"
+            type="primary"
+            disabled={!proposal?.changes?.length}
+            loading={applyProposal.isPending}
+            onClick={() => applyProposal.mutate()}
+          >
+            应用提案
+          </Button>
+        ]}
+      >
+        <Space direction="vertical" size={12} className="wide">
+          <Form<CollectValues>
+            form={collectForm}
+            layout="vertical"
+            initialValues={{ source_type: "url" }}
+            onFinish={(values) => collectRules.mutate(values)}
+          >
+            <Form.Item name="source_type" label="来源类型">
+              <Select
+                options={[
+                  { label: "在线文档 URL", value: "url" },
+                  { label: "直接粘贴文本", value: "text" }
+                ]}
+              />
+            </Form.Item>
+            <Form.Item name="source" label="来源内容" rules={[{ required: true, message: "请输入 URL 或文本" }]}>
+              <Input.TextArea rows={5} placeholder="https://... 或直接粘贴需求文档" />
+            </Form.Item>
+          </Form>
+          {proposal ? (
+            <Space direction="vertical" size={12} className="wide">
+              <Alert
+                showIcon
+                type={proposal.changes.length ? "success" : "warning"}
+                message={proposal.summary || "规则采集已完成"}
+                description={`模型：${proposal.model || "-"} / ${proposal.wire_api || "-"}`}
+              />
+              {proposal.warnings?.length ? <Alert showIcon type="warning" message={proposal.warnings.join("；")} /> : null}
+              <List
+                dataSource={proposal.changes}
+                renderItem={(item) => (
+                  <List.Item>
+                    <List.Item.Meta
+                      title={
+                        <Space>
+                          <Tag color="blue">{item.rule_name}</Tag>
+                          <Typography.Text strong>{item.title}</Typography.Text>
+                        </Space>
+                      }
+                      description={
+                        <Space direction="vertical" className="wide">
+                          {item.reason ? <Typography.Text type="secondary">{item.reason}</Typography.Text> : null}
+                          <Input.TextArea value={item.content} rows={5} readOnly spellCheck={false} />
+                        </Space>
+                      }
+                    />
+                  </List.Item>
+                )}
+              />
+            </Space>
+          ) : null}
+        </Space>
       </Modal>
     </Space>
   );

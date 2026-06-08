@@ -5,7 +5,9 @@ from sqlalchemy.orm import Session
 from app.api.deps import current_user
 from app.db.models import User
 from app.db.repositories.rules import active_rule_version, list_rule_versions
+from app.db.repositories.roles import get_user_role
 from app.db.repositories.user_rules import (
+    append_user_rule_note,
     create_user_rule_file,
     get_user_rule_file,
     list_user_rule_files,
@@ -13,6 +15,7 @@ from app.db.repositories.user_rules import (
     update_user_rule_file,
 )
 from app.db.session import get_db
+from app.services.rules.collector import RuleCollectorError, collect_rule_proposal, load_rule_source
 from app.services.rules.loader import RuleLoader
 
 router = APIRouter()
@@ -30,6 +33,17 @@ class RuleCreateRequest(BaseModel):
 
 class RuleUpdateRequest(BaseModel):
     content: str
+
+
+class RuleCollectChange(BaseModel):
+    rule_name: str
+    title: str = "Collected Rule"
+    reason: str = ""
+    content: str
+
+
+class RuleCollectApplyRequest(BaseModel):
+    changes: list[RuleCollectChange]
 
 
 @router.get("")
@@ -128,13 +142,39 @@ def reset_rule(name: str, user: User = Depends(current_user), db: Session = Depe
 
 
 @router.post("/collect")
-def collect_rules(payload: RuleCollectRequest, user: User = Depends(current_user)) -> dict:
-    return {
-        "source": payload.source,
-        "source_type": payload.source_type,
-        "status": "proposal_only",
-        "message": "Rule collector scaffold created; document fetching and splitting will be implemented next.",
-    }
+def collect_rules(
+    payload: RuleCollectRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    role = get_user_role(db, user.id, "rule_collector")
+    if not role:
+        raise HTTPException(status_code=404, detail="Rule collector role not found")
+    try:
+        source_text, source_meta = load_rule_source(payload.source, payload.source_type)
+        return collect_rule_proposal(db, user.id, role, source_text, source_meta)
+    except RuleCollectorError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+
+@router.post("/collect/apply")
+def apply_collected_rules(
+    payload: RuleCollectApplyRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    applied = []
+    for change in payload.changes:
+        try:
+            item = get_user_rule_file(db, user.id, change.rule_name)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from None
+        if not item:
+            raise HTTPException(status_code=404, detail=f"Rule not found: {change.rule_name}")
+        note = _format_collected_change(change)
+        append_user_rule_note(db, item, note, heading=change.title or "Collected Rule")
+        applied.append(change.rule_name)
+    return {"status": "applied", "applied": applied}
 
 
 def serialize_rule_file(item, include_content: bool = False) -> dict:
@@ -150,3 +190,11 @@ def serialize_rule_file(item, include_content: bool = False) -> dict:
     if include_content:
         data["content"] = item.content
     return data
+
+
+def _format_collected_change(change: RuleCollectChange) -> str:
+    parts = []
+    if change.reason.strip():
+        parts.append(f"Reason: {change.reason.strip()}")
+    parts.append(change.content.strip())
+    return "\n\n".join(parts)

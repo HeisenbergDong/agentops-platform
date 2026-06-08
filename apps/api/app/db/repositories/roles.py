@@ -9,6 +9,12 @@ def ensure_role_templates(db: Session) -> None:
     existing = {item.role_key: item for item in db.scalars(select(RoleTemplate)).all()}
     for definition in ROLE_REGISTRY:
         if definition.key in existing:
+            template = existing[definition.key]
+            template.name = definition.name
+            template.purpose = definition.purpose
+            template.rules = definition.rules
+            template.enabled = definition.enabled
+            template.model_config_key = definition.model_config_key
             continue
         db.add(role_template_from_definition(definition))
     db.commit()
