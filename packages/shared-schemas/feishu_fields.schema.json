@@ -1,0 +1,20 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "FeishuBusinessFields",
+  "type": "object",
+  "required": ["Trae Session ID", "User Prompt", "日志轨迹", "github地址"],
+  "properties": {
+    "Trae Session ID": { "type": "string" },
+    "轮次": { "type": "string" },
+    "User Prompt": { "type": "string" },
+    "任务类型": { "type": "string" },
+    "业务领域": { "type": "string" },
+    "修改范围": { "type": "string" },
+    "任务是否完成": { "type": "string" },
+    "产物及过程是否满意": { "type": "string" },
+    "不满意原因": { "type": "string" },
+    "github地址": { "type": "string" },
+    "分支/文件夹": { "type": "string" },
+    "日志轨迹": { "type": "string" }
+  }
+}

@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkerResult",
+  "type": "object",
+  "required": ["command_id", "worker_id", "status"],
+  "properties": {
+    "command_id": { "type": "string" },
+    "worker_id": { "type": "string" },
+    "status": { "type": "string", "enum": ["success", "failed", "cancelled", "manual_required"] },
+    "message": { "type": "string" },
+    "data": { "type": "object" },
+    "error": { "type": ["string", "null"] }
+  }
+}

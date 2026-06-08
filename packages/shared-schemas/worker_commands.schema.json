@@ -1,0 +1,29 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "WorkerCommand",
+  "type": "object",
+  "required": ["command_id", "type"],
+  "properties": {
+    "command_id": { "type": "string" },
+    "job_id": { "type": ["string", "null"] },
+    "round_id": { "type": ["string", "null"] },
+    "type": {
+      "type": "string",
+      "enum": [
+        "open_trae",
+        "open_workspace",
+        "focus_trae",
+        "send_prompt",
+        "wait_completion",
+        "diagnose_ui",
+        "click_continue",
+        "click_confirm",
+        "copy_latest_reply",
+        "capture_screenshot",
+        "run_command",
+        "stop_current_task"
+      ]
+    },
+    "payload": { "type": "object" }
+  }
+}

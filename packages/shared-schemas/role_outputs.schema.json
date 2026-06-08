@@ -1,0 +1,13 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "RoleOutput",
+  "type": "object",
+  "required": ["role", "status", "content"],
+  "properties": {
+    "role": { "type": "string" },
+    "status": { "type": "string" },
+    "content": { "type": "object" },
+    "evidence": { "type": "array", "items": { "type": "string" } },
+    "warnings": { "type": "array", "items": { "type": "string" } }
+  }
+}

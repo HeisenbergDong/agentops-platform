@@ -1,0 +1,37 @@
+states:
+  - idle
+  - job_starting
+  - cleaning_old_runtime
+  - loading_rules
+  - generating_prompt
+  - prompt_ready
+  - sending_to_worker
+  - worker_opening_trae
+  - prompt_sent
+  - waiting_trae
+  - awaiting_continue
+  - collecting_trace
+  - trace_validating
+  - trace_missing_abort
+  - screenshot_capturing
+  - product_reviewing
+  - browser_accepting
+  - github_submitting
+  - github_failed_abort
+  - feishu_preparing
+  - feishu_writing
+  - feishu_failed_abort
+  - round_completed
+  - project_completed
+  - stopped
+  - manual_required
+
+hard_gates:
+  github_requires: trace_validating_passed
+  feishu_requires: github_submitting_passed
+
+abort_states:
+  - trace_missing_abort
+  - github_failed_abort
+  - feishu_failed_abort
+  - manual_required
