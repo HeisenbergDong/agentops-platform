@@ -29,6 +29,7 @@ type CurrentJobResponse = {
     id: string;
     round_index: number;
     status: string;
+    prompt: string;
     trace_status: string;
     github_status: string;
     feishu_status: string;
@@ -136,6 +137,11 @@ export function DashboardPage() {
                 <Descriptions.Item label="飞书">{current.data?.round?.feishu_status || "-"}</Descriptions.Item>
               </Descriptions>
             </Card>
+            {current.data?.round?.prompt ? (
+              <Card title="当前 Prompt">
+                <Input.TextArea rows={10} value={current.data.round.prompt} readOnly spellCheck={false} />
+              </Card>
+            ) : null}
           </Space>
         </Col>
         <Col span={14}>

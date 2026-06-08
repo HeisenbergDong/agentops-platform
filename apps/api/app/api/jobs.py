@@ -19,6 +19,11 @@ from app.db.repositories.rules import active_rule_version
 from app.db.repositories.workers import create_worker_command, get_worker_by_worker_id
 from app.db.session import get_db
 from app.services.orchestrator.states import JobState
+from app.services.orchestrator.prompt_writer import (
+    PromptGenerationError,
+    generate_round_prompt,
+    mark_prompt_generation_failed,
+)
 from app.services.user_settings import load_user_settings, readiness
 from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType
 
@@ -80,6 +85,10 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
     job.status = JobState.GENERATING_PROMPT
     if round_:
         round_.status = JobState.GENERATING_PROMPT
+        try:
+            generate_round_prompt(db, user, job, round_)
+        except PromptGenerationError as exc:
+            mark_prompt_generation_failed(db, job, round_, str(exc))
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -107,6 +116,22 @@ def continue_job(
     job.status = JobState.LOADING_RULES
     if round_:
         round_.status = JobState.LOADING_RULES
+        if round_.prompt:
+            job.status = JobState.PROMPT_READY
+            round_.status = JobState.PROMPT_READY
+            add_log(
+                db,
+                job_id=job.id,
+                round_id=round_.id,
+                stage=JobState.PROMPT_READY,
+                message="Existing prompt preserved and ready for worker dispatch.",
+                extra={"prompt_chars": len(round_.prompt)},
+            )
+        else:
+            try:
+                generate_round_prompt(db, user, job, round_)
+            except PromptGenerationError as exc:
+                mark_prompt_generation_failed(db, job, round_, str(exc))
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -196,6 +221,7 @@ def serialize_job(db: Session, job) -> dict:
             "id": round_.id,
             "round_index": round_.round_index,
             "status": round_.status,
+            "prompt": round_.prompt,
             "trace_status": round_.trace_status,
             "github_status": round_.github_status,
             "feishu_status": round_.feishu_status,
