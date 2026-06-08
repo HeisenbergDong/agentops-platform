@@ -13,6 +13,8 @@ from app.db.repositories.roles import (
 )
 from app.db.repositories.user_rules import append_user_rule_note, get_user_rule_file, read_user_rule_many
 from app.db.session import get_db
+from app.services.llm import LLMClient, LLMError, model_config_from_settings
+from app.services.user_settings import load_user_settings
 
 router = APIRouter()
 
@@ -104,12 +106,36 @@ def role_chat(
     message = payload.message.strip()
     if not message:
         raise HTTPException(status_code=400, detail="Message is required")
-    mode = payload.mode if payload.mode in {"record_only", "append_rule_note"} else "record_only"
+    mode = (
+        payload.mode
+        if payload.mode in {"record_only", "llm_reply", "append_rule_note", "llm_append_rule_note"}
+        else "record_only"
+    )
     target_rule = payload.target_rule.strip() if payload.target_rule else ""
 
     action: dict = {"type": mode, "status": "recorded"}
     assistant_message = "已记录这次补充。"
-    if mode == "append_rule_note":
+    llm_result = None
+    if mode in {"llm_reply", "llm_append_rule_note"}:
+        try:
+            history = list_role_chat_messages(db, user.id, role.role_key, limit=12)
+            llm_result = LLMClient().complete(
+                model_config_from_settings(load_user_settings(db, user.id), role.model_config_key),
+                build_role_messages(role, message, mode, target_rule, db, user.id, history),
+            )
+        except LLMError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        except FileNotFoundError as exc:
+            raise HTTPException(status_code=404, detail=f"Rule not found: {exc.args[0]}") from None
+        assistant_message = llm_result.text
+        action = {
+            "type": mode,
+            "status": "generated",
+            "model": llm_result.model,
+            "wire_api": llm_result.wire_api,
+        }
+
+    if mode in {"append_rule_note", "llm_append_rule_note"}:
         available_rules = [item.strip() for item in role.rules if item.strip()]
         if not available_rules:
             raise HTTPException(status_code=400, detail="Role has no bound rules")
@@ -122,9 +148,12 @@ def role_chat(
             raise HTTPException(status_code=400, detail=str(exc)) from None
         if not rule_file:
             raise HTTPException(status_code=404, detail="Rule not found")
-        append_user_rule_note(db, rule_file, message)
-        action = {"type": mode, "status": "applied", "target_rule": target_rule}
+        note = llm_result.text if llm_result else message
+        append_user_rule_note(db, rule_file, note)
+        action.update({"status": "applied", "target_rule": target_rule})
         assistant_message = f"已追加到规则文件：{target_rule}"
+        if llm_result:
+            assistant_message = f"已生成规则补充并追加到：{target_rule}\n\n{llm_result.text}"
 
     add_role_chat_message(
         db,
@@ -195,3 +224,42 @@ def serialize_role_chat_message(item: RoleChatMessage) -> dict:
         "action": item.action,
         "created_at": item.created_at.isoformat(),
     }
+
+
+def build_role_messages(
+    role: UserRole,
+    message: str,
+    mode: str,
+    target_rule: str,
+    db: Session,
+    user_id: str,
+    history: list[RoleChatMessage],
+) -> list[dict[str, str]]:
+    rules = read_user_rule_many(db, user_id, role.rules)
+    rule_text = "\n\n".join([f"## {name}\n{content}" for name, content in rules.items()])
+    if mode == "llm_append_rule_note":
+        user_prompt = (
+            "用户希望给这个角色补充能力。请把用户输入整理成可以追加到规则文件的规则段落。"
+            "要求：只输出规则正文；使用中文；保留具体约束；不要编造不存在的需求。\n\n"
+            f"目标规则文件：{target_rule or '未指定'}\n"
+            f"用户输入：\n{message}"
+        )
+    else:
+        user_prompt = message
+    messages = [
+        {
+            "role": "system",
+            "content": (
+                f"你是 AgentOps 平台中的角色：{role.name}。\n"
+                f"职责：{role.purpose}\n"
+                "你必须遵守当前用户的角色规则。回答要简洁、可执行；涉及规则修改时只给明确建议。\n\n"
+                f"当前绑定规则：\n{rule_text}"
+            ),
+        },
+    ]
+    for item in history:
+        if item.sender not in {"user", "assistant"}:
+            continue
+        messages.append({"role": item.sender, "content": item.message})
+    messages.append({"role": "user", "content": user_prompt})
+    return messages

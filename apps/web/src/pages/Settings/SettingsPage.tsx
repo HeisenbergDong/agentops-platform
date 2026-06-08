@@ -78,20 +78,48 @@ export function SettingsPage() {
       <Form form={form} layout="vertical" onFinish={(values) => void save(values)}>
         <Card title="模型配置" loading={settings.isLoading}>
           <Row gutter={16}>
-            <Col span={8}>
-              <Form.Item name={["model", "base_url"]} label="模型 Base URL">
-                <Input placeholder="OpenAI-compatible base URL" />
+            <Col span={6}>
+              <Form.Item name={["model", "provider"]} label="Provider">
+                <Input placeholder="OpenAI" />
+              </Form.Item>
+            </Col>
+            <Col span={10}>
+              <Form.Item name={["model", "base_url"]} label="Base URL">
+                <Input placeholder="https://api.openai.com" />
               </Form.Item>
             </Col>
             <Col span={8}>
-              <Form.Item name={["model", "model_name"]} label="默认模型">
-                <Input placeholder="gpt-4.1 / claude / deepseek ..." />
-              </Form.Item>
-            </Col>
-            <Col span={8}>
-              <Form.Item name={["model", "api_key"]} label="模型 API Key">
+              <Form.Item name={["model", "api_key"]} label="API Key">
                 <Input.Password
                   placeholder={settings.data?.sections?.model?.api_key_configured ? settings.data.sections.model.api_key_mask : "保存后不回显"}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item name={["model", "model_name"]} label="默认模型">
+                <Input placeholder="gpt-5.5" />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item name={["model", "review_model_name"]} label="检查模型">
+                <Input placeholder="gpt-5.5" />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item name={["model", "wire_api"]} label="接口类型">
+                <Select
+                  options={[
+                    { label: "Responses", value: "responses" },
+                    { label: "Chat Completions", value: "chat_completions" }
+                  ]}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={6}>
+              <Form.Item name={["model", "reasoning_effort"]} label="推理强度">
+                <Select
+                  allowClear
+                  options={["minimal", "low", "medium", "high", "xhigh"].map((value) => ({ label: value, value }))}
                 />
               </Form.Item>
             </Col>
@@ -109,7 +137,7 @@ export function SettingsPage() {
             </Col>
             <Col span={12}>
               <Typography.Paragraph type="secondary">
-                仓库地址不在这里配置。GitHub 角色会按任务上下文和规则决定提交目标。
+                仓库地址不在这里配置；GitHub 角色会按任务上下文和规则决定提交目标。
               </Typography.Paragraph>
             </Col>
             <Col span={24}>

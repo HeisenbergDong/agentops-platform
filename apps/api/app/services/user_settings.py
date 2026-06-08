@@ -136,7 +136,11 @@ def _has_secret(value: Any) -> bool:
 
 def _strip_deprecated(category: str, data: dict[str, Any]) -> dict[str, Any]:
     deprecated = DEPRECATED_FIELDS.get(category, set())
-    return {key: value for key, value in data.items() if key not in deprecated and not _is_display_field(key)}
+    return {
+        key: value
+        for key, value in data.items()
+        if key not in deprecated and not _is_display_field(key)
+    }
 
 
 def _is_display_field(key: str) -> bool:

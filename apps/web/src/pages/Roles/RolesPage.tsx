@@ -23,7 +23,7 @@ type RoleFormValues = {
   rules_text: string;
 };
 
-type ChatMode = "record_only" | "append_rule_note";
+type ChatMode = "record_only" | "llm_reply" | "append_rule_note" | "llm_append_rule_note";
 
 type ChatMessage = {
   id: string;
@@ -97,9 +97,9 @@ export function RolesPage() {
       await api.post(`/roles/${encodeURIComponent(active.key)}/chat`, {
         message: messageText,
         mode: chatMode,
-        target_rule: chatMode === "append_rule_note" ? targetRule : undefined
+        target_rule: chatMode === "append_rule_note" || chatMode === "llm_append_rule_note" ? targetRule : undefined
       });
-      message.success(chatMode === "append_rule_note" ? "已写入规则" : "已记录");
+      message.success(chatMode === "append_rule_note" || chatMode === "llm_append_rule_note" ? "已写入规则" : "已发送");
       setMessageText("");
       await queryClient.invalidateQueries({ queryKey: ["role-chat", active.key] });
       await queryClient.invalidateQueries({ queryKey: ["rules"] });
@@ -172,11 +172,13 @@ export function RolesPage() {
                 value={chatMode}
                 onChange={(value) => setChatMode(value as ChatMode)}
                 options={[
-                  { label: "仅记录", value: "record_only" },
-                  { label: "写入规则", value: "append_rule_note" }
+                  { label: "记录", value: "record_only" },
+                  { label: "AI", value: "llm_reply" },
+                  { label: "直写", value: "append_rule_note" },
+                  { label: "AI写入", value: "llm_append_rule_note" }
                 ]}
               />
-              {chatMode === "append_rule_note" ? (
+              {chatMode === "append_rule_note" || chatMode === "llm_append_rule_note" ? (
                 <Select
                   value={targetRule || undefined}
                   placeholder="选择规则文件"
@@ -199,7 +201,11 @@ export function RolesPage() {
                 icon={<SendOutlined />}
                 onClick={send}
                 loading={sending}
-                disabled={!active || !messageText.trim() || (chatMode === "append_rule_note" && !targetRule)}
+                disabled={
+                  !active ||
+                  !messageText.trim() ||
+                  ((chatMode === "append_rule_note" || chatMode === "llm_append_rule_note") && !targetRule)
+                }
               >
                 发送
               </Button>
