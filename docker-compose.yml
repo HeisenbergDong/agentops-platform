@@ -65,4 +65,6 @@ services:
 
 volumes:
   postgres_data:
+    name: agentops_postgres_data
   redis_data:
+    name: agentops_redis_data
