@@ -59,6 +59,15 @@ body,
   cursor: pointer;
 }
 
+.active-list-item {
+  background: #eef4ff;
+}
+
+.ant-list-item.active-list-item,
+.ant-list-item:hover {
+  cursor: pointer;
+}
+
 .center-screen,
 .login-screen {
   min-height: 100vh;

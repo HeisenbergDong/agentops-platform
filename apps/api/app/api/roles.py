@@ -10,8 +10,8 @@ from app.db.repositories.roles import (
     list_user_roles,
     update_user_role,
 )
+from app.db.repositories.user_rules import read_user_rule_many
 from app.db.session import get_db
-from app.services.rules.loader import RuleLoader
 
 router = APIRouter()
 
@@ -49,7 +49,10 @@ def role_capabilities(
     role = get_user_role(db, user.id, role_key)
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
-    rules = RuleLoader().read_many(role.rules)
+    try:
+        rules = read_user_rule_many(db, user.id, role.rules)
+    except FileNotFoundError as exc:
+        raise HTTPException(status_code=404, detail=f"Rule not found: {exc.args[0]}") from None
     return {"role": serialize_user_role(role), "rules": rules}
 
 

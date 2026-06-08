@@ -110,6 +110,18 @@ class UserRole(IdMixin, TimestampMixin, Base):
     config: Mapped[dict] = mapped_column(JSON, default=dict)
 
 
+class UserRuleFile(IdMixin, TimestampMixin, Base):
+    __tablename__ = "user_rule_files"
+    __table_args__ = (UniqueConstraint("user_id", "name", name="uq_user_rule_file_name"),)
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    name: Mapped[str] = mapped_column(String(255), index=True)
+    content: Mapped[str] = mapped_column(Text, default="")
+    source_name: Mapped[str] = mapped_column(String(255), default="")
+    is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
 class RuleVersion(IdMixin, TimestampMixin, Base):
     __tablename__ = "rule_versions"
 
