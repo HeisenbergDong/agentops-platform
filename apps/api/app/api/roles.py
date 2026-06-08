@@ -3,8 +3,13 @@ from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
-from app.db.models import RoleTemplate, User
-from app.db.repositories.roles import get_role_template, list_role_templates
+from app.db.models import RoleTemplate, User, UserRole
+from app.db.repositories.roles import (
+    get_user_role,
+    list_role_templates,
+    list_user_roles,
+    update_user_role,
+)
 from app.db.session import get_db
 from app.services.rules.loader import RuleLoader
 
@@ -16,8 +21,22 @@ class RoleChatRequest(BaseModel):
     mode: str = "temporary_instruction"
 
 
+class RoleUpdateRequest(BaseModel):
+    name: str | None = None
+    purpose: str | None = None
+    rules: list[str] | None = None
+    enabled: bool | None = None
+    model_config_key: str | None = None
+    config: dict | None = None
+
+
 @router.get("")
 def list_roles(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    return [serialize_user_role(item) for item in list_user_roles(db, user.id)]
+
+
+@router.get("/templates")
+def list_templates(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
     return [serialize_role_template(item) for item in list_role_templates(db)]
 
 
@@ -27,11 +46,27 @@ def role_capabilities(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    role = get_role_template(db, role_key)
+    role = get_user_role(db, user.id, role_key)
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
     rules = RuleLoader().read_many(role.rules)
-    return {"role": serialize_role_template(role), "rules": rules}
+    return {"role": serialize_user_role(role), "rules": rules}
+
+
+@router.patch("/{role_key}")
+def update_role(
+    role_key: str,
+    payload: RoleUpdateRequest,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    role = get_user_role(db, user.id, role_key)
+    if not role:
+        raise HTTPException(status_code=404, detail="Role not found")
+    values = payload.model_dump(exclude_unset=True)
+    if "rules" in values:
+        values["rules"] = [item.strip() for item in values["rules"] if item.strip()]
+    return serialize_user_role(update_user_role(db, role, values))
 
 
 @router.post("/{role_key}/chat")
@@ -41,7 +76,7 @@ def role_chat(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    role = get_role_template(db, role_key)
+    role = get_user_role(db, user.id, role_key)
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
     return {
@@ -62,4 +97,20 @@ def serialize_role_template(item: RoleTemplate) -> dict:
         "enabled": item.enabled,
         "model_config_key": item.model_config_key,
         "config": item.config,
+    }
+
+
+def serialize_user_role(item: UserRole) -> dict:
+    return {
+        "id": item.id,
+        "template_id": item.template_id,
+        "key": item.role_key,
+        "name": item.name,
+        "purpose": item.purpose,
+        "rules": item.rules,
+        "enabled": item.enabled,
+        "model_config_key": item.model_config_key,
+        "config": item.config,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
     }

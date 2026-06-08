@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text, UniqueConstraint
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.models.base import IdMixin, TimestampMixin, now_utc
@@ -87,6 +87,21 @@ class RoleTemplate(IdMixin, TimestampMixin, Base):
     __tablename__ = "role_templates"
 
     role_key: Mapped[str] = mapped_column(String(128), unique=True, index=True)
+    name: Mapped[str] = mapped_column(String(255))
+    purpose: Mapped[str] = mapped_column(Text, default="")
+    rules: Mapped[list[str]] = mapped_column(JSON, default=list)
+    enabled: Mapped[bool] = mapped_column(Boolean, default=True)
+    model_config_key: Mapped[str] = mapped_column(String(128), default="default")
+    config: Mapped[dict] = mapped_column(JSON, default=dict)
+
+
+class UserRole(IdMixin, TimestampMixin, Base):
+    __tablename__ = "user_roles"
+    __table_args__ = (UniqueConstraint("user_id", "role_key", name="uq_user_role_key"),)
+
+    user_id: Mapped[str] = mapped_column(ForeignKey("users.id"), index=True)
+    template_id: Mapped[str | None] = mapped_column(ForeignKey("role_templates.id"), nullable=True)
+    role_key: Mapped[str] = mapped_column(String(128), index=True)
     name: Mapped[str] = mapped_column(String(255))
     purpose: Mapped[str] = mapped_column(Text, default="")
     rules: Mapped[list[str]] = mapped_column(JSON, default=list)
