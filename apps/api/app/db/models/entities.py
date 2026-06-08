@@ -1,6 +1,6 @@
 from datetime import datetime
 
-from sqlalchemy import Boolean, ForeignKey, Integer, JSON, String, Text
+from sqlalchemy import Boolean, DateTime, ForeignKey, Integer, JSON, String, Text
 from sqlalchemy.orm import Mapped, mapped_column, relationship
 
 from app.db.models.base import IdMixin, TimestampMixin, now_utc
@@ -12,7 +12,11 @@ class User(IdMixin, TimestampMixin, Base):
 
     email: Mapped[str] = mapped_column(String(255), unique=True, index=True)
     display_name: Mapped[str] = mapped_column(String(255))
+    password_hash: Mapped[str] = mapped_column(Text, default="")
+    role: Mapped[str] = mapped_column(String(32), default="user", index=True)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
+    auth_token_version: Mapped[int] = mapped_column(Integer, default=0)
+    last_login_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
     configs: Mapped[list["UserConfig"]] = relationship(back_populates="user")
 

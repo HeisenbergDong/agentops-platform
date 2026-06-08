@@ -1,6 +1,8 @@
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, Depends, HTTPException
 from pydantic import BaseModel
 
+from app.api.deps import current_user
+from app.db.models import User
 from app.services.roles.registry import ROLE_REGISTRY, role_by_key
 from app.services.rules.loader import RuleLoader
 
@@ -13,12 +15,12 @@ class RoleChatRequest(BaseModel):
 
 
 @router.get("")
-def list_roles() -> list[dict]:
+def list_roles(user: User = Depends(current_user)) -> list[dict]:
     return [role.__dict__ for role in ROLE_REGISTRY]
 
 
 @router.get("/{role_key}/capabilities")
-def role_capabilities(role_key: str) -> dict:
+def role_capabilities(role_key: str, user: User = Depends(current_user)) -> dict:
     role = role_by_key(role_key)
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")
@@ -27,7 +29,7 @@ def role_capabilities(role_key: str) -> dict:
 
 
 @router.post("/{role_key}/chat")
-def role_chat(role_key: str, payload: RoleChatRequest) -> dict:
+def role_chat(role_key: str, payload: RoleChatRequest, user: User = Depends(current_user)) -> dict:
     role = role_by_key(role_key)
     if not role:
         raise HTTPException(status_code=404, detail="Role not found")

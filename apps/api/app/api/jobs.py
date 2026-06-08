@@ -1,9 +1,11 @@
-from fastapi import APIRouter
+from fastapi import APIRouter, HTTPException
 from fastapi import Depends
 from pydantic import BaseModel
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from app.db.bootstrap import ensure_dev_user
+from app.api.deps import current_user
+from app.db.models import Job, User
 from app.db.repositories.jobs import add_log, create_job, current_job, latest_round, list_logs
 from app.db.repositories.rules import active_rule_version
 from app.db.session import get_db
@@ -17,8 +19,7 @@ class StartJobRequest(BaseModel):
 
 
 @router.post("/start")
-def start_job(payload: StartJobRequest, db: Session = Depends(get_db)) -> dict:
-    user = ensure_dev_user(db)
+def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     rule_version = active_rule_version(db)
     job = create_job(
         db,
@@ -30,8 +31,11 @@ def start_job(payload: StartJobRequest, db: Session = Depends(get_db)) -> dict:
 
 
 @router.post("/continue")
-def continue_job(job_id: str | None = None, db: Session = Depends(get_db)) -> dict:
-    user = ensure_dev_user(db)
+def continue_job(
+    job_id: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     job = current_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to continue."}
@@ -48,8 +52,11 @@ def continue_job(job_id: str | None = None, db: Session = Depends(get_db)) -> di
 
 
 @router.post("/stop")
-def stop_job(job_id: str | None = None, db: Session = Depends(get_db)) -> dict:
-    user = ensure_dev_user(db)
+def stop_job(
+    job_id: str | None = None,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     job = current_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to stop."}
@@ -70,8 +77,7 @@ def stop_job(job_id: str | None = None, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/current")
-def get_current_job(db: Session = Depends(get_db)) -> dict:
-    user = ensure_dev_user(db)
+def get_current_job(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     job = current_job(db, user.id)
     if not job:
         return {"status": "idle", "job": None, "logs": []}
@@ -79,7 +85,15 @@ def get_current_job(db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("/{job_id}/logs")
-def get_job_logs(job_id: str, limit: int = 100, db: Session = Depends(get_db)) -> list[dict]:
+def get_job_logs(
+    job_id: str,
+    limit: int = 100,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> list[dict]:
+    job = db.scalar(select(Job).where(Job.id == job_id, Job.user_id == user.id))
+    if not job:
+        raise HTTPException(status_code=404, detail="Job not found")
     return [serialize_log(item) for item in list_logs(db, job_id=job_id, limit=limit)]
 
 

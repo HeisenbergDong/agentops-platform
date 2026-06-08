@@ -1,5 +1,5 @@
-import { Button, Card, Col, Input, List, Row, Space, Typography } from "antd";
 import { useQuery } from "@tanstack/react-query";
+import { Button, Card, Col, Input, List, Row, Space, Typography } from "antd";
 import { useState } from "react";
 import { api } from "../../api/client";
 
@@ -57,7 +57,7 @@ export function RolesPage() {
         <Col span={8}>
           <Card title="角色聊天">
             <Space direction="vertical" className="wide">
-              <Input.TextArea rows={6} value={message} onChange={(e) => setMessage(e.target.value)} />
+              <Input.TextArea rows={6} value={message} onChange={(event) => setMessage(event.target.value)} />
               <Button type="primary" onClick={send} disabled={!active}>
                 发送
               </Button>

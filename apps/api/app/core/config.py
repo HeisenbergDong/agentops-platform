@@ -10,6 +10,10 @@ class Settings(BaseSettings):
 
     app_env: str = "development"
     app_secret_key: str = "change-me"
+    access_token_ttl_seconds: int = 60 * 60 * 24 * 7
+    bootstrap_admin_email: str = "admin@agentops.local"
+    bootstrap_admin_password: str = "agentops-admin"
+    bootstrap_admin_name: str = "AgentOps Admin"
     database_url: str = "postgresql+psycopg://agentops:agentops_dev_password_change_me@localhost:5432/agentops"
     redis_url: str = "redis://localhost:6379/0"
     attachment_root: Path = Field(default=Path("./storage"))

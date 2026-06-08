@@ -19,7 +19,11 @@ def upgrade() -> None:
         sa.Column("id", sa.String(length=32), primary_key=True),
         sa.Column("email", sa.String(length=255), nullable=False, unique=True),
         sa.Column("display_name", sa.String(length=255), nullable=False),
+        sa.Column("password_hash", sa.Text(), nullable=False, server_default=""),
+        sa.Column("role", sa.String(length=32), nullable=False, server_default="user"),
         sa.Column("is_active", sa.Boolean(), nullable=False, server_default=sa.text("true")),
+        sa.Column("auth_token_version", sa.Integer(), nullable=False, server_default="0"),
+        sa.Column("last_login_at", sa.DateTime(timezone=True), nullable=True),
         sa.Column("created_at", sa.DateTime(timezone=True), nullable=False),
         sa.Column("updated_at", sa.DateTime(timezone=True), nullable=False),
     )

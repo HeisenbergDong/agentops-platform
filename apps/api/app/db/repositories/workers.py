@@ -22,5 +22,8 @@ def upsert_worker_heartbeat(db: Session, payload: WorkerHeartbeat) -> Worker:
     return worker
 
 
-def list_workers(db: Session) -> list[Worker]:
-    return list(db.scalars(select(Worker).order_by(Worker.worker_id)).all())
+def list_workers(db: Session, user_id: str | None = None) -> list[Worker]:
+    query = select(Worker).order_by(Worker.worker_id)
+    if user_id is not None:
+        query = query.where(Worker.user_id == user_id)
+    return list(db.scalars(query).all())

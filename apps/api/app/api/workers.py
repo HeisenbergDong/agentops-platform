@@ -1,7 +1,9 @@
 from fastapi import APIRouter, Depends
 from sqlalchemy.orm import Session
 
+from app.api.deps import current_user
 from app.core.security import require_worker_token
+from app.db.models import User
 from app.db.repositories.workers import list_workers, upsert_worker_heartbeat
 from app.db.session import get_db
 from app.worker_gateway.contracts import WorkerHeartbeat, WorkerResult
@@ -16,8 +18,9 @@ def heartbeat(payload: WorkerHeartbeat, db: Session = Depends(get_db)) -> dict:
 
 
 @router.get("")
-def get_workers(db: Session = Depends(get_db)) -> list[dict]:
-    return [serialize_worker(item) for item in list_workers(db)]
+def get_workers(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    owner_id = None if user.role == "admin" else user.id
+    return [serialize_worker(item) for item in list_workers(db, user_id=owner_id)]
 
 
 @router.get("/{worker_id}/commands", dependencies=[Depends(require_worker_token)])
@@ -34,6 +37,7 @@ def serialize_worker(item) -> dict:
     return {
         "id": item.id,
         "worker_id": item.worker_id,
+        "user_id": item.user_id,
         "machine_name": item.machine_name,
         "supported_apps": item.supported_apps,
         "current_stage": item.current_stage,

@@ -1,5 +1,5 @@
-import { Card, Descriptions, List, Space, Typography } from "antd";
 import { useQuery } from "@tanstack/react-query";
+import { Card, Descriptions, List, Space, Typography } from "antd";
 import { api } from "../../api/client";
 
 type Rule = {

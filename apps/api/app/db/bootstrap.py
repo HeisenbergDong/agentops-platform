@@ -1,9 +1,11 @@
-from sqlalchemy import select
+from sqlalchemy import inspect, select, text
 from sqlalchemy.orm import Session
 
 from app.db.models import RuleVersion, User
 from app.db.models.base import now_utc
 from app.db.session import Base, engine
+from app.core.config import settings
+from app.core.security import hash_password
 from app.services.rules.loader import RuleLoader
 
 
@@ -12,14 +14,58 @@ DEV_USER_EMAIL = "dev@agentops.local"
 
 def create_schema() -> None:
     Base.metadata.create_all(bind=engine)
+    ensure_schema_extensions()
+
+
+def ensure_schema_extensions() -> None:
+    inspector = inspect(engine)
+    if "users" not in inspector.get_table_names():
+        return
+    columns = {item["name"] for item in inspector.get_columns("users")}
+    statements: list[str] = []
+    if "password_hash" not in columns:
+        statements.append("alter table users add column password_hash text not null default ''")
+    if "role" not in columns:
+        statements.append("alter table users add column role varchar(32) not null default 'user'")
+    if "auth_token_version" not in columns:
+        statements.append("alter table users add column auth_token_version integer not null default 0")
+    if "last_login_at" not in columns:
+        statements.append("alter table users add column last_login_at timestamp with time zone null")
+    if not statements:
+        return
+    with engine.begin() as connection:
+        for statement in statements:
+            connection.execute(text(statement))
 
 
 def ensure_dev_user(db: Session) -> User:
     user = db.scalar(select(User).where(User.email == DEV_USER_EMAIL))
     if user:
         return user
-    user = User(email=DEV_USER_EMAIL, display_name="Development User")
+    user = User(email=DEV_USER_EMAIL, display_name="Development User", role="user")
     db.add(user)
+    db.commit()
+    db.refresh(user)
+    return user
+
+
+def ensure_admin_user(db: Session) -> User:
+    admin = db.scalar(select(User).where(User.role == "admin"))
+    if admin:
+        if not admin.password_hash:
+            admin.password_hash = hash_password(settings.bootstrap_admin_password)
+            db.commit()
+            db.refresh(admin)
+        return admin
+    email = settings.bootstrap_admin_email.strip().lower()
+    user = db.scalar(select(User).where(User.email == email))
+    if not user:
+        user = User(email=email, display_name=settings.bootstrap_admin_name, role="admin")
+        db.add(user)
+    user.display_name = user.display_name or settings.bootstrap_admin_name
+    user.role = "admin"
+    user.is_active = True
+    user.password_hash = hash_password(settings.bootstrap_admin_password)
     db.commit()
     db.refresh(user)
     return user
@@ -52,5 +98,6 @@ def bootstrap_database() -> None:
     from app.db.session import SessionLocal
 
     with SessionLocal() as db:
-        user = ensure_dev_user(db)
-        ensure_initial_rule_version(db, user)
+        admin = ensure_admin_user(db)
+        ensure_dev_user(db)
+        ensure_initial_rule_version(db, admin)

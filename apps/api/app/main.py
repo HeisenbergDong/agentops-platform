@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api import attachments, auth, errors, jobs, roles, rules, settings, workers
+from app.api import admin, attachments, auth, errors, jobs, roles, rules, settings, workers
 from app.core.config import settings as app_settings
 from app.db.bootstrap import bootstrap_database
 from app.db.session import SessionLocal
@@ -19,6 +19,7 @@ def create_app() -> FastAPI:
     )
 
     app.include_router(auth.router, prefix="/api/auth", tags=["auth"])
+    app.include_router(admin.router, prefix="/api/admin", tags=["admin"])
     app.include_router(settings.router, prefix="/api/settings", tags=["settings"])
     app.include_router(jobs.router, prefix="/api/jobs", tags=["jobs"])
     app.include_router(roles.router, prefix="/api/roles", tags=["roles"])

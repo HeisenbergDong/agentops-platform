@@ -53,7 +53,7 @@ export function DashboardPage() {
                   <Button icon={<ReloadOutlined />} onClick={continueJob}>
                     继续
                   </Button>
-                <Button danger icon={<PauseCircleOutlined />} onClick={stopJob}>
+                  <Button danger icon={<PauseCircleOutlined />} onClick={stopJob}>
                     停止
                   </Button>
                 </Space>
