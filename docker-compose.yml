@@ -1,4 +1,37 @@
 services:
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile
+    container_name: agentops-api
+    environment:
+      APP_ENV: production
+      APP_SECRET_KEY: change-me-before-production
+      DATABASE_URL: postgresql+psycopg://agentops:agentops_dev_password_change_me@postgres:5432/agentops
+      REDIS_URL: redis://redis:6379/0
+      ATTACHMENT_ROOT: /app/storage
+      CORS_ORIGINS: http://localhost:5173,http://115.190.113.8:8080
+      WORKER_TOKEN_DEV: change-me-worker-token
+    ports:
+      - "127.0.0.1:8000:8000"
+    volumes:
+      - ./storage:/app/storage
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+    container_name: agentops-web
+    ports:
+      - "8080:80"
+    depends_on:
+      - api
+
   postgres:
     image: postgres:16-alpine
     container_name: agentops-postgres

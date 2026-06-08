@@ -1,11 +1,12 @@
-import { Card, List, Space, Typography } from "antd";
+import { Card, List, Space, Tag, Typography } from "antd";
 import { useQuery } from "@tanstack/react-query";
 import { api } from "../../api/client";
 
 export function WorkersPage() {
   const workers = useQuery({
     queryKey: ["workers"],
-    queryFn: async () => (await api.get("/workers")).data
+    queryFn: async () => (await api.get("/workers")).data,
+    refetchInterval: 5000
   });
 
   return (
@@ -16,7 +17,11 @@ export function WorkersPage() {
           dataSource={workers.data || []}
           renderItem={(worker: any) => (
             <List.Item>
-              <List.Item.Meta title={worker.worker_id} description={worker.current_stage} />
+              <List.Item.Meta
+                title={worker.worker_id}
+                description={`${worker.machine_name} / ${worker.current_stage} / ${worker.current_window_title || "-"}`}
+              />
+              <Tag color={worker.busy ? "orange" : "green"}>{worker.busy ? "忙碌" : "空闲"}</Tag>
             </List.Item>
           )}
         />

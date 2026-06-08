@@ -1,8 +1,11 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy import text
 
 from app.api import attachments, auth, errors, jobs, roles, rules, settings, workers
 from app.core.config import settings as app_settings
+from app.db.bootstrap import bootstrap_database
+from app.db.session import SessionLocal
 
 
 def create_app() -> FastAPI:
@@ -24,9 +27,20 @@ def create_app() -> FastAPI:
     app.include_router(attachments.router, prefix="/api/attachments", tags=["attachments"])
     app.include_router(errors.router, prefix="/api/errors", tags=["errors"])
 
+    @app.on_event("startup")
+    def startup() -> None:
+        bootstrap_database()
+
     @app.get("/api/health")
     def health() -> dict:
-        return {"status": "ok", "service": "agentops-api"}
+        db_ok = False
+        try:
+            with SessionLocal() as db:
+                db.execute(text("select 1"))
+            db_ok = True
+        except Exception:
+            db_ok = False
+        return {"status": "ok" if db_ok else "degraded", "service": "agentops-api", "database": db_ok}
 
     return app
 
