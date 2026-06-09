@@ -6,6 +6,7 @@ from app.api.deps import current_user
 from app.db.models import User
 from app.db.session import get_db
 from app.services.feishu.discovery import FeishuDiscoveryError, discover_feishu_resources
+from app.services.preflight import build_preflight
 from app.services.user_settings import (
     load_user_settings,
     public_user_settings,
@@ -32,6 +33,7 @@ def get_settings(user: User = Depends(current_user), db: Session = Depends(get_d
     return {
         "sections": public_user_settings(configs),
         "readiness": readiness(configs),
+        "preflight": build_preflight(db, user),
     }
 
 
@@ -44,6 +46,11 @@ def save_settings(
     save_user_settings(db, user.id, payload.model_dump())
     db.commit()
     return get_settings(user, db)
+
+
+@router.get("/preflight")
+def get_preflight(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    return build_preflight(db, user)
 
 
 @router.post("/feishu/discover")

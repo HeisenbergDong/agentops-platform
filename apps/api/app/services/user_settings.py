@@ -20,7 +20,7 @@ INTERNAL_FIELDS = {
 
 DEPRECATED_FIELDS = {
     "github": {"repo_url"},
-    "feishu": {"base_token", "table_id", "view_id"},
+    "feishu": {"base_token"},
     "webhook": {"secret"},
     "trae": {"workspace_path"},
 }
@@ -103,11 +103,15 @@ def readiness(configs: dict[str, dict[str, Any]]) -> dict[str, Any]:
     defaults = configs.get("defaults", {})
     items = [
         ReadinessItem("model.api_key", "模型 API Key", _has_secret(model.get("api_key"))),
-        ReadinessItem("github.token", "GitHub Token", _has_secret(github.get("token"))),
+        ReadinessItem("model.model_name", "模型名称", bool(model.get("model_name") or model.get("model"))),
+        ReadinessItem("github.token", "GitHub Token", _has_secret(github.get("token")), required=False),
         ReadinessItem("feishu.app_id", "飞书 App ID", bool(feishu.get("app_id"))),
         ReadinessItem("feishu.app_secret", "飞书 App Secret", _has_secret(feishu.get("app_secret"))),
+        ReadinessItem("feishu.app_token", "飞书 Base/App Token", bool(feishu.get("app_token"))),
+        ReadinessItem("feishu.table_id", "飞书 Table ID", bool(feishu.get("table_id"))),
         ReadinessItem("worker.worker_id", "关联 Worker", bool(worker.get("worker_id"))),
         ReadinessItem("worker.trae_workspace_path", "Trae 工作目录", bool(worker.get("trae_workspace_path"))),
+        ReadinessItem("worker.browser_url", "浏览器验收 URL", bool(worker.get("browser_url"))),
         ReadinessItem(
             "defaults.default_rule_version_id",
             "默认规则版本",

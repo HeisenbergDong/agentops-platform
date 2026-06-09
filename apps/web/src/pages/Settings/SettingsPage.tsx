@@ -11,6 +11,12 @@ type SettingsResponse = {
     missing_required: string[];
     items: Array<{ key: string; label: string; configured: boolean; required: boolean }>;
   };
+  preflight?: {
+    ready: boolean;
+    blocking: string[];
+    warnings: string[];
+    summary: string;
+  };
 };
 
 export function SettingsPage() {
@@ -36,9 +42,19 @@ export function SettingsPage() {
   }, [form, settings.data?.sections]);
 
   const readinessText = useMemo(() => {
+    if (settings.data?.preflight?.summary) {
+      return settings.data.preflight.summary;
+    }
     const missing = settings.data?.readiness?.missing_required || [];
     return missing.length ? `缺少：${missing.join("、")}` : "必要配置已完成";
   }, [settings.data]);
+  const readinessColor = settings.data?.preflight
+    ? settings.data.preflight.ready
+      ? "green"
+      : "red"
+    : settings.data?.readiness?.complete
+      ? "green"
+      : "orange";
 
   async function save(values: any, showMessage = true) {
     await api.put("/settings", values);
@@ -68,7 +84,7 @@ export function SettingsPage() {
     <Space direction="vertical" size={16} className="page">
       <Space className="toolbar">
         <Typography.Title level={3}>用户配置</Typography.Title>
-        <Tag color={settings.data?.readiness?.complete ? "green" : "orange"}>{readinessText}</Tag>
+        <Tag color={readinessColor}>{readinessText}</Tag>
       </Space>
       <Alert
         showIcon
@@ -173,6 +189,21 @@ export function SettingsPage() {
                 />
               </Form.Item>
             </Col>
+            <Col span={8}>
+              <Form.Item name={["feishu", "app_token"]} label="Base / App Token">
+                <Input placeholder="bascn..." />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item name={["feishu", "table_id"]} label="Table ID">
+                <Input placeholder="tbl..." />
+              </Form.Item>
+            </Col>
+            <Col span={8}>
+              <Form.Item name={["feishu", "view_id"]} label="View ID">
+                <Input placeholder="vew..." />
+              </Form.Item>
+            </Col>
             <Col span={24}>
               <Alert
                 showIcon
@@ -209,9 +240,14 @@ export function SettingsPage() {
                 <Input placeholder="D:\\zdbz_code" />
               </Form.Item>
             </Col>
+            <Col span={12}>
+              <Form.Item name={["worker", "browser_url"]} label="浏览器验收 URL">
+                <Input placeholder="http://localhost:5173" />
+              </Form.Item>
+            </Col>
             <Col span={24}>
               <Typography.Paragraph type="secondary">
-                服务端只保存这份关联配置，不直接访问本机路径；后续由 Worker 拉取或接收该配置。
+                服务端只保存这份关联配置，不直接访问本机路径；后续由 Worker 拉取或接收该配置。浏览器验收 URL 仅支持本地 HTTP 地址。
               </Typography.Paragraph>
             </Col>
           </Row>

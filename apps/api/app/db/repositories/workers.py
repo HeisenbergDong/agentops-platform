@@ -192,7 +192,12 @@ def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) ->
     )
     if not command:
         return None
-    command.status = "completed" if payload.status in {"ok", "success", "completed"} else "failed"
+    if payload.status in {"ok", "success", "completed"}:
+        command.status = "completed"
+    elif payload.status in {"failed", "manual_required", "cancelled"}:
+        command.status = payload.status
+    else:
+        command.status = "failed"
     command.finished_at = now_utc()
     command.message = payload.message
     command.result = payload.data

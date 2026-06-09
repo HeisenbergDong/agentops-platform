@@ -20,7 +20,10 @@
         "click_confirm",
         "copy_latest_reply",
         "capture_screenshot",
+        "scan_project",
         "run_command",
+        "browser_acceptance",
+        "git_submit",
         "stop_current_task"
       ]
     },

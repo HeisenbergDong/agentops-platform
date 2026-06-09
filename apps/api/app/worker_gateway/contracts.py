@@ -15,7 +15,10 @@ class WorkerCommandType(StrEnum):
     CLICK_CONFIRM = "click_confirm"
     COPY_LATEST_REPLY = "copy_latest_reply"
     CAPTURE_SCREENSHOT = "capture_screenshot"
+    SCAN_PROJECT = "scan_project"
     RUN_COMMAND = "run_command"
+    BROWSER_ACCEPTANCE = "browser_acceptance"
+    GIT_SUBMIT = "git_submit"
     STOP_CURRENT_TASK = "stop_current_task"
 
 

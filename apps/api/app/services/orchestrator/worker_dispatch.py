@@ -53,6 +53,7 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
             payload={
                 "prompt": round_.prompt,
                 "trae_workspace_path": worker_settings.get("trae_workspace_path", ""),
+                "browser_url": worker_settings.get("browser_url", ""),
                 "job_id": job.id,
                 "round_id": round_.id,
                 "round_index": round_.round_index,

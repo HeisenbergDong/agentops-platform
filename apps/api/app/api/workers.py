@@ -18,6 +18,7 @@ from app.db.repositories.workers import (
     update_worker_heartbeat,
 )
 from app.db.session import get_db
+from app.services.orchestrator.worker_results import handle_worker_result
 from app.services.user_settings import load_user_settings
 from app.worker_gateway.contracts import (
     CreateWorkerCommandRequest,
@@ -117,6 +118,7 @@ def post_result(
     command = finish_worker_command(db, worker_id, payload)
     if not command:
         raise HTTPException(status_code=404, detail="Command not found")
+    handle_worker_result(db, command, payload)
     return {"status": "received", "worker_id": worker_id, "command": serialize_command(command)}
 
 
@@ -149,7 +151,10 @@ def assigned_worker_config(db: Session, worker: Worker) -> dict:
     worker_settings = settings.get("worker", {})
     if worker_settings.get("worker_id") != worker.worker_id:
         return {}
-    return {"trae_workspace_path": worker_settings.get("trae_workspace_path", "")}
+    return {
+        "trae_workspace_path": worker_settings.get("trae_workspace_path", ""),
+        "browser_url": worker_settings.get("browser_url", ""),
+    }
 
 
 def serialize_worker(item: Worker) -> dict:
