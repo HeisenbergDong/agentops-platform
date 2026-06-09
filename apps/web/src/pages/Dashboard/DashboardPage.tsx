@@ -35,6 +35,19 @@ type CurrentJobResponse = {
     feishu_status: string;
   } | null;
   logs?: RuntimeLog[];
+  worker_command?: {
+    command_id: string;
+    worker_id: string;
+    type: string;
+    status: string;
+    attempts: number;
+    message: string;
+    error: string;
+    created_at: string;
+    updated_at: string;
+    claimed_at?: string | null;
+    finished_at?: string | null;
+  } | null;
   message?: string;
 };
 
@@ -135,6 +148,14 @@ export function DashboardPage() {
                 <Descriptions.Item label="Trace">{current.data?.round?.trace_status || "-"}</Descriptions.Item>
                 <Descriptions.Item label="GitHub">{current.data?.round?.github_status || "-"}</Descriptions.Item>
                 <Descriptions.Item label="飞书">{current.data?.round?.feishu_status || "-"}</Descriptions.Item>
+                <Descriptions.Item label="Worker 命令">
+                  {current.data?.worker_command
+                    ? `${current.data.worker_command.type} / ${current.data.worker_command.status}`
+                    : "-"}
+                </Descriptions.Item>
+                <Descriptions.Item label="Worker ID">
+                  {current.data?.worker_command?.worker_id || "-"}
+                </Descriptions.Item>
               </Descriptions>
             </Card>
             {current.data?.round?.prompt ? (

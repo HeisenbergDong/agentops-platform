@@ -25,6 +25,11 @@ from app.services.orchestrator.prompt_writer import (
     mark_prompt_generation_failed,
 )
 from app.services.user_settings import load_user_settings, readiness
+from app.services.orchestrator.worker_dispatch import (
+    WorkerDispatchError,
+    dispatch_prompt_to_worker,
+    mark_worker_dispatch_failed,
+)
 from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType
 
 router = APIRouter()
@@ -89,6 +94,11 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
             generate_round_prompt(db, user, job, round_)
         except PromptGenerationError as exc:
             mark_prompt_generation_failed(db, job, round_, str(exc))
+        if job.status == JobState.PROMPT_READY:
+            try:
+                dispatch_prompt_to_worker(db, user, job, round_)
+            except WorkerDispatchError as exc:
+                mark_worker_dispatch_failed(db, job, round_, str(exc))
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -127,11 +137,20 @@ def continue_job(
                 message="Existing prompt preserved and ready for worker dispatch.",
                 extra={"prompt_chars": len(round_.prompt)},
             )
+            try:
+                dispatch_prompt_to_worker(db, user, job, round_)
+            except WorkerDispatchError as exc:
+                mark_worker_dispatch_failed(db, job, round_, str(exc))
         else:
             try:
                 generate_round_prompt(db, user, job, round_)
             except PromptGenerationError as exc:
                 mark_prompt_generation_failed(db, job, round_, str(exc))
+            if job.status == JobState.PROMPT_READY:
+                try:
+                    dispatch_prompt_to_worker(db, user, job, round_)
+                except WorkerDispatchError as exc:
+                    mark_worker_dispatch_failed(db, job, round_, str(exc))
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -228,6 +247,7 @@ def serialize_job(db: Session, job) -> dict:
         }
         if round_
         else None,
+        "worker_command": serialize_worker_command(latest_worker_command(db, job.id, round_.id if round_ else None)),
         "logs": [serialize_log(item) for item in logs],
     }
 
@@ -240,6 +260,33 @@ def serialize_log(item) -> dict:
         "message": item.message,
         "extra": item.extra,
         "created_at": item.created_at.isoformat(),
+    }
+
+
+def latest_worker_command(db: Session, job_id: str, round_id: str | None):
+    from app.db.models import WorkerCommand
+
+    query = select(WorkerCommand).where(WorkerCommand.job_id == job_id)
+    if round_id:
+        query = query.where(WorkerCommand.round_id == round_id)
+    return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def serialize_worker_command(item) -> dict | None:
+    if not item:
+        return None
+    return {
+        "command_id": item.id,
+        "worker_id": item.worker_id,
+        "type": item.command_type,
+        "status": item.status,
+        "attempts": item.attempts,
+        "message": item.message,
+        "error": item.error,
+        "created_at": item.created_at.isoformat(),
+        "updated_at": item.updated_at.isoformat(),
+        "claimed_at": item.claimed_at.isoformat() if item.claimed_at else None,
+        "finished_at": item.finished_at.isoformat() if item.finished_at else None,
     }
 
 
