@@ -20,7 +20,7 @@ from app.db.repositories.jobs import (
     list_logs,
 )
 from app.db.repositories.rules import active_rule_version
-from app.db.repositories.workers import create_worker_command, get_worker_by_worker_id
+from app.db.repositories.workers import create_worker_command, expire_worker_command_leases, get_worker_by_worker_id
 from app.db.session import get_db
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator.prompt_writer import (
@@ -185,6 +185,7 @@ def continue_job(
 
 @router.post("/retry-worker-command")
 def retry_worker_command(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    expire_worker_command_leases(db)
     job = current_active_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to retry."}
@@ -317,6 +318,7 @@ def stop_job(
 
 @router.get("/current")
 def get_current_job(user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    expire_worker_command_leases(db)
     job = current_job(db, user.id)
     if not job:
         return {"status": "idle", "job": None, "logs": []}
@@ -449,6 +451,8 @@ def serialize_worker_command(item) -> dict | None:
         "type": item.command_type,
         "status": item.status,
         "attempts": item.attempts,
+        "lease_id": item.lease_id,
+        "lease_expires_at": item.lease_expires_at.isoformat() if item.lease_expires_at else None,
         "message": item.message,
         "error": item.error,
         "payload": _safe_command_dict(item.payload),

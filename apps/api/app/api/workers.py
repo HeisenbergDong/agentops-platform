@@ -15,10 +15,10 @@ from app.db.repositories.workers import (
     ack_worker_command,
     create_worker_command,
     finish_worker_command,
-    get_worker_command,
     get_worker_by_worker_id,
     list_workers,
     poll_worker_commands,
+    read_worker_command_for_worker,
     register_worker,
     update_worker_heartbeat,
 )
@@ -124,30 +124,46 @@ def poll_commands(
 def ack_command(
     worker_id: str,
     command_id: str,
+    lease_id: str = "",
     worker: Worker = Depends(current_worker),
     db: Session = Depends(get_db),
 ) -> dict:
     if worker.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
-    command = ack_worker_command(db, worker_id, command_id)
+    command, status = ack_worker_command(db, worker_id, command_id, lease_id=lease_id)
     if not command:
         raise HTTPException(status_code=404, detail="Command not found")
-    return serialize_command(command)
+    result = serialize_command(command)
+    result["ack_status"] = status
+    if status != "ok":
+        result["status"] = status
+    return result
 
 
 @router.get("/{worker_id}/commands/{command_id}")
 def get_command_status(
     worker_id: str,
     command_id: str,
+    lease_id: str = "",
     worker: Worker = Depends(current_worker),
     db: Session = Depends(get_db),
 ) -> dict:
     if worker.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
-    command = get_worker_command(db, worker_id, command_id)
+    command, status = read_worker_command_for_worker(
+        db,
+        worker_id,
+        command_id,
+        lease_id=lease_id,
+        renew=True,
+    )
     if not command:
         raise HTTPException(status_code=404, detail="Command not found")
-    return serialize_command(command)
+    result = serialize_command(command)
+    result["read_status"] = status
+    if status != "ok":
+        result["status"] = status
+    return result
 
 
 @router.post("/{worker_id}/results")
@@ -159,9 +175,11 @@ def post_result(
 ) -> dict:
     if worker.worker_id != worker_id or payload.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
-    command = finish_worker_command(db, worker_id, payload)
+    command, status = finish_worker_command(db, worker_id, payload)
     if not command:
         raise HTTPException(status_code=404, detail="Command not found")
+    if status == "stale_lease":
+        return {"status": "ignored", "reason": "stale_lease", "worker_id": worker_id, "command": serialize_command(command)}
     handle_worker_result(db, command, payload)
     return {"status": "received", "worker_id": worker_id, "command": serialize_command(command)}
 
@@ -303,6 +321,8 @@ def serialize_command(item) -> dict:
         "payload": item.payload,
         "status": item.status,
         "attempts": item.attempts,
+        "lease_id": item.lease_id,
+        "lease_expires_at": item.lease_expires_at.isoformat() if item.lease_expires_at else None,
         "message": item.message,
         "result": item.result,
         "error": item.error,

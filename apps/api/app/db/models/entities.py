@@ -77,6 +77,8 @@ class WorkerCommand(IdMixin, TimestampMixin, Base):
     status: Mapped[str] = mapped_column(String(32), default="queued", index=True)
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    lease_id: Mapped[str] = mapped_column(String(64), default="", index=True)
+    lease_expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     finished_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     message: Mapped[str] = mapped_column(Text, default="")
     result: Mapped[dict] = mapped_column(JSON, default=dict)

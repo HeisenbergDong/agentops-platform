@@ -76,7 +76,7 @@ def test_run_once_posts_worker_process_events(tmp_path):
                 }
             ]
 
-        def ack_command(self, worker_id: str, command_id: str) -> dict:
+        def ack_command(self, worker_id: str, command_id: str, lease_id: str = "") -> dict:
             return {"status": "claimed"}
 
         def post_log(self, worker_id: str, payload: dict) -> dict:

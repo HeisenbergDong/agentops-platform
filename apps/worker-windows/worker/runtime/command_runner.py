@@ -46,9 +46,12 @@ class CommandRunner:
         command_id = command.get("command_id", "")
         command_type = command.get("type", "")
         payload = command.get("payload") or {}
+        lease_id = str(command.get("lease_id") or "")
         cancellation = CancellationToken(self.state, command_id, self.cancellation_checker)
         try:
             self.state.busy = True
+            self.state.current_command_id = command_id
+            self.state.current_lease_id = lease_id
             self.state.stage = command_type or "unknown_command"
             if command_type != "stop_current_task":
                 self.state.stop_requested = False
@@ -85,16 +88,18 @@ class CommandRunner:
                 self.state.stop_requested = True
                 data = {"stopped": True}
             else:
-                return self._failed(command_id, f"Unsupported command type: {command_type}")
-            return self._success(command_id, data)
+                return self._failed(command_id, f"Unsupported command type: {command_type}", lease_id=lease_id)
+            return self._success(command_id, data, lease_id=lease_id)
         except CommandCancelled as exc:
-            return self._cancelled(command_id, str(exc))
+            return self._cancelled(command_id, str(exc), lease_id=lease_id)
         except (TraeAutomationError, PromptSendError) as exc:
-            return self._manual_required(command_id, str(exc))
+            return self._manual_required(command_id, str(exc), lease_id=lease_id)
         except Exception as exc:
-            return self._failed(command_id, str(exc))
+            return self._failed(command_id, str(exc), lease_id=lease_id)
         finally:
             self.state.busy = False
+            self.state.current_command_id = ""
+            self.state.current_lease_id = ""
             if self.state.stage != "prompt_sent":
                 self.state.stage = "idle"
 
@@ -249,39 +254,43 @@ class CommandRunner:
         candidate = workspace_path or self.settings.workspace_root
         return candidate if candidate and candidate.exists() else workspace_path
 
-    def _success(self, command_id: str, data: dict) -> dict:
+    def _success(self, command_id: str, data: dict, lease_id: str = "") -> dict:
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
+            "lease_id": lease_id,
             "status": "success",
             "message": "Command processed",
             "data": data,
         }
 
-    def _manual_required(self, command_id: str, error: str) -> dict:
+    def _manual_required(self, command_id: str, error: str, lease_id: str = "") -> dict:
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
+            "lease_id": lease_id,
             "status": "manual_required",
             "message": "Command requires manual worker intervention",
             "data": {},
             "error": error,
         }
 
-    def _cancelled(self, command_id: str, message: str) -> dict:
+    def _cancelled(self, command_id: str, message: str, lease_id: str = "") -> dict:
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
+            "lease_id": lease_id,
             "status": "cancelled",
             "message": message or "Command cancelled",
             "data": {},
             "error": "",
         }
 
-    def _failed(self, command_id: str, error: str) -> dict:
+    def _failed(self, command_id: str, error: str, lease_id: str = "") -> dict:
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
+            "lease_id": lease_id,
             "status": "failed",
             "message": "Command failed",
             "data": {},

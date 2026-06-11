@@ -34,19 +34,21 @@ class WorkerClient:
         response.raise_for_status()
         return response.json().get("commands", [])
 
-    def ack_command(self, worker_id: str, command_id: str) -> dict:
+    def ack_command(self, worker_id: str, command_id: str, lease_id: str = "") -> dict:
         response = httpx.post(
             f"{self.server_url}/api/workers/{worker_id}/commands/{command_id}/ack",
             headers=self.headers,
+            params={"lease_id": lease_id} if lease_id else None,
             timeout=20,
         )
         response.raise_for_status()
         return response.json()
 
-    def get_command(self, worker_id: str, command_id: str) -> dict:
+    def get_command(self, worker_id: str, command_id: str, lease_id: str = "") -> dict:
         response = httpx.get(
             f"{self.server_url}/api/workers/{worker_id}/commands/{command_id}",
             headers=self.headers,
+            params={"lease_id": lease_id} if lease_id else None,
             timeout=10,
         )
         response.raise_for_status()

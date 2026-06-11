@@ -28,11 +28,13 @@ class WorkerCommand(BaseModel):
     round_id: str | None = None
     type: WorkerCommandType
     payload: dict[str, Any] = Field(default_factory=dict)
+    lease_id: str = ""
 
 
 class WorkerResult(BaseModel):
     command_id: str
     worker_id: str
+    lease_id: str = ""
     status: str
     message: str = ""
     data: dict[str, Any] = Field(default_factory=dict)

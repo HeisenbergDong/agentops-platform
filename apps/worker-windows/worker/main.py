@@ -19,6 +19,7 @@ from worker.registration import RegistrationOptions, is_registered, machine_fing
 from worker.system.console import disable_quick_edit_mode
 
 ACTIVE_COMMAND_STATUSES = {"queued", "claimed", "running"}
+STALE_LEASE_STATUSES = {"stale_lease", "expired_lease"}
 MAX_COMMAND_STATUS_FAILURES = 3
 
 
@@ -55,14 +56,25 @@ def run_once(
             client.post_result(worker_settings.worker_id, result)
             processed += 1
             continue
-        acked = client.ack_command(worker_settings.worker_id, command["command_id"])
+        acked = client.ack_command(
+            worker_settings.worker_id,
+            command["command_id"],
+            lease_id=str(command.get("lease_id") or ""),
+        )
+        if is_stale_lease_response(acked):
+            log(f"Skipped stale worker command lease: {command.get('command_id')}")
+            processed += 1
+            continue
         if is_cancelled_command(acked):
             result = cancelled_result(worker_settings.worker_id, command, "Command was cancelled before worker execution.")
             client.post_result(worker_settings.worker_id, result)
             processed += 1
             continue
+        command = {**command, "lease_id": str(acked.get("lease_id") or command.get("lease_id") or "")}
         post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
         result = runner.run(command)
+        if command.get("lease_id") and "lease_id" not in result:
+            result["lease_id"] = command["lease_id"]
         result = attach_worker_uploads(client, worker_settings.worker_id, command, result)
         post_worker_event(
             client,
@@ -235,13 +247,20 @@ def attach_cancellation_checker(
 
     def checker(command_id: str) -> bool:
         try:
-            command = client.get_command(worker_settings.worker_id, command_id)
+            command = client.get_command(
+                worker_settings.worker_id,
+                command_id,
+                lease_id=getattr(runner.state, "current_lease_id", ""),
+            )
         except Exception as exc:
             failures = failures_by_command.get(command_id, 0) + 1
             failures_by_command[command_id] = failures
             log(f"Could not read command status for {command_id}: {exc} ({failures}/{MAX_COMMAND_STATUS_FAILURES}).")
             return failures >= MAX_COMMAND_STATUS_FAILURES
         failures_by_command[command_id] = 0
+        if is_stale_lease_response(command):
+            log(f"Command lease is no longer active for {command_id}; stopping local execution.")
+            return True
         return is_cancelled_command(command)
 
     runner.cancellation_checker = checker
@@ -394,10 +413,17 @@ def is_cancelled_command(command: dict) -> bool:
     return bool(status) and command_type != "stop_current_task"
 
 
+def is_stale_lease_response(command: dict) -> bool:
+    status = str(command.get("status") or command.get("ack_status") or command.get("read_status") or "").lower()
+    reason = str(command.get("reason") or "").lower()
+    return status in STALE_LEASE_STATUSES or reason in STALE_LEASE_STATUSES
+
+
 def cancelled_result(worker_id: str, command: dict, message: str) -> dict:
     return {
         "command_id": command.get("command_id", ""),
         "worker_id": worker_id,
+        "lease_id": str(command.get("lease_id") or ""),
         "status": "cancelled",
         "message": message,
         "data": {},

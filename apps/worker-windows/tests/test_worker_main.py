@@ -17,7 +17,7 @@ class FakeClient:
     def poll_commands(self, worker_id):
         return self.commands
 
-    def ack_command(self, worker_id, command_id):
+    def ack_command(self, worker_id, command_id, lease_id=""):
         return self.ack_response
 
     def post_result(self, worker_id, payload):
@@ -58,7 +58,7 @@ class FakeRunner:
 
 
 def test_run_once_skips_command_cancelled_after_ack(tmp_path: Path):
-    command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}}
+    command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
     client = FakeClient(commands=[command], ack_response={**command, "status": "cancelled"})
     runner = FakeRunner()
     settings = WorkerSettings(
@@ -83,9 +83,10 @@ def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):
         "job_id": "job1",
         "round_id": "round1",
         "type": "capture_screenshot",
+        "lease_id": "claim-1",
         "payload": {},
     }
-    client = FakeClient(commands=[command], ack_response={**command, "status": "running"})
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
 
     class ScreenshotRunner(FakeRunner):
         def run(self, command):
@@ -118,6 +119,7 @@ def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):
     assert client.results[0]["data"]["upload_status"] == "uploaded"
     assert client.results[0]["data"]["server_attachment"]["id"] == "att1"
     assert client.results[0]["data"]["server_attachment"]["job_id"] == "job1"
+    assert client.results[0]["lease_id"] == "run-1"
 
 
 def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
@@ -147,3 +149,21 @@ def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
     assert settings.workspace_root == assigned_root
     assert settings.browser_url == "http://localhost:5173"
     assert runner.settings is settings
+
+
+def test_run_once_skips_stale_lease_after_ack(tmp_path: Path):
+    command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
+    client = FakeClient(commands=[command], ack_response={**command, "status": "stale_lease"})
+    runner = FakeRunner()
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=runner, worker_settings=settings)
+
+    assert processed == 1
+    assert runner.ran is False
+    assert client.results == []

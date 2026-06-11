@@ -52,6 +52,12 @@ def ensure_schema_extensions() -> None:
             statements.append("alter table workers add column registered_at timestamp with time zone not null default now()")
         if "revoked_at" not in worker_columns:
             statements.append("alter table workers add column revoked_at timestamp with time zone null")
+    if "worker_commands" in inspector.get_table_names():
+        command_columns = {item["name"] for item in inspector.get_columns("worker_commands")}
+        if "lease_id" not in command_columns:
+            statements.append("alter table worker_commands add column lease_id varchar(64) not null default ''")
+        if "lease_expires_at" not in command_columns:
+            statements.append("alter table worker_commands add column lease_expires_at timestamp with time zone null")
     if not statements:
         return
     with engine.begin() as connection:

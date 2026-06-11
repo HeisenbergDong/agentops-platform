@@ -19,6 +19,9 @@ class Settings(BaseSettings):
     attachment_root: Path = Field(default=Path("./storage"))
     cors_origins_raw: str = Field(default="http://localhost:5173", alias="CORS_ORIGINS")
     worker_token_dev: str = "change-me-worker-token"
+    worker_command_claim_lease_seconds: int = 60
+    worker_command_run_lease_seconds: int = 120
+    worker_command_max_claim_attempts: int = 3
 
     @cached_property
     def cors_origins(self) -> list[str]:

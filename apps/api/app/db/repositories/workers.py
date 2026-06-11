@@ -1,21 +1,27 @@
-from datetime import timedelta
+from datetime import datetime, timedelta
 
 from sqlalchemy import desc, select
 from sqlalchemy.orm import Session
 
+from app.core.config import settings
 from app.core.security import (
     generate_worker_registration_code,
     generate_worker_token,
     hash_worker_secret,
 )
-from app.db.models import Worker, WorkerCommand, WorkerRegistrationCode
+from app.db.models import Job, RuntimeLog, TaskRound, Worker, WorkerCommand, WorkerRegistrationCode
 from app.db.models.base import new_id, now_utc
+from app.services.orchestrator.events import build_display_message
+from app.services.orchestrator.states import JobState
 from app.worker_gateway.contracts import (
     CreateWorkerCommandRequest,
     WorkerHeartbeat,
     WorkerRegisterRequest,
     WorkerResult,
 )
+
+LEASED_COMMAND_STATES = {"claimed", "running"}
+TERMINAL_COMMAND_STATES = {"completed", "failed", "manual_required", "cancelled"}
 
 
 def create_registration_code(
@@ -94,6 +100,7 @@ def _is_expired(expires_at) -> bool:
 
 
 def update_worker_heartbeat(db: Session, worker: Worker, payload: WorkerHeartbeat) -> Worker:
+    expire_worker_command_leases(db, worker_id=worker.worker_id)
     worker.display_name = payload.display_name or worker.display_name or payload.machine_name
     worker.worker_type = payload.worker_type or worker.worker_type
     worker.machine_name = payload.machine_name
@@ -146,6 +153,8 @@ def create_worker_command(
         command_type=payload.type.value,
         payload=payload.payload,
         status="queued",
+        lease_id="",
+        lease_expires_at=None,
     )
     db.add(command)
     db.commit()
@@ -154,6 +163,7 @@ def create_worker_command(
 
 
 def poll_worker_commands(db: Session, worker_id: str, limit: int = 5) -> list[WorkerCommand]:
+    expire_worker_command_leases(db, worker_id=worker_id)
     rows = list(
         db.scalars(
             select(WorkerCommand)
@@ -162,29 +172,45 @@ def poll_worker_commands(db: Session, worker_id: str, limit: int = 5) -> list[Wo
             .limit(limit)
         ).all()
     )
+    claimed_at = now_utc()
     for row in rows:
         row.status = "claimed"
-        row.claimed_at = now_utc()
+        row.claimed_at = claimed_at
         row.attempts += 1
+        row.lease_id = new_id()
+        row.lease_expires_at = claimed_at + timedelta(seconds=max(1, settings.worker_command_claim_lease_seconds))
     db.commit()
     return rows
 
 
-def ack_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCommand | None:
+def ack_worker_command(
+    db: Session,
+    worker_id: str,
+    command_id: str,
+    lease_id: str = "",
+) -> tuple[WorkerCommand | None, str]:
+    expire_worker_command_leases(db, worker_id=worker_id)
     command = db.scalar(
         select(WorkerCommand).where(WorkerCommand.id == command_id, WorkerCommand.worker_id == worker_id)
     )
     if not command:
-        return None
-    if command.status == "cancelled":
+        return None, "missing"
+    if command.status in TERMINAL_COMMAND_STATES:
         db.commit()
         db.refresh(command)
-        return command
+        return command, "ok"
+    if command.status != "claimed" or not _lease_matches(command, lease_id):
+        db.commit()
+        db.refresh(command)
+        return command, "stale_lease"
+    now = now_utc()
     command.status = "running"
-    command.claimed_at = command.claimed_at or now_utc()
+    command.claimed_at = command.claimed_at or now
+    command.lease_id = new_id()
+    command.lease_expires_at = now + timedelta(seconds=max(1, settings.worker_command_run_lease_seconds))
     db.commit()
     db.refresh(command)
-    return command
+    return command, "ok"
 
 
 def get_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCommand | None:
@@ -196,10 +222,53 @@ def get_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCo
     )
 
 
-def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) -> WorkerCommand | None:
+def read_worker_command_for_worker(
+    db: Session,
+    worker_id: str,
+    command_id: str,
+    lease_id: str = "",
+    *,
+    renew: bool = False,
+) -> tuple[WorkerCommand | None, str]:
+    expire_worker_command_leases(db, worker_id=worker_id)
+    command = get_worker_command(db, worker_id, command_id)
+    if not command:
+        return None, "missing"
+    if command.status == "running":
+        if not _lease_matches(command, lease_id):
+            db.commit()
+            db.refresh(command)
+            return command, "stale_lease"
+        if renew:
+            command.lease_expires_at = now_utc() + timedelta(
+                seconds=max(1, settings.worker_command_run_lease_seconds)
+            )
+            db.commit()
+            db.refresh(command)
+    return command, "ok"
+
+
+def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) -> tuple[WorkerCommand | None, str]:
     command = get_worker_command(db, worker_id, payload.command_id)
     if not command:
-        return None
+        return None, "missing"
+    if command.status == "cancelled":
+        if payload.status != "cancelled":
+            db.commit()
+            db.refresh(command)
+            return command, "stale_lease"
+        if command.lease_id and not _lease_matches(command, payload.lease_id):
+            db.commit()
+            db.refresh(command)
+            return command, "stale_lease"
+    elif command.status in TERMINAL_COMMAND_STATES:
+        db.commit()
+        db.refresh(command)
+        return command, "stale_lease"
+    elif command.lease_id and not _lease_matches(command, payload.lease_id):
+        db.commit()
+        db.refresh(command)
+        return command, "stale_lease"
     if command.status == "cancelled":
         command.finished_at = command.finished_at or now_utc()
     elif payload.status in {"ok", "success", "completed"}:
@@ -209,9 +278,126 @@ def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) ->
     else:
         command.status = "failed"
     command.finished_at = now_utc()
+    command.lease_id = ""
+    command.lease_expires_at = None
     command.message = payload.message
     command.result = payload.data
     command.error = payload.error or ""
     db.commit()
     db.refresh(command)
-    return command
+    return command, "ok"
+
+
+def expire_worker_command_leases(db: Session, worker_id: str | None = None) -> dict[str, int]:
+    now = now_utc()
+    query = select(WorkerCommand).where(
+        WorkerCommand.status.in_(LEASED_COMMAND_STATES),
+        WorkerCommand.lease_expires_at.is_not(None),
+    )
+    if worker_id:
+        query = query.where(WorkerCommand.worker_id == worker_id)
+    commands = [
+        command
+        for command in db.scalars(query).all()
+        if command.lease_expires_at and _is_at_or_before(command.lease_expires_at, now)
+    ]
+    requeued = 0
+    cancelled = 0
+    failed = 0
+    for command in commands:
+        previous_status = command.status
+        if command.status == "claimed":
+            if command.attempts >= max(1, settings.worker_command_max_claim_attempts):
+                command.status = "failed"
+                command.finished_at = now
+                command.error = "Worker command claim lease expired too many times."
+                command.message = command.error
+                command.lease_id = ""
+                command.lease_expires_at = None
+                failed += 1
+                _mark_job_manual_required(db, command, now)
+            else:
+                command.status = "queued"
+                command.claimed_at = None
+                command.lease_id = ""
+                command.lease_expires_at = None
+                command.message = "Worker command claim lease expired; requeued."
+                requeued += 1
+        elif command.status == "running":
+            command.status = "cancelled"
+            command.finished_at = now
+            command.error = "Worker command run lease expired; worker likely crashed or lost contact."
+            command.message = command.error
+            command.lease_id = ""
+            command.lease_expires_at = None
+            cancelled += 1
+            _mark_job_manual_required(db, command, now)
+        if command.status != previous_status:
+            _add_lease_expired_log(db, command, previous_status, now)
+    if commands:
+        db.commit()
+    return {"requeued": requeued, "cancelled": cancelled, "failed": failed}
+
+
+def _lease_matches(command: WorkerCommand, lease_id: str | None) -> bool:
+    expected = str(command.lease_id or "")
+    provided = str(lease_id or "")
+    return bool(expected) and expected == provided
+
+
+def _is_at_or_before(value: datetime, reference: datetime) -> bool:
+    if value.tzinfo is None and reference.tzinfo is not None:
+        reference = reference.replace(tzinfo=None)
+    elif value.tzinfo is not None and reference.tzinfo is None:
+        value = value.replace(tzinfo=None)
+    return value <= reference
+
+
+def _mark_job_manual_required(db: Session, command: WorkerCommand, now: datetime) -> None:
+    if not command.job_id:
+        return
+    job = db.get(Job, command.job_id)
+    if job and job.status not in {JobState.STOPPED, JobState.PROJECT_COMPLETED}:
+        job.status = JobState.MANUAL_REQUIRED
+        job.updated_at = now
+    if command.round_id:
+        round_ = db.get(TaskRound, command.round_id)
+        if round_ and round_.status not in {JobState.STOPPED, JobState.PROJECT_COMPLETED}:
+            round_.status = JobState.MANUAL_REQUIRED
+            round_.updated_at = now
+
+
+def _add_lease_expired_log(
+    db: Session,
+    command: WorkerCommand,
+    previous_status: str,
+    now: datetime,
+) -> None:
+    if not command.job_id:
+        return
+    level = "warning" if command.status == "queued" else "error"
+    message = (
+        "Worker command claim lease expired and was requeued."
+        if command.status == "queued"
+        else "Worker command lease expired; command was stopped for crash recovery."
+    )
+    extra = {
+        "command_id": command.id,
+        "worker_id": command.worker_id,
+        "command_type": command.command_type,
+        "previous_status": previous_status,
+        "status": command.status,
+        "attempts": command.attempts,
+    }
+    log = RuntimeLog(
+        job_id=command.job_id,
+        round_id=command.round_id,
+        level=level,
+        stage="worker_command_lease_expired",
+        message=message,
+        display_message=build_display_message("worker_command_lease_expired", message, level=level, extra=extra),
+        extra=extra,
+        created_at=now,
+        updated_at=now,
+    )
+    db.add(log)
