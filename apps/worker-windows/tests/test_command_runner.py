@@ -238,6 +238,29 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
     assert "cancelled" in result["message"].lower()
 
 
+def test_capture_screenshot_routes_quality_payload(monkeypatch: pytest.MonkeyPatch):
+    received = {}
+
+    def fake_capture_screenshot(target: str, timeout_seconds: float, quality_required: bool):
+        received["target"] = target
+        received["timeout_seconds"] = timeout_seconds
+        received["quality_required"] = quality_required
+        return {"status": "captured", "path": "screen.png"}
+
+    monkeypatch.setattr(command_runner, "capture_screenshot", fake_capture_screenshot)
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {
+            "command_id": "cmd-shot",
+            "type": "capture_screenshot",
+            "payload": {"target": "full_screen", "timeout_seconds": 4, "quality_required": False},
+        }
+    )
+
+    assert result["status"] == "success"
+    assert received == {"target": "full_screen", "timeout_seconds": 4.0, "quality_required": False}
+
+
 def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         command_runner,

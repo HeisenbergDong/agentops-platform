@@ -54,7 +54,7 @@ class CommandRunner:
                 self.state.stop_requested = False
                 cancellation.raise_if_cancelled()
             if command_type == "capture_screenshot":
-                data = capture_screenshot()
+                data = self._capture_screenshot(payload)
             elif command_type == "open_trae":
                 data = self._open_trae(payload)
             elif command_type == "focus_trae":
@@ -126,6 +126,13 @@ class CommandRunner:
             workspace_path,
             launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
             force_open_workspace=bool(payload.get("force_open_workspace", False)),
+        )
+
+    def _capture_screenshot(self, payload: dict[str, Any]) -> dict:
+        return capture_screenshot(
+            target=str(payload.get("target") or "trae_window"),
+            timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            quality_required=bool(payload.get("quality_required", True)),
         )
 
     def _send_prompt(self, payload: dict[str, Any]) -> dict:

@@ -372,6 +372,35 @@ def test_capture_screenshot_uses_uploaded_server_attachment():
     assert attachments[0].path == "storage/workers/worker1/screenshot/server-screen.png"
 
 
+def test_capture_screenshot_rejects_failed_quality_gate():
+    db = _test_session()
+    job, round_, command = _create_capture_screenshot_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "status": "captured",
+                "path": "screenshots/bad.png",
+                "filename": "bad.png",
+                "content_type": "image/png",
+                "size_bytes": 10,
+                "quality": {"ok": False, "reason": "mostly_blank"},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.status == JobState.MANUAL_REQUIRED
+    assert round_.status == JobState.MANUAL_REQUIRED
+    assert db.scalar(select(Attachment).where(Attachment.kind == "screenshot")) is None
+
+
 def test_scan_project_with_recommended_command_queues_product_review_command():
     db = _test_session()
     job, round_, command = _create_scan_project_rows(db)

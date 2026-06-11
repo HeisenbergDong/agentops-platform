@@ -297,7 +297,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             db,
             command,
             WorkerCommandType.CAPTURE_SCREENSHOT,
-            {},
+            {"target": "trae_window", "quality_required": True},
         )
         add_log(
             db,
@@ -333,7 +333,9 @@ def _handle_capture_screenshot_result(db: Session, command: WorkerCommand, resul
     extra = _result_extra(command, result)
     data_status = str(result.data.get("status") or "")
     screenshot_path = str(result.data.get("path") or "")
-    if result.status not in {"ok", "success", "completed"} or data_status != "captured" or not screenshot_path:
+    quality = result.data.get("quality") if isinstance(result.data, dict) else {}
+    quality_failed = isinstance(quality, dict) and quality.get("ok") is False
+    if result.status not in {"ok", "success", "completed"} or data_status != "captured" or not screenshot_path or quality_failed:
         _mark_manual_required(
             db,
             job,
@@ -1751,12 +1753,25 @@ def _latest_trace_text(db: Session, job_id: str, round_id: str) -> str:
 
 
 def _latest_attachment(db: Session, job_id: str, round_id: str, kind: str) -> Attachment | None:
-    return db.scalar(
-        select(Attachment)
-        .where(Attachment.job_id == job_id, Attachment.round_id == round_id, Attachment.kind == kind)
-        .order_by(Attachment.created_at.desc())
-        .limit(1)
+    attachments = list(
+        db.scalars(
+            select(Attachment)
+            .where(Attachment.job_id == job_id, Attachment.round_id == round_id, Attachment.kind == kind)
+            .order_by(Attachment.created_at.desc())
+        ).all()
     )
+    if not attachments:
+        return None
+    return max(attachments, key=_attachment_freshness_key)
+
+
+def _attachment_freshness_key(attachment: Attachment) -> tuple[float, float, str]:
+    created = attachment.created_at.timestamp() if attachment.created_at else 0.0
+    try:
+        file_mtime = Path(str(attachment.path or "")).stat().st_mtime
+    except OSError:
+        file_mtime = 0.0
+    return (created, file_mtime, str(attachment.id or ""))
 
 
 def _runtime_log_text(db: Session, job_id: str, round_id: str) -> str:
