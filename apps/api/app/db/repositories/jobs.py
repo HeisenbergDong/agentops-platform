@@ -101,6 +101,32 @@ def cleanup_user_runtime_state(db: Session, user_id: str) -> dict:
     }
 
 
+def cancel_job_worker_commands(
+    db: Session,
+    job_id: str,
+    *,
+    reason: str = "Cancelled by user stop.",
+    exclude_command_types: set[str] | None = None,
+) -> int:
+    exclude_command_types = exclude_command_types or set()
+    commands = list(
+        db.scalars(
+            select(WorkerCommand).where(
+                WorkerCommand.job_id == job_id,
+                WorkerCommand.status.in_(ACTIVE_COMMAND_STATES),
+            )
+        ).all()
+    )
+    cancelled = 0
+    for command in commands:
+        if command.command_type in exclude_command_types:
+            continue
+        command.status = "cancelled"
+        command.message = reason
+        cancelled += 1
+    return cancelled
+
+
 def latest_round(db: Session, job_id: str) -> TaskRound | None:
     return db.scalar(
         select(TaskRound)

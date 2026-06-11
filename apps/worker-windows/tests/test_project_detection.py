@@ -72,7 +72,7 @@ def test_browser_acceptance_starts_nested_vite_dev_server(monkeypatch: pytest.Mo
     ]
     launched = {}
 
-    def fake_fetch(project_path: str, normalized_url: str, timeout_seconds: float):
+    def fake_fetch(project_path: str, normalized_url: str, timeout_seconds: float, cancellation_check=None):
         return fetch_results.pop(0)
 
     class FakeProcess:
@@ -121,7 +121,7 @@ def test_git_push_args_set_upstream_when_missing(monkeypatch: pytest.MonkeyPatch
         stdout = ""
         stderr = "no upstream"
 
-    def fake_git(cwd: Path, args: list[str], timeout: int):
+    def fake_git(cwd: Path, args: list[str], timeout: int, cancellation_check=None):
         calls.append(args)
         return Result()
 

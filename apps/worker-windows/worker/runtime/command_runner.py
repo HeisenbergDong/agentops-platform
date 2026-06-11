@@ -1,6 +1,6 @@
 from pathlib import Path
 import time
-from typing import Any
+from typing import Any, Callable
 
 from worker.config import WorkerSettings, settings
 from worker.project.browser_acceptance import run_browser_acceptance
@@ -8,6 +8,7 @@ from worker.project.commands import run_project_command
 from worker.project.git_submit import run_git_submit
 from worker.project.scanner import scan_project
 from worker.project.workspace import ensure_project_workspace
+from worker.runtime.cancellation import CancellationToken, CommandCancelled
 from worker.runtime.state import WorkerRuntimeState
 from worker.safety.path_guard import assert_within_root
 from worker.trae.diagnose import diagnose_ui
@@ -21,18 +22,28 @@ from worker.trae.window import TraeAutomationError, ensure_trae_running, focus_t
 
 
 class CommandRunner:
-    def __init__(self, worker_id: str | None = None, runtime_settings: WorkerSettings | None = None) -> None:
+    def __init__(
+        self,
+        worker_id: str | None = None,
+        runtime_settings: WorkerSettings | None = None,
+        cancellation_checker: Callable[[str], bool] | None = None,
+    ) -> None:
         self.settings = runtime_settings or settings
         self.worker_id = worker_id or self.settings.worker_id
+        self.cancellation_checker = cancellation_checker
         self.state = WorkerRuntimeState()
 
     def run(self, command: dict) -> dict:
         command_id = command.get("command_id", "")
         command_type = command.get("type", "")
         payload = command.get("payload") or {}
+        cancellation = CancellationToken(self.state, command_id, self.cancellation_checker)
         try:
             self.state.busy = True
             self.state.stage = command_type or "unknown_command"
+            if command_type != "stop_current_task":
+                self.state.stop_requested = False
+                cancellation.raise_if_cancelled()
             if command_type == "capture_screenshot":
                 data = capture_screenshot()
             elif command_type == "open_trae":
@@ -43,7 +54,7 @@ class CommandRunner:
                 data = self._send_prompt(payload)
                 self.state.stage = "prompt_sent"
             elif command_type == "wait_completion":
-                data = self._wait_completion(payload)
+                data = self._wait_completion(payload, cancellation)
                 self.state.stage = "trae_completed"
             elif command_type == "diagnose_ui":
                 data = diagnose_ui()
@@ -56,17 +67,19 @@ class CommandRunner:
             elif command_type == "scan_project":
                 data = self._scan_project(payload)
             elif command_type == "run_command":
-                data = self._run_command(payload)
+                data = self._run_command(payload, cancellation)
             elif command_type == "browser_acceptance":
-                data = self._browser_acceptance(payload)
+                data = self._browser_acceptance(payload, cancellation)
             elif command_type == "git_submit":
-                data = self._git_submit(payload)
+                data = self._git_submit(payload, cancellation)
             elif command_type == "stop_current_task":
                 self.state.stop_requested = True
                 data = {"stopped": True}
             else:
                 return self._failed(command_id, f"Unsupported command type: {command_type}")
             return self._success(command_id, data)
+        except CommandCancelled as exc:
+            return self._cancelled(command_id, str(exc))
         except (TraeAutomationError, PromptSendError) as exc:
             return self._manual_required(command_id, str(exc))
         except Exception as exc:
@@ -129,11 +142,12 @@ class CommandRunner:
         self.state.current_window_title = str(send_result.get("window_title") or self.state.current_window_title)
         return send_result
 
-    def _wait_completion(self, payload: dict[str, Any]) -> dict:
+    def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         return wait_completion(
             timeout_seconds=float(payload.get("timeout_seconds", 900)),
             stable_seconds=float(payload.get("stable_seconds", 15)),
             poll_interval_seconds=float(payload.get("poll_interval_seconds", 2)),
+            cancellation_check=cancellation.raise_if_cancelled,
         )
 
     def _copy_latest_reply(self, payload: dict[str, Any]) -> dict:
@@ -158,23 +172,30 @@ class CommandRunner:
             changed_file_list=payload.get("changed_files"),
         )
 
-    def _run_command(self, payload: dict[str, Any]) -> dict:
+    def _run_command(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         command = payload.get("command")
         if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
             raise ValueError("run_command payload.command must be a list of strings")
         cwd = self._workspace_path(payload.get("cwd") or payload.get("workspace_path")) or self.settings.workspace_root
         timeout = int(payload.get("timeout", 120))
-        return run_project_command(self.settings.workspace_root, cwd, command, timeout=timeout)
+        return run_project_command(
+            self.settings.workspace_root,
+            cwd,
+            command,
+            timeout=timeout,
+            cancellation_check=cancellation.raise_if_cancelled,
+        )
 
-    def _browser_acceptance(self, payload: dict[str, Any]) -> dict:
+    def _browser_acceptance(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         return run_browser_acceptance(
             str(workspace_path or self.settings.workspace_root),
             url=str(payload.get("url") or payload.get("browser_url") or payload.get("acceptance_url") or ""),
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            cancellation_check=cancellation.raise_if_cancelled,
         )
 
-    def _git_submit(self, payload: dict[str, Any]) -> dict:
+    def _git_submit(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         project_path = workspace_path or self.settings.workspace_root
         return run_git_submit(
@@ -187,6 +208,7 @@ class CommandRunner:
             remote_url=str(payload.get("remote_url") or payload.get("github_remote_url") or ""),
             project_name=str(payload.get("project_name") or payload.get("github_repo_name") or ""),
             timeout=int(payload.get("timeout", 120)),
+            cancellation_check=cancellation.raise_if_cancelled,
         )
 
     def _workspace_path(self, raw_path: Any) -> Path | None:
@@ -219,6 +241,16 @@ class CommandRunner:
             "message": "Command requires manual worker intervention",
             "data": {},
             "error": error,
+        }
+
+    def _cancelled(self, command_id: str, message: str) -> dict:
+        return {
+            "command_id": command_id,
+            "worker_id": self.worker_id,
+            "status": "cancelled",
+            "message": message or "Command cancelled",
+            "data": {},
+            "error": "",
         }
 
     def _failed(self, command_id: str, error: str) -> dict:

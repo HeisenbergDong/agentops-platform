@@ -176,6 +176,10 @@ def ack_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCo
     )
     if not command:
         return None
+    if command.status == "cancelled":
+        db.commit()
+        db.refresh(command)
+        return command
     command.status = "running"
     command.claimed_at = command.claimed_at or now_utc()
     db.commit()
@@ -183,16 +187,22 @@ def ack_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCo
     return command
 
 
-def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) -> WorkerCommand | None:
-    command = db.scalar(
+def get_worker_command(db: Session, worker_id: str, command_id: str) -> WorkerCommand | None:
+    return db.scalar(
         select(WorkerCommand).where(
-            WorkerCommand.id == payload.command_id,
+            WorkerCommand.id == command_id,
             WorkerCommand.worker_id == worker_id,
         )
     )
+
+
+def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) -> WorkerCommand | None:
+    command = get_worker_command(db, worker_id, payload.command_id)
     if not command:
         return None
-    if payload.status in {"ok", "success", "completed"}:
+    if command.status == "cancelled":
+        command.finished_at = command.finished_at or now_utc()
+    elif payload.status in {"ok", "success", "completed"}:
         command.status = "completed"
     elif payload.status in {"failed", "manual_required", "cancelled"}:
         command.status = payload.status

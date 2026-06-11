@@ -32,9 +32,15 @@ FEISHU_ATTACHMENT_FIELD = "截图（userprompt附件/产物/运行结果/对话�
 LOG_TRACE_FIELD_SOFT_LIMIT = 45000
 LOG_TRACE_OVERFLOW_TEXT = "因日志超长已经保存txt文档，放在截图列。"
 MAX_ROUNDS_PER_PROJECT = 5
+TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
+TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
+IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
+    if _should_ignore_worker_result(db, command, result):
+        db.commit()
+        return
     if command.command_type == WorkerCommandType.SEND_PROMPT.value:
         _handle_send_prompt_result(db, command, result)
         db.commit()
@@ -1368,6 +1374,68 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
         message="Worker stop command finished.",
         level="info" if result.status in {"ok", "success", "completed"} else "warning",
         extra=_result_extra(command, result),
+    )
+
+
+def _should_ignore_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> bool:
+    if command.command_type == WorkerCommandType.STOP_CURRENT_TASK.value:
+        return False
+    job, round_ = _load_job_round(db, command)
+    if not job:
+        return False
+    if str(command.status) in IGNORED_RESULT_COMMAND_STATES:
+        _record_stale_worker_result(
+            db,
+            command,
+            result,
+            job,
+            round_,
+            "Cancelled worker command returned a late result; scheduler state was preserved.",
+        )
+        return True
+    if str(job.status) in {str(item) for item in TERMINAL_JOB_STATES}:
+        _record_stale_worker_result(
+            db,
+            command,
+            result,
+            job,
+            round_,
+            "Worker result arrived after the job was already terminal; no follow-up command was queued.",
+        )
+        return True
+    if round_ and str(round_.status) in {str(item) for item in TERMINAL_ROUND_STATES}:
+        _record_stale_worker_result(
+            db,
+            command,
+            result,
+            job,
+            round_,
+            "Worker result arrived after the round was already terminal; no follow-up command was queued.",
+        )
+        return True
+    return False
+
+
+def _record_stale_worker_result(
+    db: Session,
+    command: WorkerCommand,
+    result: WorkerResult,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+) -> None:
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else command.round_id,
+        stage="stale_worker_result_ignored",
+        message=message,
+        level="warning",
+        extra={
+            **_result_extra(command, result),
+            "job_status": str(job.status),
+            "round_status": str(round_.status) if round_ else "",
+        },
     )
 
 

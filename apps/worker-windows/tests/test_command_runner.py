@@ -106,6 +106,11 @@ def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytes
     def raise_no_window(*args, **kwargs):
         raise TraeAutomationError("no window")
 
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+    )
     monkeypatch.setattr(command_runner, "send_prompt", raise_no_window)
 
     result = CommandRunner(worker_id="worker-test").run(
@@ -160,10 +165,11 @@ def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tm
 def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
     received = {}
 
-    def fake_wait_completion(timeout_seconds: float, stable_seconds: float, poll_interval_seconds: float):
+    def fake_wait_completion(timeout_seconds: float, stable_seconds: float, poll_interval_seconds: float, cancellation_check=None):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
         received["poll_interval_seconds"] = poll_interval_seconds
+        received["cancellable"] = callable(cancellation_check)
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
@@ -177,7 +183,33 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert result["status"] == "success"
-    assert received == {"timeout_seconds": 30.0, "stable_seconds": 3.0, "poll_interval_seconds": 1.0}
+    assert received == {
+        "timeout_seconds": 30.0,
+        "stable_seconds": 3.0,
+        "poll_interval_seconds": 1.0,
+        "cancellable": True,
+    }
+
+
+def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
+    def fake_wait_completion(timeout_seconds: float, stable_seconds: float, poll_interval_seconds: float, cancellation_check=None):
+        assert cancellation_check is not None
+        cancellation_check()
+        return {"status": "completed"}
+
+    monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
+    runner = CommandRunner(worker_id="worker-test", cancellation_checker=lambda command_id: command_id == "cmd-cancel")
+
+    result = runner.run(
+        {
+            "command_id": "cmd-cancel",
+            "type": "wait_completion",
+            "payload": {"timeout_seconds": 30, "stable_seconds": 3, "poll_interval_seconds": 1},
+        }
+    )
+
+    assert result["status"] == "cancelled"
+    assert "cancelled" in result["message"].lower()
 
 
 def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
@@ -218,10 +250,11 @@ def test_browser_acceptance_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_
     received = {}
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
 
-    def fake_browser_acceptance(project_path: str, url: str, timeout_seconds: float):
+    def fake_browser_acceptance(project_path: str, url: str, timeout_seconds: float, cancellation_check=None):
         received["project_path"] = project_path
         received["url"] = url
         received["timeout_seconds"] = timeout_seconds
+        received["cancellable"] = callable(cancellation_check)
         return {"status": "passed", "url": url}
 
     monkeypatch.setattr(command_runner, "run_browser_acceptance", fake_browser_acceptance)
@@ -240,6 +273,7 @@ def test_browser_acceptance_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_
         "project_path": str(workspace),
         "url": "localhost:5173",
         "timeout_seconds": 3.0,
+        "cancellable": True,
     }
 
 
@@ -249,7 +283,18 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     received = {}
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
 
-    def fake_git_submit(root, project_path, commit_message, push, remote, branch, remote_url, project_name, timeout):
+    def fake_git_submit(
+        root,
+        project_path,
+        commit_message,
+        push,
+        remote,
+        branch,
+        remote_url,
+        project_name,
+        timeout,
+        cancellation_check=None,
+    ):
         received["root"] = root
         received["project_path"] = project_path
         received["commit_message"] = commit_message
@@ -259,6 +304,7 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         received["remote_url"] = remote_url
         received["project_name"] = project_name
         received["timeout"] = timeout
+        received["cancellable"] = callable(cancellation_check)
         return {"status": "committed", "commit_sha": "abc123"}
 
     monkeypatch.setattr(command_runner, "run_git_submit", fake_git_submit)
@@ -292,6 +338,7 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         "remote_url": "git@github.com:acme/project.git",
         "project_name": "project",
         "timeout": 5,
+        "cancellable": True,
     }
 
 

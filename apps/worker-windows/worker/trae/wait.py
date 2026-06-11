@@ -1,5 +1,6 @@
 import hashlib
 import time
+from typing import Callable
 
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
@@ -18,6 +19,7 @@ def wait_completion(
     timeout_seconds: float = 900.0,
     stable_seconds: float = 15.0,
     poll_interval_seconds: float = 2.0,
+    cancellation_check: Callable[[], None] | None = None,
 ) -> dict:
     focus_trae(timeout_seconds=min(10.0, timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
@@ -26,6 +28,8 @@ def wait_completion(
     latest_text = ""
 
     while time.monotonic() < deadline:
+        if cancellation_check:
+            cancellation_check()
         window = find_trae_window(timeout_seconds=2.0)
         latest_text = window_text_snapshot(window)
         signature = hashlib.sha256(latest_text.encode("utf-8", errors="ignore")).hexdigest()
@@ -45,6 +49,17 @@ def wait_completion(
         else:
             stable_since = None
             last_signature = signature
-        time.sleep(poll_interval_seconds)
+        _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
 
     raise TraeAutomationError("Trae output did not become stable before wait_completion timeout")
+
+
+def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], None] | None) -> None:
+    if not cancellation_check:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        cancellation_check()
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    cancellation_check()

@@ -43,6 +43,15 @@ class WorkerClient:
         response.raise_for_status()
         return response.json()
 
+    def get_command(self, worker_id: str, command_id: str) -> dict:
+        response = httpx.get(
+            f"{self.server_url}/api/workers/{worker_id}/commands/{command_id}",
+            headers=self.headers,
+            timeout=10,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def post_result(self, worker_id: str, payload: dict) -> dict:
         response = httpx.post(
             f"{self.server_url}/api/workers/{worker_id}/results",

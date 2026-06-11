@@ -117,7 +117,7 @@ def ensure_round_project_context(
         return context
 
     project_count = int(db.scalar(select(func.count(Project.id)).where(Project.job_id == job.id)) or 0)
-    project_name = _project_name(job, project_count=project_count)
+    project_name = _project_name(job, round_, project_count=project_count)
     workspace_root = str(worker_settings.get("trae_workspace_path") or worker_settings.get("workspace_root") or "").strip()
     workspace_path = _join_workspace_path(workspace_root, project_name) if workspace_root else project_name
     project = Project(
@@ -156,16 +156,111 @@ def _project_context_from_record(project: Project, worker_settings: dict, github
     }
 
 
-def _project_name(job: Job, project_count: int = 0) -> str:
-    direction = _first_direction(job)
-    base = _slugify(direction)
-    digest = hashlib.sha1(f"{job.id}:{direction}".encode("utf-8", errors="ignore")).hexdigest()[:8]
+def _project_name(job: Job, round_: TaskRound | None = None, project_count: int = 0) -> str:
+    source = _project_source_text(job, round_)
+    base = _semantic_slug(source) or _ascii_slugify(source)
+    digest = hashlib.sha1(f"{job.id}:{source}".encode("utf-8", errors="ignore")).hexdigest()[:8]
     if not base or base == "project":
         base = "agentops-project"
     suffix = "" if project_count <= 0 else f"-p{project_count + 1}"
     if base.endswith(digest):
         return f"{base[: max(1, 80 - len(suffix))]}{suffix}"
     return f"{base[: max(1, 70 - len(suffix))].strip('-')}-{digest}{suffix}"
+
+
+def _project_source_text(job: Job, round_: TaskRound | None = None) -> str:
+    parts = [_first_direction(job)]
+    if round_ and round_.prompt:
+        parts.append(round_.prompt)
+    return " ".join(part for part in parts if part).strip()
+
+
+PHRASE_SLUGS = (
+    ("\u8ba2\u5355\u770b\u677f", "order-dashboard"),
+    ("\u8ba2\u5355\u7ba1\u7406", "order-management"),
+    ("\u5ba2\u6237\u7ba1\u7406", "crm-system"),
+    ("\u4ed3\u50a8\u7ba1\u7406", "warehouse-management"),
+    ("\u5e93\u5b58\u7ba1\u7406", "inventory-management"),
+    ("\u7269\u6d41\u8ddf\u8e2a", "logistics-tracking"),
+    ("\u5feb\u9012", "express-logistics"),
+    ("\u7269\u4e1a", "property-management"),
+    ("\u793e\u533a", "community-platform"),
+    ("\u5ba1\u6279", "approval-workflow"),
+    ("\u6743\u9650", "permission-system"),
+    ("\u89c4\u5219\u4e2d\u5fc3", "rules-center"),
+    ("\u89d2\u8272\u5de5\u4f5c\u53f0", "role-workspace"),
+    ("\u7528\u6237\u914d\u7f6e", "user-settings"),
+    ("\u5f02\u5e38\u4e2d\u5fc3", "error-center"),
+    ("\u98de\u4e66", "feishu-integration"),
+    ("github", "github-integration"),
+    ("agentops", "agentops-platform"),
+)
+
+KEYWORD_SLUG_PARTS = (
+    ("\u8ba2\u5355", "order"),
+    ("\u5ba2\u6237", "crm"),
+    ("\u4ed3\u5e93", "warehouse"),
+    ("\u4ed3\u50a8", "warehouse"),
+    ("\u5e93\u5b58", "inventory"),
+    ("\u7269\u6d41", "logistics"),
+    ("\u8fd0\u5355", "shipment"),
+    ("\u7269\u4e1a", "property"),
+    ("\u793e\u533a", "community"),
+    ("\u5ba1\u6279", "approval"),
+    ("\u6743\u9650", "permission"),
+    ("\u89c4\u5219", "rules"),
+    ("\u89d2\u8272", "roles"),
+    ("\u5de5\u4f5c\u53f0", "workspace"),
+    ("\u770b\u677f", "dashboard"),
+    ("\u7edf\u8ba1", "analytics"),
+    ("\u7b5b\u9009", "filters"),
+    ("\u641c\u7d22", "search"),
+    ("\u76d1\u63a7", "monitor"),
+    ("\u5f02\u5e38", "errors"),
+    ("\u7528\u6237", "user"),
+    ("\u914d\u7f6e", "settings"),
+    ("\u4efb\u52a1", "task"),
+    ("\u9879\u76ee", "project"),
+    ("\u7ba1\u7406", "management"),
+    ("\u7cfb\u7edf", "system"),
+    ("order", "order"),
+    ("dashboard", "dashboard"),
+    ("crm", "crm"),
+    ("customer", "crm"),
+    ("warehouse", "warehouse"),
+    ("inventory", "inventory"),
+    ("logistics", "logistics"),
+    ("approval", "approval"),
+    ("permission", "permission"),
+    ("role", "roles"),
+    ("rules", "rules"),
+    ("settings", "settings"),
+    ("worker", "worker"),
+    ("automation", "automation"),
+)
+
+
+def _semantic_slug(value: str) -> str:
+    text = str(value or "").strip().lower()
+    if not text:
+        return ""
+    for needle, slug in PHRASE_SLUGS:
+        if needle in text:
+            return slug
+    parts: list[str] = []
+    for needle, part in KEYWORD_SLUG_PARTS:
+        if needle in text and part not in parts:
+            parts.append(part)
+        if len(parts) >= 3:
+            break
+    return "-".join(parts)
+
+
+def _ascii_slugify(value: str) -> str:
+    text = str(value or "").strip().lower()
+    slug = re.sub(r"[^a-z0-9._-]+", "-", text)
+    slug = re.sub(r"-{2,}", "-", slug).strip(".-_")
+    return slug[:80] or "project"
 
 
 def _slugify(value: str) -> str:

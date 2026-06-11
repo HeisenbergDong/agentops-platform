@@ -17,6 +17,9 @@ from worker.connection.client import WorkerClient
 from worker.registration import RegistrationOptions, is_registered, machine_fingerprint, register_worker
 from worker.system.console import disable_quick_edit_mode
 
+ACTIVE_COMMAND_STATUSES = {"queued", "claimed", "running"}
+MAX_COMMAND_STATUS_FAILURES = 3
+
 
 def run_once(
     client: WorkerClient | None = None,
@@ -26,6 +29,8 @@ def run_once(
     worker_settings = worker_settings or load_worker_settings()
     client = client or WorkerClient(worker_settings.server_url, worker_settings.token)
     runner = runner or create_command_runner(worker_settings)
+    if getattr(runner, "cancellation_checker", None) is None:
+        attach_cancellation_checker(runner, client, worker_settings)
     heartbeat = {
         "worker_id": worker_settings.worker_id,
         "machine_name": socket.gethostname(),
@@ -43,7 +48,17 @@ def run_once(
     commands = client.poll_commands(worker_settings.worker_id)
     processed = 0
     for command in commands:
-        client.ack_command(worker_settings.worker_id, command["command_id"])
+        if is_cancelled_command(command):
+            result = cancelled_result(worker_settings.worker_id, command, "Command was cancelled before ack.")
+            client.post_result(worker_settings.worker_id, result)
+            processed += 1
+            continue
+        acked = client.ack_command(worker_settings.worker_id, command["command_id"])
+        if is_cancelled_command(acked):
+            result = cancelled_result(worker_settings.worker_id, command, "Command was cancelled before worker execution.")
+            client.post_result(worker_settings.worker_id, result)
+            processed += 1
+            continue
         post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
         result = runner.run(command)
         post_worker_event(
@@ -67,6 +82,7 @@ def run_forever(worker_settings: WorkerSettings | None = None) -> None:
     print_runtime_summary(worker_settings)
     client = WorkerClient(worker_settings.server_url, worker_settings.token)
     runner = create_command_runner(worker_settings)
+    attach_cancellation_checker(runner, client, worker_settings)
     if worker_settings.auto_launch_trae_on_startup:
         try_auto_launch_trae(runner)
     last_idle_log_at = 0.0
@@ -207,6 +223,27 @@ def create_command_runner(worker_settings: WorkerSettings) -> Any:
     return CommandRunner(worker_settings.worker_id, runtime_settings=worker_settings)
 
 
+def attach_cancellation_checker(
+    runner: Any,
+    client: WorkerClient,
+    worker_settings: WorkerSettings,
+) -> None:
+    failures_by_command: dict[str, int] = {}
+
+    def checker(command_id: str) -> bool:
+        try:
+            command = client.get_command(worker_settings.worker_id, command_id)
+        except Exception as exc:
+            failures = failures_by_command.get(command_id, 0) + 1
+            failures_by_command[command_id] = failures
+            log(f"Could not read command status for {command_id}: {exc} ({failures}/{MAX_COMMAND_STATUS_FAILURES}).")
+            return failures >= MAX_COMMAND_STATUS_FAILURES
+        failures_by_command[command_id] = 0
+        return is_cancelled_command(command)
+
+    runner.cancellation_checker = checker
+
+
 def try_auto_launch_trae(runner: Any) -> None:
     try:
         result = runner.ensure_trae_ready()
@@ -291,6 +328,27 @@ def print_runtime_summary(worker_settings: WorkerSettings) -> None:
 def log(message: str) -> None:
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
     print(f"[{timestamp}] {message}", flush=True)
+
+
+def is_cancelled_command(command: dict) -> bool:
+    status = str(command.get("status") or "").lower()
+    if status == "cancelled":
+        return True
+    if status in ACTIVE_COMMAND_STATUSES:
+        return False
+    command_type = str(command.get("type") or "")
+    return bool(status) and command_type != "stop_current_task"
+
+
+def cancelled_result(worker_id: str, command: dict, message: str) -> dict:
+    return {
+        "command_id": command.get("command_id", ""),
+        "worker_id": worker_id,
+        "status": "cancelled",
+        "message": message,
+        "data": {},
+        "error": "",
+    }
 
 
 def pause_before_exit() -> None:

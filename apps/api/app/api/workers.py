@@ -12,6 +12,7 @@ from app.db.repositories.workers import (
     ack_worker_command,
     create_worker_command,
     finish_worker_command,
+    get_worker_command,
     get_worker_by_worker_id,
     list_workers,
     poll_worker_commands,
@@ -126,6 +127,21 @@ def ack_command(
     if worker.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
     command = ack_worker_command(db, worker_id, command_id)
+    if not command:
+        raise HTTPException(status_code=404, detail="Command not found")
+    return serialize_command(command)
+
+
+@router.get("/{worker_id}/commands/{command_id}")
+def get_command_status(
+    worker_id: str,
+    command_id: str,
+    worker: Worker = Depends(current_worker),
+    db: Session = Depends(get_db),
+) -> dict:
+    if worker.worker_id != worker_id:
+        raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
+    command = get_worker_command(db, worker_id, command_id)
     if not command:
         raise HTTPException(status_code=404, detail="Command not found")
     return serialize_command(command)

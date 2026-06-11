@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 from fastapi import APIRouter, HTTPException
 from fastapi import Depends
 from pydantic import BaseModel
@@ -9,6 +11,7 @@ from app.db.models import Attachment, Job, RuntimeLog, User, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import (
     add_log,
+    cancel_job_worker_commands,
     cleanup_user_runtime_state,
     create_job,
     current_active_job,
@@ -277,6 +280,17 @@ def stop_job(
         stage=JobState.STOPPED,
         message="Stop requested; scheduler and worker should stop current activity.",
     )
+    cancelled_commands = cancel_job_worker_commands(db, job.id)
+    if cancelled_commands:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="worker_commands_cancelled",
+            message="Active worker commands for this job were cancelled before stop propagation.",
+            level="warning",
+            extra={"cancelled_commands": cancelled_commands},
+        )
     command = enqueue_stop_worker_command(db, user.id, job.id, round_.id if round_ else None)
     if command:
         add_log(
@@ -488,6 +502,8 @@ def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id
     worker = get_worker_by_worker_id(db, worker_id)
     if not worker or worker.user_id != user_id:
         return None
+    if is_worker_offline(worker):
+        return None
     return create_worker_command(
         db,
         worker_id=worker.worker_id,
@@ -499,3 +515,13 @@ def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id
             payload={"reason": "user_stop"},
         ),
     )
+
+
+def is_worker_offline(worker) -> bool:
+    if worker.revoked_at or not worker.last_seen_at:
+        return True
+    current = now_utc()
+    last_seen = worker.last_seen_at
+    if last_seen.tzinfo is None:
+        current = current.replace(tzinfo=None)
+    return current - last_seen > timedelta(minutes=2)

@@ -325,6 +325,41 @@ def test_worker_dispatch_uses_current_user_worker_settings_only():
     assert command.payload["trae_workspace_path"].replace("\\", "/").startswith("D:/mr-d/demo-")
 
 
+def test_worker_dispatch_names_project_from_chinese_core_feature():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    save_user_settings(
+        db,
+        user.id,
+        {
+            "github": {
+                "owner": "heisenberg-good-man",
+                "remote_protocol": "https",
+            }
+        },
+    )
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["做一个订单看板"])
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        round_index=1,
+        status=JobState.PROMPT_READY,
+        prompt="做一个订单看板，支持筛选、统计和状态流转。",
+    )
+    db.add_all([job, round_])
+    db.commit()
+
+    command = dispatch_prompt_to_worker(db, user, job, round_)
+
+    project_name = command.payload["project_name"]
+    assert project_name.startswith("order-dashboard-")
+    assert command.payload["github_repo_name"] == project_name
+    assert command.payload["trae_workspace_path"].replace("\\", "/") == f"D:/mr-d/{project_name}"
+    assert command.payload["github_remote_url"] == f"https://github.com/heisenberg-good-man/{project_name}.git"
+
+
 def test_retry_worker_command_requeues_failed_command_with_current_settings():
     db = _test_session()
     user = _create_user(db, "user1")

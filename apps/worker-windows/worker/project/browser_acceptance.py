@@ -4,6 +4,7 @@ import subprocess
 import time
 from html import unescape
 from pathlib import Path
+from typing import Callable
 from urllib.parse import urlparse
 
 import httpx
@@ -16,7 +17,14 @@ IGNORED_DIRS = {"node_modules", "dist", "build", "target", ".venv", "__pycache__
 DEFAULT_START_TIMEOUT_SECONDS = 45.0
 
 
-def run_browser_acceptance(project_path: str, url: str = "", timeout_seconds: float = 10.0) -> dict:
+def run_browser_acceptance(
+    project_path: str,
+    url: str = "",
+    timeout_seconds: float = 10.0,
+    cancellation_check: Callable[[], None] | None = None,
+) -> dict:
+    if cancellation_check:
+        cancellation_check()
     normalized_url = _normalize_url(url)
     if not normalized_url:
         return {
@@ -35,10 +43,12 @@ def run_browser_acceptance(project_path: str, url: str = "", timeout_seconds: fl
             "message": "Only local HTTP URLs are supported for automated browser acceptance.",
         }
 
-    initial = _fetch_url(project_path, normalized_url, timeout_seconds)
+    initial = _fetch_url(project_path, normalized_url, timeout_seconds, cancellation_check)
     if initial["status"] == "passed":
         return initial
 
+    if cancellation_check:
+        cancellation_check()
     start_result = _start_local_dev_server(Path(project_path), parsed)
     if start_result["status"] not in {"started", "already_running"}:
         initial["auto_start"] = start_result
@@ -47,8 +57,8 @@ def run_browser_acceptance(project_path: str, url: str = "", timeout_seconds: fl
     deadline = time.monotonic() + max(DEFAULT_START_TIMEOUT_SECONDS, timeout_seconds)
     latest = initial
     while time.monotonic() < deadline:
-        time.sleep(1.5)
-        latest = _fetch_url(project_path, normalized_url, timeout_seconds)
+        _sleep_with_cancellation(1.5, cancellation_check)
+        latest = _fetch_url(project_path, normalized_url, timeout_seconds, cancellation_check)
         if latest["status"] == "passed":
             latest["auto_start"] = start_result
             latest["message"] = "Browser acceptance URL responded with content after starting the local dev server."
@@ -59,7 +69,14 @@ def run_browser_acceptance(project_path: str, url: str = "", timeout_seconds: fl
     return latest
 
 
-def _fetch_url(project_path: str, normalized_url: str, timeout_seconds: float) -> dict:
+def _fetch_url(
+    project_path: str,
+    normalized_url: str,
+    timeout_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
+) -> dict:
+    if cancellation_check:
+        cancellation_check()
     try:
         with httpx.Client(timeout=timeout_seconds, follow_redirects=True, trust_env=False) as client:
             response = client.get(
@@ -90,6 +107,17 @@ def _fetch_url(project_path: str, normalized_url: str, timeout_seconds: float) -
         "inspection": inspection,
         "message": "Browser acceptance URL responded with usable content." if passed else _acceptance_failure_message(response.status_code, inspection),
     }
+
+
+def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], None] | None) -> None:
+    if not cancellation_check:
+        time.sleep(seconds)
+        return
+    deadline = time.monotonic() + max(0.0, seconds)
+    while time.monotonic() < deadline:
+        cancellation_check()
+        time.sleep(min(0.25, max(0.0, deadline - time.monotonic())))
+    cancellation_check()
 
 
 def _start_local_dev_server(root: Path, parsed_url) -> dict:

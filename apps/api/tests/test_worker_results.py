@@ -961,6 +961,51 @@ def test_send_prompt_manual_required_marks_job_manual_required():
     assert log.level == "warning"
 
 
+def test_late_worker_result_after_stop_is_ignored():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    job.status = JobState.STOPPED
+    round_.status = JobState.STOPPED
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"text_chars": 1000}),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "stale_worker_result_ignored"))
+    assert job.status == JobState.STOPPED
+    assert round_.status == JobState.STOPPED
+    assert next_command is None
+    assert log is not None
+
+
+def test_late_cancelled_command_result_is_ignored():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.status = "cancelled"
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"text_chars": 1000}),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "stale_worker_result_ignored"))
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert next_command is None
+    assert log is not None
+
+
 def _test_session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
