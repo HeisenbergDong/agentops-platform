@@ -7,6 +7,7 @@ from worker.runtime import command_runner
 from worker.runtime.command_runner import _current_turn_gate
 from worker.runtime.command_runner import CommandRunner
 from worker.project.git_submit import run_git_submit
+from worker.trae.diagnose import detect_terminal_prompt
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae.window import TraeAutomationError
 
@@ -166,10 +167,19 @@ def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tm
 def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
     received = {}
 
-    def fake_wait_completion(timeout_seconds: float, stable_seconds: float, poll_interval_seconds: float, cancellation_check=None):
+    def fake_wait_completion(
+        timeout_seconds: float,
+        stable_seconds: float,
+        poll_interval_seconds: float,
+        intervention_idle_seconds: float,
+        max_interventions: int,
+        cancellation_check=None,
+    ):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
         received["poll_interval_seconds"] = poll_interval_seconds
+        received["intervention_idle_seconds"] = intervention_idle_seconds
+        received["max_interventions"] = max_interventions
         received["cancellable"] = callable(cancellation_check)
         return {"status": "completed"}
 
@@ -179,7 +189,13 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         {
             "command_id": "cmd-5",
             "type": "wait_completion",
-            "payload": {"timeout_seconds": 30, "stable_seconds": 3, "poll_interval_seconds": 1},
+            "payload": {
+                "timeout_seconds": 30,
+                "stable_seconds": 3,
+                "poll_interval_seconds": 1,
+                "intervention_idle_seconds": 11,
+                "max_interventions": 5,
+            },
         }
     )
 
@@ -188,12 +204,21 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "timeout_seconds": 30.0,
         "stable_seconds": 3.0,
         "poll_interval_seconds": 1.0,
+        "intervention_idle_seconds": 11.0,
+        "max_interventions": 5,
         "cancellable": True,
     }
 
 
 def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
-    def fake_wait_completion(timeout_seconds: float, stable_seconds: float, poll_interval_seconds: float, cancellation_check=None):
+    def fake_wait_completion(
+        timeout_seconds: float,
+        stable_seconds: float,
+        poll_interval_seconds: float,
+        intervention_idle_seconds: float,
+        max_interventions: int,
+        cancellation_check=None,
+    ):
         assert cancellation_check is not None
         cancellation_check()
         return {"status": "completed"}
@@ -454,6 +479,20 @@ def test_probe_trace_reports_service_interruption():
 
     assert result["complete_like"] is False
     assert result["reason"] == "service_interrupted"
+
+
+def test_detect_terminal_prompt_handles_npm_create_confirm():
+    result = detect_terminal_prompt("Need to install the following packages: create-vite@latest\nOk to proceed? (y)")
+
+    assert result["input"] == "y"
+    assert result["reason"].startswith("terminal_prompt:")
+
+
+def test_detect_terminal_prompt_handles_vite_select_defaults():
+    result = detect_terminal_prompt("Select a framework: Vue React Svelte")
+
+    assert result["input"] == "\n"
+    assert result["confidence"] > 0.8
 
 
 def test_current_turn_gate_blocks_old_or_missing_turn():

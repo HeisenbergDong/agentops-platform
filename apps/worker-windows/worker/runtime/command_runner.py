@@ -156,6 +156,8 @@ class CommandRunner:
             timeout_seconds=float(payload.get("timeout_seconds", 900)),
             stable_seconds=float(payload.get("stable_seconds", 15)),
             poll_interval_seconds=float(payload.get("poll_interval_seconds", 2)),
+            intervention_idle_seconds=float(payload.get("intervention_idle_seconds", 60)),
+            max_interventions=int(payload.get("max_interventions", 3)),
             cancellation_check=cancellation.raise_if_cancelled,
         )
 

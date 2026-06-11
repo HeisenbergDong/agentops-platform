@@ -1598,6 +1598,8 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "wait_timeout_seconds",
         "stable_seconds",
         "poll_interval_seconds",
+        "intervention_idle_seconds",
+        "max_interventions",
         "copy_timeout_seconds",
         "continue_timeout_seconds",
         "browser_acceptance_timeout_seconds",
