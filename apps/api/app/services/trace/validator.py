@@ -17,6 +17,20 @@ CONTINUE_MARKERS = (
     "more results",
 )
 CONTINUE_BARE_MARKERS = ("\u7ee7\u7eed", "continue")
+SERVICE_INTERRUPTION_MARKERS = (
+    "\u670d\u52a1\u7aef\u5f02\u5e38",
+    "\u670d\u52a1\u5f02\u5e38",
+    "\u7f51\u7edc\u5f02\u5e38",
+    "\u751f\u6210\u5931\u8d25",
+    "\u4efb\u52a1\u4e2d\u65ad",
+    "\u5df2\u4e2d\u65ad",
+    "\u8bf7\u7a0d\u540e\u91cd\u8bd5",
+    "ErrorResponse",
+    "server error",
+    "service error",
+    "failed to generate",
+    "something went wrong",
+)
 FINAL_SUMMARY_MARKERS = (
     "\u6784\u5efa\u5b8c\u6210",
     "\u4fee\u590d\u5b8c\u6210",
@@ -35,6 +49,7 @@ RECOVERABLE_TRACE_REASONS = {
     "empty_trace",
     "trace_too_short",
     "awaiting_continuation",
+    "service_interrupted",
     "partial_code_copy",
     "final_summary_only",
     "missing_tool_trace_markers",
@@ -49,6 +64,8 @@ def validate_full_trace(text: str) -> dict:
         return {"valid": False, "reason": "final_summary_only"}
     if _needs_continue(normalized):
         return {"valid": False, "reason": "awaiting_continuation"}
+    if _looks_like_service_interruption(normalized):
+        return {"valid": False, "reason": "service_interrupted"}
     if _looks_like_partial_code_copy(normalized):
         return {"valid": False, "reason": "partial_code_copy"}
     if len(normalized) < 800:
@@ -74,6 +91,11 @@ def _needs_continue(text: str) -> bool:
         return True
     tail_lines = [line.strip().lower() for line in text.splitlines()[-8:] if line.strip()]
     return any(line in CONTINUE_BARE_MARKERS for line in tail_lines)
+
+
+def _looks_like_service_interruption(text: str) -> bool:
+    tail = text[-2400:].lower()
+    return any(marker.lower() in tail for marker in SERVICE_INTERRUPTION_MARKERS)
 
 
 def _looks_like_final_summary_only(text: str) -> bool:

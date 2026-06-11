@@ -229,17 +229,72 @@ def test_copy_latest_reply_does_not_store_uncompleted_trae_turn(monkeypatch, tmp
 
     db.refresh(job)
     db.refresh(round_)
-    warning_log = db.scalar(
-        select(RuntimeLog)
-        .where(RuntimeLog.stage == "session_collected")
-        .order_by(RuntimeLog.created_at.desc())
-        .limit(1)
-    )
-    assert job.status == JobState.SCREENSHOT_CAPTURING
-    assert round_.trace_status == "valid"
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert round_.trace_status == "trae_turn_not_completed:interrupted"
     assert round_.trae_session_id == ""
-    assert warning_log is not None
-    assert warning_log.level == "warning"
+    assert next_command is not None
+    assert next_command.status == "queued"
+
+
+def test_copy_latest_reply_rejects_context_mismatched_old_turn(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    trace = _valid_trace()
+    monkeypatch.setattr(worker_results.settings, "attachment_root", tmp_path / "storage")
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": trace,
+                "current_turn_gate": {"passed": False, "reason": "workspace_mismatch", "recoverable": False},
+                "trae_turn": {"status": "missing", "reason": "workspace_mismatch"},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    screenshot_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CAPTURE_SCREENSHOT.value))
+    assert job.status == JobState.TRACE_MISSING_ABORT
+    assert round_.status == JobState.TRACE_MISSING_ABORT
+    assert round_.trace_status == "workspace_mismatch"
+    assert screenshot_command is None
+    assert db.scalar(select(Attachment).where(Attachment.kind == "trace")) is None
+
+
+def test_copy_latest_reply_service_interruption_queues_continue_recovery():
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": _valid_trace(),
+                "trace_probe": {"complete_like": False, "reason": "service_interrupted"},
+                "trae_turn": _valid_trae_turn(),
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert round_.trace_status == "service_interrupted"
+    assert next_command is not None
 
 
 def test_capture_screenshot_records_attachment_and_advances_to_product_reviewing():

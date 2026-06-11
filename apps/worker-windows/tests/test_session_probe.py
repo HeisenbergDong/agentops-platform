@@ -172,6 +172,35 @@ def test_probe_latest_trae_turn_blocks_when_only_old_turn_exists(monkeypatch, tm
     assert result["candidate"]["session_id"] == old_session
 
 
+def test_probe_latest_trae_turn_waits_for_newer_unfinished_continuation(monkeypatch, tmp_path):
+    appdata = tmp_path / "AppData" / "Roaming"
+    log_dir = appdata / "Trae CN" / "logs" / "20260611"
+    log_dir.mkdir(parents=True)
+    session = "41867a07a0b34471bd185ecc93ebf73b"
+    completed_message = "6a26227be4db5ceccde3e54e"
+    completed_task = "7a26227be4db5ceccde3e54f"
+    pending_message = "8a26227be4db5ceccde3e54e"
+    pending_task = "9a26227be4db5ceccde3e54f"
+    (log_dir / "ai-agent_1_stdout.log").write_text(
+        "\n".join(
+            [
+                _start_line("2026-06-08T10:01:00+08:00", session, completed_message, completed_task, "8f0bce1835c9654e637c14de711bd35b"),
+                _finish_line("2026-06-08T10:02:00+08:00", session, completed_message, "8f0bce1835c9654e637c14de711bd35b"),
+                _start_line("2026-06-08T10:05:00+08:00", session, pending_message, pending_task, "9f0bce1835c9654e637c14de711bd35b"),
+            ]
+        ),
+        encoding="utf-8",
+    )
+    monkeypatch.setenv("APPDATA", str(appdata))
+    sent_after_epoch = _epoch("2026-06-08T10:00:00+08:00")
+
+    result = probe_latest_trae_turn(sent_after_epoch=sent_after_epoch)
+
+    assert result["status"] == "missing"
+    assert result["reason"] == "awaiting_current_continuation"
+    assert result["candidate"]["user_message_id"] == pending_message
+
+
 def _write_workspace_db(path, folder, session_id: str, prompt: str) -> None:
     path.mkdir(parents=True)
     (path / "workspace.json").write_text(json.dumps({"folder": folder.as_uri()}), encoding="utf-8")

@@ -140,6 +140,17 @@ def probe_latest_trae_turn(
             "sent_after_epoch": sent_after_ts,
         }
 
+    pending_turn = latest_pending_turn(scoped_turns or turns, prompt=prompt, workspace_path=workspace_path)
+    if pending_turn:
+        return {
+            "status": "missing",
+            "reason": "awaiting_current_continuation",
+            "candidate": pending_turn.as_dict(),
+            "log_files_scanned": len(log_files),
+            "workspace_count": len(workspaces),
+            "probe_scope": probe_scope,
+        }
+
     selected = select_best_turn(scoped_turns or turns, prompt=prompt, workspace_path=workspace_path)
     validation_error = selected_turn_context_error(selected, prompt=prompt, workspace_path=workspace_path)
     if validation_error:
@@ -432,6 +443,23 @@ def select_best_turn(turns: list[TraeTurn], prompt: str = "", workspace_path: st
     return selected
 
 
+def latest_pending_turn(turns: list[TraeTurn], prompt: str = "", workspace_path: str = "") -> TraeTurn | None:
+    completed = [turn for turn in turns if turn.status == "completed"]
+    pending = [turn for turn in turns if turn.status != "completed"]
+    if not pending:
+        return None
+    latest_completed_epoch = max((_turn_timestamp(turn) or 0.0) for turn in completed) if completed else 0.0
+    context_pending = [
+        turn
+        for turn in pending
+        if _turn_matches_requested_context(turn, prompt=prompt, workspace_path=workspace_path)
+        and (_turn_timestamp(turn) or 0.0) >= latest_completed_epoch
+    ]
+    if not context_pending:
+        return None
+    return sorted(context_pending, key=lambda item: (_turn_timestamp(item) or 0.0, item.last_line_number), reverse=True)[0]
+
+
 def selected_turn_context_error(turn: TraeTurn, prompt: str = "", workspace_path: str = "") -> str:
     prompt_norm = _normalize_text(prompt)
     workspace_norm = _normalize_path(workspace_path)
@@ -448,6 +476,18 @@ def selected_turn_context_error(turn: TraeTurn, prompt: str = "", workspace_path
     if workspace_norm and prompt_norm and not workspace_matches and prompt_similarity < 0.10:
         return "low_confidence_context_match"
     return ""
+
+
+def _turn_matches_requested_context(turn: TraeTurn, prompt: str = "", workspace_path: str = "") -> bool:
+    prompt_norm = _normalize_text(prompt)
+    workspace_norm = _normalize_path(workspace_path)
+    if workspace_norm:
+        turn_workspace = _normalize_path(turn.workspace_folder)
+        if turn_workspace and not _workspace_matches(turn_workspace, workspace_norm):
+            return False
+    if prompt_norm and turn.prompt_guess:
+        return _similarity(prompt_norm, _normalize_text(turn.prompt_guess)) >= 0.10
+    return True
 
 
 def _normalize_text(value: str) -> str:

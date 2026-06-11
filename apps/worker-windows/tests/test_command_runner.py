@@ -4,9 +4,10 @@ import subprocess
 import pytest
 
 from worker.runtime import command_runner
+from worker.runtime.command_runner import _current_turn_gate
 from worker.runtime.command_runner import CommandRunner
 from worker.project.git_submit import run_git_submit
-from worker.trae.trace_copy import probe_trace
+from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae.window import TraeAutomationError
 
 
@@ -218,6 +219,11 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "copy_latest_reply",
         lambda timeout_seconds: {"status": "copied", "raw_text": "trace", "timeout_seconds": timeout_seconds},
     )
+    monkeypatch.setattr(
+        command_runner,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "sid", "user_message_id": "mid"},
+    )
 
     result = CommandRunner(worker_id="worker-test").run(
         {"command_id": "cmd-6", "type": "copy_latest_reply", "payload": {"timeout_seconds": 7}}
@@ -226,6 +232,7 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     assert result["status"] == "success"
     assert result["data"]["raw_text"] == "trace"
     assert result["data"]["timeout_seconds"] == 7.0
+    assert result["data"]["current_turn_gate"]["passed"] is True
 
 
 def test_scan_project_uses_workspace_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -438,6 +445,73 @@ def test_probe_trace_reports_awaiting_continuation():
 
     assert result["complete_like"] is False
     assert result["reason"] == "awaiting_continuation"
+
+
+def test_probe_trace_reports_service_interruption():
+    trace = "toolName: edit\nstatus: success\n" + ("trace detail line\n" * 80) + "\u670d\u52a1\u7aef\u5f02\u5e38\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5"
+
+    result = probe_trace(trace)
+
+    assert result["complete_like"] is False
+    assert result["reason"] == "service_interrupted"
+
+
+def test_current_turn_gate_blocks_old_or_missing_turn():
+    gate = _current_turn_gate({"status": "missing", "reason": "workspace_mismatch"})
+
+    assert gate["passed"] is False
+    assert gate["recoverable"] is False
+    assert gate["reason"] == "workspace_mismatch"
+
+
+def test_current_turn_gate_recovers_unfinished_current_turn():
+    gate = _current_turn_gate({"status": "found", "turn_status": "running", "session_id": "sid"})
+
+    assert gate["passed"] is False
+    assert gate["recoverable"] is True
+    assert gate["reason"] == "trae_turn_not_completed:running"
+
+
+def test_scroll_assistant_to_bottom_uses_scrollable_controls_without_hwnd():
+    class Rect:
+        left = 10
+        top = 10
+        right = 510
+        bottom = 610
+
+    class FakeControl:
+        def __init__(self):
+            self.focused = False
+            self.wheels = []
+
+        def set_focus(self):
+            self.focused = True
+
+        def wheel_mouse_input(self, wheel_dist):
+            self.wheels.append(wheel_dist)
+
+        def rectangle(self):
+            return Rect()
+
+        def window_text(self):
+            return "assistant"
+
+    class FakeWindow:
+        hwnd = 0
+
+        def __init__(self, control):
+            self.control = control
+
+        def descendants(self, control_type):
+            return [self.control] if control_type == "Pane" else []
+
+    control = FakeControl()
+
+    result = scroll_assistant_to_bottom(FakeWindow(control), wheel_steps=2)
+
+    assert result["status"] == "scrolled"
+    assert control.focused is True
+    assert control.wheels == [-5, -5]
 
 
 def test_probe_trace_reports_missing_tool_trace_markers():

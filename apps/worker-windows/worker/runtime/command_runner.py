@@ -20,6 +20,15 @@ from worker.trae.trace_copy import copy_latest_reply
 from worker.trae.wait import wait_completion
 from worker.trae.window import TraeAutomationError, ensure_trae_running, focus_trae, open_trae
 
+RECOVERABLE_TRACE_PROBE_REASONS = {"awaiting_continuation", "service_interrupted"}
+RECOVERABLE_TURN_GATE_REASONS = {
+    "awaiting_continuation",
+    "awaiting_current_continuation",
+    "service_interrupted",
+    "no_completed_turn_after_prompt_send",
+    "trae_turn_not_completed",
+}
+
 
 class CommandRunner:
     def __init__(
@@ -159,6 +168,7 @@ class CommandRunner:
             sent_after_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
+        result["current_turn_gate"] = _current_turn_gate(result.get("trae_turn"), result.get("trace_probe"))
         return result
 
     def _click_continue(self, payload: dict[str, Any]) -> dict:
@@ -271,3 +281,55 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _current_turn_gate(turn: object, trace_probe: object = None) -> dict:
+    if isinstance(trace_probe, dict):
+        probe_reason = str(trace_probe.get("reason") or "")
+        if probe_reason in RECOVERABLE_TRACE_PROBE_REASONS:
+            return {
+                "passed": False,
+                "reason": probe_reason,
+                "recoverable": True,
+                "source": "trace_probe",
+            }
+    if not isinstance(turn, dict):
+        return {
+            "passed": False,
+            "reason": "current_turn_probe_missing",
+            "recoverable": False,
+            "source": "trae_turn",
+        }
+    if turn.get("status") != "found":
+        reason = str(turn.get("reason") or "current_turn_missing")
+        return {
+            "passed": False,
+            "reason": reason,
+            "recoverable": _recoverable_turn_gate_reason(reason),
+            "source": "trae_turn",
+            "candidate": turn.get("candidate") if isinstance(turn.get("candidate"), dict) else None,
+        }
+    turn_status = str(turn.get("turn_status") or "")
+    if turn_status != "completed":
+        return {
+            "passed": False,
+            "reason": f"trae_turn_not_completed:{turn_status or 'unknown'}",
+            "recoverable": True,
+            "source": "trae_turn",
+            "session_id": str(turn.get("session_id") or ""),
+            "user_message_id": str(turn.get("user_message_id") or ""),
+        }
+    return {
+        "passed": True,
+        "reason": "ok",
+        "recoverable": False,
+        "source": "trae_turn",
+        "session_id": str(turn.get("session_id") or ""),
+        "user_message_id": str(turn.get("user_message_id") or ""),
+    }
+
+
+def _recoverable_turn_gate_reason(reason: str) -> bool:
+    if reason in RECOVERABLE_TURN_GATE_REASONS:
+        return True
+    return reason.startswith("trae_turn_not_completed:")

@@ -2,6 +2,7 @@ import hashlib
 import time
 from typing import Callable
 
+from worker.trae.trace_copy import probe_trace
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
 BUSY_MARKERS = (
@@ -13,6 +14,7 @@ BUSY_MARKERS = (
     "Running",
     "Thinking",
 )
+RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
 
 
 def wait_completion(
@@ -40,11 +42,17 @@ def wait_completion(
         elif not busy and signature == last_signature:
             stable_since = stable_since or time.monotonic()
             if time.monotonic() - stable_since >= stable_seconds:
+                output_probe = probe_trace(latest_text)
+                if output_probe.get("reason") in RECOVERABLE_OUTPUT_REASONS:
+                    raise TraeAutomationError(
+                        f"Trae output is stable but not complete ({output_probe.get('reason')}); continue is required"
+                    )
                 return {
                     "status": "completed",
                     "stable_seconds": stable_seconds,
                     "text_chars": len(latest_text),
                     "text_sample": latest_text[-1000:],
+                    "output_probe": output_probe,
                 }
         else:
             stable_since = None

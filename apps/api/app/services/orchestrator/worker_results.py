@@ -35,6 +35,12 @@ MAX_ROUNDS_PER_PROJECT = 5
 TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
 TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
 IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
+RECOVERABLE_COPY_GATE_REASONS = {
+    "awaiting_continuation",
+    "awaiting_current_continuation",
+    "service_interrupted",
+    "no_completed_turn_after_prompt_send",
+}
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -89,6 +95,8 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
 
     extra = _result_extra(command, result)
     if result.status in {"ok", "success", "completed"}:
+        if result.data.get("sent_at_epoch") and "sent_at_epoch" not in command.payload:
+            command.payload = {**command.payload, "sent_at_epoch": result.data.get("sent_at_epoch")}
         job.status = JobState.WAITING_TRAE
         if round_:
             round_.status = JobState.WAITING_TRAE
@@ -162,7 +170,10 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
             db,
             command,
             WorkerCommandType.COPY_LATEST_REPLY,
-            {"timeout_seconds": command.payload.get("copy_timeout_seconds", 10)},
+            {
+                "timeout_seconds": command.payload.get("copy_timeout_seconds", 10),
+                "prompt": round_.prompt if round_ and round_.prompt else command.payload.get("prompt", ""),
+            },
         )
         add_log(
             db,
@@ -202,6 +213,21 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
         return
 
     raw_trace = str(result.data.get("raw_text") or "")
+    worker_probe = result.data.get("trace_probe") if isinstance(result.data, dict) else None
+    probe_reason = str(worker_probe.get("reason") or "") if isinstance(worker_probe, dict) else ""
+    if probe_reason in RECOVERABLE_COPY_GATE_REASONS:
+        if round_:
+            round_.trace_status = probe_reason
+        _queue_continue_recovery(
+            db,
+            command,
+            job,
+            round_,
+            f"Trae copied reply still needs recovery ({probe_reason}); continuing Trae before retrying trace collection.",
+            {**extra, "trace_probe": worker_probe, "trace_chars": len(raw_trace)},
+        )
+        return
+
     validation = validate_full_trace(raw_trace)
     trace_extra = {
         **extra,
@@ -223,6 +249,29 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
         return
 
     if validation["valid"]:
+        gate = _copy_current_turn_gate(result.data)
+        trace_extra["current_turn_gate"] = gate
+        if not gate["passed"]:
+            if round_:
+                round_.trace_status = gate["reason"]
+            if gate["recoverable"]:
+                _queue_continue_recovery(
+                    db,
+                    command,
+                    job,
+                    round_,
+                    f"Current Trae turn is not complete yet ({gate['reason']}); continuing Trae before retrying trace collection.",
+                    trace_extra,
+                )
+                return
+            _mark_trace_missing_abort(
+                db,
+                job,
+                round_,
+                f"Copied Trae reply was rejected because it does not belong to the current completed turn ({gate['reason']}).",
+                trace_extra,
+            )
+            return
         _store_trae_turn_metadata(db, job, round_, result.data.get("trae_turn"))
         trace_attachment = _record_trace_attachment(db, command, raw_trace)
         job.status = JobState.SCREENSHOT_CAPTURING
@@ -1270,6 +1319,47 @@ def _ensure_trae_session_gate(
         extra={"command_id": command.id, "command_type": command.command_type},
     )
     return False
+
+
+def _copy_current_turn_gate(data: object) -> dict:
+    if not isinstance(data, dict):
+        return {"passed": False, "reason": "copy_result_missing", "recoverable": False}
+    gate = data.get("current_turn_gate")
+    if isinstance(gate, dict) and isinstance(gate.get("passed"), bool):
+        reason = str(gate.get("reason") or ("ok" if gate.get("passed") else "current_turn_gate_failed"))
+        return {
+            **gate,
+            "passed": bool(gate.get("passed")),
+            "reason": reason,
+            "recoverable": bool(gate.get("recoverable")),
+        }
+
+    turn = data.get("trae_turn")
+    if not isinstance(turn, dict):
+        return {"passed": False, "reason": "current_turn_probe_missing", "recoverable": False}
+    if turn.get("status") != "found":
+        reason = str(turn.get("reason") or "current_turn_missing")
+        return {"passed": False, "reason": reason, "recoverable": _recoverable_copy_gate_reason(reason)}
+    turn_status = str(turn.get("turn_status") or "")
+    if turn_status != "completed":
+        return {
+            "passed": False,
+            "reason": f"trae_turn_not_completed:{turn_status or 'unknown'}",
+            "recoverable": True,
+        }
+    return {
+        "passed": True,
+        "reason": "ok",
+        "recoverable": False,
+        "session_id": str(turn.get("session_id") or ""),
+        "user_message_id": str(turn.get("user_message_id") or ""),
+    }
+
+
+def _recoverable_copy_gate_reason(reason: str) -> bool:
+    if reason in RECOVERABLE_COPY_GATE_REASONS:
+        return True
+    return reason.startswith("trae_turn_not_completed:")
 
 
 def _mark_trace_missing_abort(

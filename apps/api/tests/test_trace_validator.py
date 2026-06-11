@@ -43,6 +43,19 @@ def test_trace_validator_rejects_trace_that_requires_continue():
     assert validate_full_trace(trace) == {"valid": False, "reason": "awaiting_continuation"}
 
 
+def test_trace_validator_rejects_service_interruption_as_recoverable():
+    trace = (
+        "toolName: edit\n"
+        "status: success\n"
+        "filePath: app.py\n"
+        "command: pytest\n"
+        + ("trace detail line\n" * 80)
+        + "\u670d\u52a1\u7aef\u5f02\u5e38\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5"
+    )
+
+    assert validate_full_trace(trace) == {"valid": False, "reason": "service_interrupted"}
+
+
 def test_trace_validator_allows_body_mentions_of_continue():
     trace = (
         "toolName: edit\n"

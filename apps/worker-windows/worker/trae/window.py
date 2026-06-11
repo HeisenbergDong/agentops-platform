@@ -22,7 +22,11 @@ CUIAUTOMATION_CLSID = "{ff48dba4-60ef-4201-aa87-54103eef594e}"
 CONTROL_TYPES = {
     "Button": 50000,
     "Edit": 50004,
+    "List": 50008,
+    "Group": 50026,
     "Text": 50020,
+    "Document": 50030,
+    "Pane": 50033,
 }
 TRAE_EXECUTABLE_NAMES = ("Trae CN.exe", "Trae.exe", "trae.exe")
 
