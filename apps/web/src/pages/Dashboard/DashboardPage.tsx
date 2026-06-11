@@ -1,7 +1,15 @@
-import { PauseCircleOutlined, PlayCircleOutlined, ReloadOutlined } from "@ant-design/icons";
+import {
+  CheckCircleOutlined,
+  ExclamationCircleOutlined,
+  PauseCircleOutlined,
+  PlayCircleOutlined,
+  QuestionCircleOutlined,
+  ReloadOutlined
+} from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
-import { Alert, Button, Card, Input, Space, Tag, Typography, message } from "antd";
+import { Button, Card, Input, Modal, Space, Tag, Tooltip, Typography, message } from "antd";
 import { useState } from "react";
+import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 
 type RuntimeLog = {
@@ -64,9 +72,20 @@ type PreflightResponse = {
   blocking: string[];
   warnings: string[];
   summary: string;
+  checks: PreflightCheck[];
+};
+
+type PreflightCheck = {
+  key: string;
+  label: string;
+  status: "pass" | "warning" | "fail" | string;
+  message: string;
+  required: boolean;
+  details?: Record<string, any>;
 };
 
 export function DashboardPage() {
+  const navigate = useNavigate();
   const [directions, setDirections] = useState("AgentOps 自动作业平台");
   const [busy, setBusy] = useState<"start" | "continue" | "stop" | "">("");
   const current = useQuery({
@@ -85,10 +104,7 @@ export function DashboardPage() {
     try {
       if (action === "start") {
         const payload = {
-          directions: directions
-            .split(/[\n,，]+/)
-            .map((item) => item.trim())
-            .filter(Boolean)
+          directions: parseDirections(directions)
         };
         await api.post("/jobs/start", payload);
         message.success("作业已开始");
@@ -109,12 +125,39 @@ export function DashboardPage() {
     }
   }
 
+  function handleStartClick() {
+    if (hasCurrentJob && !isTerminalStatus(status)) {
+      Modal.confirm({
+        title: "重新开始新作业？",
+        content: "系统会清理当前作业的运行状态，并按上面的作业范围重新开始。",
+        okText: "重新开始",
+        cancelText: "取消",
+        onOk: () => runAction("start")
+      });
+      return;
+    }
+    void runAction("start");
+  }
+
   const job = current.data?.job || null;
   const round = current.data?.round || null;
   const logs = current.data?.logs || [];
   const status = job?.status || current.data?.status || "idle";
   const preflightData = preflight.data;
-  const canStart = !preflight.isLoading && (!preflightData || preflightData.ready);
+  const directionsList = parseDirections(directions);
+  const hasCurrentJob = Boolean(job);
+  const hasActiveWorkerCommand = Boolean(
+    current.data?.worker_command && ["queued", "claimed", "running"].includes(current.data.worker_command.status)
+  );
+  const preflightReady = Boolean(preflightData?.ready);
+  const canStart = !preflight.isLoading && preflightReady && directionsList.length > 0;
+  const canContinue =
+    !preflight.isLoading &&
+    preflightReady &&
+    hasCurrentJob &&
+    RESUMABLE_STATES.has(status) &&
+    !hasActiveWorkerCommand;
+  const canStop = hasCurrentJob && !isTerminalStatus(status);
 
   return (
     <Space direction="vertical" size={16} className="page dashboard-simple">
@@ -136,34 +179,57 @@ export function DashboardPage() {
             placeholder="输入本次要做的作业范围，可以多行填写。"
           />
           <Space wrap>
-            <Button
-              type="primary"
-              icon={<PlayCircleOutlined />}
-              loading={busy === "start"}
-              disabled={!canStart}
-              onClick={() => void runAction("start")}
+            <Tooltip title={canStart ? "" : startDisabledReason(preflight.isLoading, preflightData, directionsList)}>
+              <span>
+                <Button
+                  type="primary"
+                  icon={<PlayCircleOutlined />}
+                  loading={busy === "start"}
+                  disabled={!canStart}
+                  onClick={handleStartClick}
+                >
+                  {hasCurrentJob && !isTerminalStatus(status) ? "重新开始" : "开始"}
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip
+              title={
+                canContinue
+                  ? ""
+                  : continueDisabledReason(preflight.isLoading, preflightData, status, hasCurrentJob, hasActiveWorkerCommand)
+              }
             >
-              开始
-            </Button>
-            <Button
-              icon={<ReloadOutlined />}
-              loading={busy === "continue"}
-              onClick={() => void runAction("continue")}
-            >
-              继续
-            </Button>
-            <Button
-              danger
-              icon={<PauseCircleOutlined />}
-              loading={busy === "stop"}
-              onClick={() => void runAction("stop")}
-            >
-              停止
-            </Button>
+              <span>
+                <Button
+                  icon={<ReloadOutlined />}
+                  loading={busy === "continue"}
+                  disabled={!canContinue}
+                  onClick={() => void runAction("continue")}
+                >
+                  继续
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip title={canStop ? "" : stopDisabledReason(status, hasCurrentJob)}>
+              <span>
+                <Button
+                  danger
+                  icon={<PauseCircleOutlined />}
+                  loading={busy === "stop"}
+                  disabled={!canStop}
+                  onClick={() => void runAction("stop")}
+                >
+                  停止
+                </Button>
+              </span>
+            </Tooltip>
           </Space>
-          {preflightData && !preflightData.ready ? (
-            <Alert showIcon type="warning" message={preflightData.summary || "运行前检查未通过"} />
-          ) : null}
+          <PreflightMiniChecks
+            loading={preflight.isLoading}
+            data={preflightData}
+            onRefresh={() => void preflight.refetch()}
+            onJump={(target) => navigate(target)}
+          />
         </Space>
       </Card>
 
@@ -183,6 +249,152 @@ export function DashboardPage() {
       </Card>
     </Space>
   );
+}
+
+const RESUMABLE_STATES = new Set([
+  "prompt_ready",
+  "manual_required",
+  "trace_missing_abort",
+  "session_missing_abort",
+  "github_failed_abort",
+  "feishu_failed_abort"
+]);
+
+const TERMINAL_STATES = new Set(["idle", "stopped", "project_completed"]);
+
+function parseDirections(value: string): string[] {
+  return value
+    .split(/[\n,，]+/)
+    .map((item) => item.trim())
+    .filter(Boolean);
+}
+
+function isTerminalStatus(status: string): boolean {
+  return TERMINAL_STATES.has(status);
+}
+
+function PreflightMiniChecks({
+  loading,
+  data,
+  onRefresh,
+  onJump
+}: {
+  loading: boolean;
+  data?: PreflightResponse;
+  onRefresh: () => void;
+  onJump: (target: string) => void;
+}) {
+  const checks = data?.checks || [];
+  return (
+    <div className="preflight-mini">
+      <Typography.Text type="secondary" className="preflight-mini-label">
+        运行前检查
+      </Typography.Text>
+      <div className="preflight-mini-icons">
+        {checks.length ? (
+          checks.map((item) => (
+            <Tooltip
+              key={item.key}
+              title={
+                <div className="preflight-tooltip">
+                  <div className="preflight-tooltip-title">{item.label}</div>
+                  <div>{item.message}</div>
+                  <div className="preflight-tooltip-target">{preflightTargetText(item.key)}</div>
+                </div>
+              }
+            >
+              <button
+                type="button"
+                className={`preflight-mini-icon ${preflightClassName(item.status)}`}
+                aria-label={`${item.label}：${preflightStatusText(item.status)}`}
+                onClick={() => onJump(preflightTarget(item.key))}
+              >
+                {preflightIcon(item.status)}
+              </button>
+            </Tooltip>
+          ))
+        ) : (
+          <Tooltip title={loading ? "正在检查运行条件" : "暂无检查结果"}>
+            <span className="preflight-mini-icon unknown">
+              <QuestionCircleOutlined />
+            </span>
+          </Tooltip>
+        )}
+      </div>
+      <Button size="small" type="link" icon={<ReloadOutlined />} onClick={onRefresh}>
+        刷新
+      </Button>
+      {data?.summary ? (
+        <Typography.Text type={data.ready ? "secondary" : "warning"} className="preflight-mini-summary">
+          {data.summary}
+        </Typography.Text>
+      ) : null}
+    </div>
+  );
+}
+
+function preflightIcon(status: string) {
+  if (status === "pass") return <CheckCircleOutlined />;
+  if (status === "warning" || status === "fail") return <ExclamationCircleOutlined />;
+  return <QuestionCircleOutlined />;
+}
+
+function preflightClassName(status: string): string {
+  if (status === "pass") return "pass";
+  if (status === "warning" || status === "fail") return "warning";
+  return "unknown";
+}
+
+function preflightStatusText(status: string): string {
+  if (status === "pass") return "已通过";
+  if (status === "warning") return "提醒";
+  if (status === "fail") return "未通过";
+  return "未知";
+}
+
+function preflightTarget(key: string): string {
+  if (key === "worker.status" || key === "worker.capabilities") return "/workers";
+  if (key.startsWith("model.")) return "/settings#settings-model";
+  if (key.startsWith("github.")) return "/settings#settings-github";
+  if (key.startsWith("feishu.")) return "/settings#settings-feishu";
+  if (key.startsWith("webhook.")) return "/settings#settings-webhook";
+  if (key.startsWith("worker.")) return "/settings#settings-worker";
+  if (key.startsWith("defaults.")) return "/settings#settings-defaults";
+  return "/settings";
+}
+
+function preflightTargetText(key: string): string {
+  if (key === "worker.status" || key === "worker.capabilities") return "点击查看 Worker 状态";
+  return "点击跳转到对应配置";
+}
+
+function startDisabledReason(loading: boolean, data: PreflightResponse | undefined, directions: string[]): string {
+  if (loading) return "正在检查运行条件";
+  if (!directions.length) return "请先填写作业范围";
+  if (!data?.ready) return data?.summary || "运行前检查未通过";
+  return "";
+}
+
+function continueDisabledReason(
+  loading: boolean,
+  data: PreflightResponse | undefined,
+  status: string,
+  hasCurrentJob: boolean,
+  hasActiveWorkerCommand: boolean
+): string {
+  if (loading) return "正在检查运行条件";
+  if (!hasCurrentJob) return "当前没有可继续的作业";
+  if (isTerminalStatus(status)) return "当前作业已结束，不能继续";
+  if (hasActiveWorkerCommand) return "Worker 命令正在执行中";
+  if (!data?.ready) return data?.summary || "运行前检查未通过";
+  if (!RESUMABLE_STATES.has(status)) return "当前状态不需要继续";
+  return "";
+}
+
+function stopDisabledReason(status: string, hasCurrentJob: boolean): string {
+  if (!hasCurrentJob) return "当前没有运行中的作业";
+  if (isTerminalStatus(status)) return "当前作业已停止或已结束";
+  return "";
 }
 
 function formatTime(value: string): string {

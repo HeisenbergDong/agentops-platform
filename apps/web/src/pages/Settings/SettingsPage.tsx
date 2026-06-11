@@ -2,6 +2,7 @@ import { CloudSyncOutlined, SaveOutlined } from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
 import { Alert, Button, Card, Col, Form, Input, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useEffect, useMemo, useState } from "react";
+import { useLocation } from "react-router-dom";
 import { api } from "../../api/client";
 import { selectPopupProps } from "../../components/selectPopup";
 
@@ -21,6 +22,7 @@ type SettingsResponse = {
 };
 
 export function SettingsPage() {
+  const location = useLocation();
   const [form] = Form.useForm();
   const [discovering, setDiscovering] = useState(false);
   const settings = useQuery({
@@ -41,6 +43,14 @@ export function SettingsPage() {
       form.setFieldsValue(settings.data.sections);
     }
   }, [form, settings.data?.sections]);
+
+  useEffect(() => {
+    const targetId = location.hash.replace("#", "");
+    if (!targetId) return;
+    window.setTimeout(() => {
+      document.getElementById(targetId)?.scrollIntoView({ block: "start" });
+    }, 0);
+  }, [location.hash]);
 
   const readinessText = useMemo(() => {
     if (settings.data?.preflight?.summary) {
@@ -93,7 +103,7 @@ export function SettingsPage() {
         message="用户只配置凭证和偏好；仓库、飞书资源、Trae 执行细节由对应角色和 Worker 在流程中自动处理。"
       />
       <Form className="settings-form" form={form} layout="vertical" onFinish={(values) => void save(values)}>
-        <Card className="settings-card" title="模型配置" loading={settings.isLoading}>
+        <Card id="settings-model" className="settings-card settings-anchor" title="模型配置" loading={settings.isLoading}>
           <Row gutter={16}>
             <Col span={6}>
               <Form.Item name={["model", "provider"]} label="Provider">
@@ -145,7 +155,7 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card className="settings-card" title="GitHub 凭证">
+        <Card id="settings-github" className="settings-card settings-anchor" title="GitHub 凭证">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["github", "token"]} label="GitHub Token">
@@ -168,7 +178,8 @@ export function SettingsPage() {
         </Card>
 
         <Card
-          className="settings-card"
+          id="settings-feishu"
+          className="settings-card settings-anchor"
           title="飞书授权"
           extra={
             <Button icon={<CloudSyncOutlined />} loading={discovering} onClick={() => void discoverFeishu()}>
@@ -218,13 +229,13 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card className="settings-card" title="Webhook">
+        <Card id="settings-webhook" className="settings-card settings-anchor" title="Webhook">
           <Form.Item name={["webhook", "url"]} label="Webhook 地址">
             <Input placeholder="https://example.com/hook" />
           </Form.Item>
         </Card>
 
-        <Card className="settings-card" title="Trae / Worker">
+        <Card id="settings-worker" className="settings-card settings-anchor" title="Trae / Worker">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["worker", "worker_id"]} label="关联 Worker">
@@ -258,7 +269,7 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card className="settings-card" title="默认项">
+        <Card id="settings-defaults" className="settings-card settings-anchor" title="默认项">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["defaults", "default_rule_version_id"]} label="默认规则版本">

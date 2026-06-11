@@ -141,6 +141,10 @@ body,
   overflow: auto;
 }
 
+.settings-anchor {
+  scroll-margin-top: 84px;
+}
+
 .settings-action-bar {
   position: sticky;
   bottom: 0;
@@ -304,6 +308,86 @@ body,
 
 .control-card .ant-card-body {
   padding-bottom: 18px;
+}
+
+.preflight-mini {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+  padding-top: 2px;
+}
+
+.preflight-mini-label {
+  white-space: nowrap;
+}
+
+.preflight-mini-icons {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+
+.preflight-mini-icon {
+  width: 24px;
+  height: 24px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border: 1px solid transparent;
+  border-radius: 50%;
+  padding: 0;
+  background: #fff;
+  cursor: pointer;
+  font-size: 15px;
+  line-height: 1;
+}
+
+.preflight-mini-icon.pass {
+  color: #16a34a;
+  border-color: #bbf7d0;
+  background: #f0fdf4;
+}
+
+.preflight-mini-icon.warning {
+  color: #d97706;
+  border-color: #fde68a;
+  background: #fffbeb;
+}
+
+.preflight-mini-icon.unknown {
+  color: #667085;
+  border-color: #e4e7ec;
+  background: #f9fafb;
+}
+
+.preflight-mini-icon:hover {
+  filter: brightness(0.98);
+}
+
+.preflight-mini-summary {
+  flex: 1 1 240px;
+  min-width: 160px;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.preflight-tooltip {
+  max-width: 320px;
+}
+
+.preflight-tooltip-title {
+  font-weight: 600;
+  margin-bottom: 4px;
+}
+
+.preflight-tooltip-target {
+  margin-top: 6px;
+  color: rgba(255, 255, 255, 0.72);
 }
 
 .process-card .ant-card-body {
