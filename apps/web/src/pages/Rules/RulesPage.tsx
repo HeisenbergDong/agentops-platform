@@ -3,6 +3,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { Alert, Button, Card, Col, Form, Input, List, Modal, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
+import { selectPopupProps } from "../../components/selectPopup";
 
 type Rule = {
   id: string;
@@ -281,6 +282,7 @@ export function RulesPage() {
           >
             <Form.Item name="source_type" label="来源类型">
               <Select
+                {...selectPopupProps}
                 options={[
                   { label: "在线文档 URL", value: "url" },
                   { label: "直接粘贴文本", value: "text" }

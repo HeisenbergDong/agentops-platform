@@ -2,6 +2,7 @@ from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
 from app.db.models import Attachment, AutomationError, Job, RuntimeLog, TaskRound, WorkerCommand
+from app.services.orchestrator.events import build_display_message
 from app.services.orchestrator.states import JobState
 
 TERMINAL_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
@@ -104,7 +105,7 @@ def latest_round(db: Session, job_id: str) -> TaskRound | None:
     return db.scalar(
         select(TaskRound)
         .where(TaskRound.job_id == job_id)
-        .order_by(desc(TaskRound.round_index))
+        .order_by(desc(TaskRound.created_at), desc(TaskRound.round_index))
         .limit(1)
     )
 
@@ -117,14 +118,18 @@ def add_log(
     round_id: str | None = None,
     level: str = "info",
     extra: dict | None = None,
+    display_message: str | None = None,
 ) -> RuntimeLog:
+    extra = extra or {}
     item = RuntimeLog(
         job_id=job_id,
         round_id=round_id,
         level=level,
         stage=str(stage),
         message=message,
-        extra=extra or {},
+        display_message=display_message
+        or build_display_message(str(stage), message, level=level, extra=extra),
+        extra=extra,
     )
     db.add(item)
     db.flush()

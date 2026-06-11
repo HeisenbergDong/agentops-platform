@@ -1,25 +1,29 @@
 from pathlib import Path
+import time
 from typing import Any
 
-from worker.config import settings
+from worker.config import WorkerSettings, settings
 from worker.project.browser_acceptance import run_browser_acceptance
 from worker.project.commands import run_project_command
 from worker.project.git_submit import run_git_submit
 from worker.project.scanner import scan_project
+from worker.project.workspace import ensure_project_workspace
 from worker.runtime.state import WorkerRuntimeState
 from worker.safety.path_guard import assert_within_root
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.intervene import click_confirm, click_continue
 from worker.trae.prompt import PromptSendError, send_prompt
 from worker.trae.screenshot import capture_screenshot
+from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.trace_copy import copy_latest_reply
 from worker.trae.wait import wait_completion
-from worker.trae.window import TraeAutomationError, focus_trae, open_trae
+from worker.trae.window import TraeAutomationError, ensure_trae_running, focus_trae, open_trae
 
 
 class CommandRunner:
-    def __init__(self, worker_id: str | None = None) -> None:
-        self.worker_id = worker_id or settings.worker_id
+    def __init__(self, worker_id: str | None = None, runtime_settings: WorkerSettings | None = None) -> None:
+        self.settings = runtime_settings or settings
+        self.worker_id = worker_id or self.settings.worker_id
         self.state = WorkerRuntimeState()
 
     def run(self, command: dict) -> dict:
@@ -34,7 +38,7 @@ class CommandRunner:
             elif command_type == "open_trae":
                 data = self._open_trae(payload)
             elif command_type == "focus_trae":
-                data = focus_trae()
+                data = self._focus_trae(payload)
             elif command_type == "send_prompt":
                 data = self._send_prompt(payload)
                 self.state.stage = "prompt_sent"
@@ -74,21 +78,55 @@ class CommandRunner:
 
     def _open_trae(self, payload: dict[str, Any]) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        return open_trae(settings.trae_exe_path, workspace_path)
+        return open_trae(self.settings.trae_exe_path, workspace_path)
+
+    def ensure_trae_ready(
+        self,
+        workspace_path: Path | None = None,
+        launch_timeout_seconds: float = 30.0,
+        force_open_workspace: bool = False,
+    ) -> dict:
+        result = ensure_trae_running(
+            self.settings.trae_exe_path,
+            self._launch_workspace_path(workspace_path),
+            launch_timeout_seconds=launch_timeout_seconds,
+            force_open_workspace=force_open_workspace,
+        )
+        self.state.current_window_title = str(result.get("window_title") or "")
+        return result
+
+    def _focus_trae(self, payload: dict[str, Any]) -> dict:
+        launch_if_missing = bool(payload.get("launch_if_missing", True))
+        if not launch_if_missing:
+            return focus_trae()
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        return self.ensure_trae_ready(
+            workspace_path,
+            launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
+            force_open_workspace=bool(payload.get("force_open_workspace", False)),
+        )
 
     def _send_prompt(self, payload: dict[str, Any]) -> dict:
         prompt = str(payload.get("prompt") or "")
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        open_result = None
+        workspace_info = {}
         if workspace_path:
-            open_result = open_trae(settings.trae_exe_path, workspace_path)
+            workspace_info = ensure_project_workspace(self.settings.workspace_root, workspace_path, payload)
+        open_result = self.ensure_trae_ready(
+            workspace_path,
+            launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
+            force_open_workspace=bool(payload.get("force_open_workspace", bool(workspace_path))),
+        )
+        sent_at_epoch = time.time()
         send_result = send_prompt(
             prompt,
             submit=bool(payload.get("submit", True)),
             submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
         )
-        if open_result:
-            send_result["open_trae"] = open_result
+        send_result["sent_at_epoch"] = sent_at_epoch
+        send_result["open_trae"] = open_result
+        send_result["workspace"] = workspace_info
+        self.state.current_window_title = str(send_result.get("window_title") or self.state.current_window_title)
         return send_result
 
     def _wait_completion(self, payload: dict[str, Any]) -> dict:
@@ -99,41 +137,55 @@ class CommandRunner:
         )
 
     def _copy_latest_reply(self, payload: dict[str, Any]) -> dict:
-        return copy_latest_reply(timeout_seconds=float(payload.get("timeout_seconds", 10)))
+        result = copy_latest_reply(timeout_seconds=float(payload.get("timeout_seconds", 10)))
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        result["trae_turn"] = probe_latest_trae_turn(
+            prompt=str(payload.get("prompt") or ""),
+            workspace_path=str(workspace_path or ""),
+            sent_after_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
+            sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
+        )
+        return result
 
     def _click_continue(self, payload: dict[str, Any]) -> dict:
         return click_continue(timeout_seconds=float(payload.get("timeout_seconds", 10)))
 
     def _scan_project(self, payload: dict[str, Any]) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        return scan_project(workspace_path or settings.workspace_root)
+        return scan_project(
+            workspace_path or self.settings.workspace_root,
+            prompt=str(payload.get("prompt") or ""),
+            changed_file_list=payload.get("changed_files"),
+        )
 
     def _run_command(self, payload: dict[str, Any]) -> dict:
         command = payload.get("command")
         if not isinstance(command, list) or not all(isinstance(item, str) for item in command):
             raise ValueError("run_command payload.command must be a list of strings")
-        cwd = self._workspace_path(payload.get("cwd") or payload.get("workspace_path")) or settings.workspace_root
+        cwd = self._workspace_path(payload.get("cwd") or payload.get("workspace_path")) or self.settings.workspace_root
         timeout = int(payload.get("timeout", 120))
-        return run_project_command(settings.workspace_root, cwd, command, timeout=timeout)
+        return run_project_command(self.settings.workspace_root, cwd, command, timeout=timeout)
 
     def _browser_acceptance(self, payload: dict[str, Any]) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         return run_browser_acceptance(
-            str(workspace_path or settings.workspace_root),
+            str(workspace_path or self.settings.workspace_root),
             url=str(payload.get("url") or payload.get("browser_url") or payload.get("acceptance_url") or ""),
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
         )
 
     def _git_submit(self, payload: dict[str, Any]) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        project_path = workspace_path or settings.workspace_root
+        project_path = workspace_path or self.settings.workspace_root
         return run_git_submit(
-            settings.workspace_root,
+            self.settings.workspace_root,
             project_path,
             commit_message=str(payload.get("commit_message") or ""),
             push=bool(payload.get("push", True)),
             remote=str(payload.get("remote") or "origin"),
             branch=str(payload.get("branch") or ""),
+            remote_url=str(payload.get("remote_url") or payload.get("github_remote_url") or ""),
+            project_name=str(payload.get("project_name") or payload.get("github_repo_name") or ""),
             timeout=int(payload.get("timeout", 120)),
         )
 
@@ -142,9 +194,13 @@ class CommandRunner:
             return None
         workspace_path = Path(str(raw_path)).expanduser()
         if not workspace_path.is_absolute():
-            workspace_path = settings.workspace_root / workspace_path
-        assert_within_root(workspace_path, settings.workspace_root)
+            workspace_path = self.settings.workspace_root / workspace_path
+        assert_within_root(workspace_path, self.settings.workspace_root)
         return workspace_path
+
+    def _launch_workspace_path(self, workspace_path: Path | None) -> Path | None:
+        candidate = workspace_path or self.settings.workspace_root
+        return candidate if candidate and candidate.exists() else workspace_path
 
     def _success(self, command_id: str, data: dict) -> dict:
         return {
@@ -174,3 +230,12 @@ class CommandRunner:
             "data": {},
             "error": error,
         }
+
+
+def _float_or_none(value: Any) -> float | None:
+    if value in ("", None):
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None

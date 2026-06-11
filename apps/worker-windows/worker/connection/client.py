@@ -6,6 +6,15 @@ class WorkerClient:
         self.server_url = server_url.rstrip("/")
         self.headers = {"Authorization": f"Bearer {token}"}
 
+    def register_worker(self, payload: dict) -> dict:
+        response = httpx.post(
+            f"{self.server_url}/api/workers/register",
+            json=payload,
+            timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
     def heartbeat(self, payload: dict) -> dict:
         response = httpx.post(
             f"{self.server_url}/api/workers/heartbeat",
@@ -40,6 +49,16 @@ class WorkerClient:
             headers=self.headers,
             json=payload,
             timeout=30,
+        )
+        response.raise_for_status()
+        return response.json()
+
+    def post_log(self, worker_id: str, payload: dict) -> dict:
+        response = httpx.post(
+            f"{self.server_url}/api/workers/{worker_id}/logs",
+            headers=self.headers,
+            json=payload,
+            timeout=10,
         )
         response.raise_for_status()
         return response.json()

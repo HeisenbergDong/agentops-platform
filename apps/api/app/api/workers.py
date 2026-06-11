@@ -1,10 +1,11 @@
 from datetime import timedelta
 
 from fastapi import APIRouter, Depends, HTTPException
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, current_worker
-from app.db.models import User, Worker
+from app.db.models import User, Worker, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import (
@@ -79,6 +80,30 @@ def create_command(
     return serialize_command(command)
 
 
+@router.get("/{worker_id}/recent-commands")
+def recent_commands(
+    worker_id: str,
+    limit: int = 10,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
+    worker = get_worker_by_worker_id(db, worker_id)
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    if user.role != "admin" and worker.user_id != user.id:
+        raise HTTPException(status_code=403, detail="Worker is not bound to current user")
+    safe_limit = max(1, min(limit, 50))
+    rows = list(
+        db.scalars(
+            select(WorkerCommand)
+            .where(WorkerCommand.worker_id == worker.worker_id)
+            .order_by(WorkerCommand.created_at.desc())
+            .limit(safe_limit)
+        ).all()
+    )
+    return {"worker_id": worker.worker_id, "commands": [serialize_command(item) for item in rows]}
+
+
 @router.get("/{worker_id}/commands")
 def poll_commands(
     worker_id: str,
@@ -139,6 +164,7 @@ def post_log(
         stage=payload.stage,
         message=payload.message,
         extra={"worker_id": worker_id, "command_id": payload.command_id, **payload.extra},
+        display_message=payload.display_message,
     )
     db.commit()
     return {"status": "received", "log_id": log.id}

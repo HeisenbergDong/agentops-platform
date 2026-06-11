@@ -177,6 +177,10 @@ class TaskRound(IdMixin, TimestampMixin, Base):
     round_index: Mapped[int] = mapped_column(Integer)
     status: Mapped[str] = mapped_column(String(128), index=True)
     prompt: Mapped[str] = mapped_column(Text, default="")
+    trae_session_id: Mapped[str] = mapped_column(String(128), default="")
+    trae_user_message_id: Mapped[str] = mapped_column(String(128), default="")
+    trae_task_id: Mapped[str] = mapped_column(String(128), default="")
+    trae_trace_id: Mapped[str] = mapped_column(String(128), default="")
     trace_status: Mapped[str] = mapped_column(String(128), default="missing")
     github_status: Mapped[str] = mapped_column(String(128), default="pending")
     feishu_status: Mapped[str] = mapped_column(String(128), default="pending")
@@ -192,6 +196,7 @@ class RuntimeLog(IdMixin, TimestampMixin, Base):
     level: Mapped[str] = mapped_column(String(32), default="info")
     stage: Mapped[str] = mapped_column(String(128), index=True)
     message: Mapped[str] = mapped_column(Text)
+    display_message: Mapped[str] = mapped_column(Text, default="")
     extra: Mapped[dict] = mapped_column(JSON, default=dict)
 
 

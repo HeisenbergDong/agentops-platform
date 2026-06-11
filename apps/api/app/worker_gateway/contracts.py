@@ -79,4 +79,5 @@ class WorkerLogEntry(BaseModel):
     level: str = "info"
     stage: str = "worker"
     message: str
+    display_message: str | None = None
     extra: dict[str, Any] = Field(default_factory=dict)

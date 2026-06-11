@@ -1,2 +1,2 @@
 $ErrorActionPreference = "Stop"
-.\.venv\Scripts\python -m worker.main
+.\.venv\Scripts\python -m worker.main @args

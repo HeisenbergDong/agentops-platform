@@ -15,6 +15,21 @@
     "不满意原因": { "type": "string" },
     "github地址": { "type": "string" },
     "分支/文件夹": { "type": "string" },
-    "日志轨迹": { "type": "string" }
+    "日志轨迹": { "type": "string" },
+    "截图（userprompt附件/产物/运行结果/对话）": {
+      "type": "array",
+      "items": {
+        "oneOf": [
+          { "type": "string" },
+          {
+            "type": "object",
+            "properties": {
+              "file_token": { "type": "string" }
+            },
+            "required": ["file_token"]
+          }
+        ]
+      }
+    }
   }
 }

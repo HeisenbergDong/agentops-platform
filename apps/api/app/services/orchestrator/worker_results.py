@@ -4,18 +4,34 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.models import Attachment, Job, RuntimeLog, TaskRound, WorkerCommand
+from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import create_worker_command
 from app.services.feishu.writer import FeishuWriteError, write_feishu_record
+from app.services.github.repository import ensure_github_repository
 from app.services.orchestrator.dissatisfaction import (
     DissatisfactionEvidence,
     generate_dissatisfaction_reason,
 )
+from app.services.orchestrator.prompt_writer import (
+    PromptGenerationError,
+    generate_round_prompt,
+    mark_prompt_generation_failed,
+)
 from app.services.orchestrator.states import JobState
 from app.services.trace.validator import is_recoverable_trace_reason, validate_full_trace
 from app.services.user_settings import load_user_settings, save_user_settings
+from app.services.orchestrator.worker_dispatch import (
+    WorkerDispatchError,
+    dispatch_prompt_to_worker,
+    mark_worker_dispatch_failed,
+)
 from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType, WorkerResult
+
+FEISHU_ATTACHMENT_FIELD = "截图（userprompt附件/产物/运行结果/对话）"
+LOG_TRACE_FIELD_SOFT_LIMIT = 45000
+LOG_TRACE_OVERFLOW_TEXT = "因日志超长已经保存txt文档，放在截图列。"
+MAX_ROUNDS_PER_PROJECT = 5
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -94,6 +110,8 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
                 "timeout_seconds": command.payload.get("wait_timeout_seconds", 900),
                 "stable_seconds": command.payload.get("stable_seconds", 15),
                 "poll_interval_seconds": command.payload.get("poll_interval_seconds", 2),
+                "sent_at_epoch": result.data.get("sent_at_epoch"),
+                "sent_at": result.data.get("sent_at"),
             },
         )
         add_log(
@@ -199,6 +217,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
         return
 
     if validation["valid"]:
+        _store_trae_turn_metadata(db, job, round_, result.data.get("trae_turn"))
         trace_attachment = _record_trace_attachment(db, command, raw_trace)
         job.status = JobState.SCREENSHOT_CAPTURING
         if round_:
@@ -294,7 +313,9 @@ def _handle_capture_screenshot_result(db: Session, command: WorkerCommand, resul
         db,
         command,
         WorkerCommandType.SCAN_PROJECT,
-        {},
+        {
+            "prompt": round_.prompt if round_ else "",
+        },
     )
     add_log(
         db,
@@ -427,6 +448,18 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
         extra=extra,
     )
 
+    product_review = _product_review_from_data(result.data)
+    if product_review:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.PRODUCT_REVIEWING,
+            message="Static product review evidence collected.",
+            level="warning" if _product_review_has_blocking(product_review) else "info",
+            extra={"product_review": product_review},
+        )
+
     recommended_commands = _recommended_commands(result.data)
     if recommended_commands:
         review_command = _enqueue_worker_command(
@@ -435,9 +468,11 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
             WorkerCommandType.RUN_COMMAND,
             {
                 "command": recommended_commands[0],
-                "cwd": _workspace_path(command, result.data),
+                "cwd": _recommended_command_cwd(command, result.data),
                 "timeout": command.payload.get("review_timeout_seconds", 180),
                 "purpose": "product_review",
+                "remaining_commands": recommended_commands[1:],
+                "product_review": product_review,
             },
         )
         add_log(
@@ -447,6 +482,27 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
             stage=JobState.PRODUCT_REVIEWING,
             message="run_command worker command queued for product review evidence.",
             extra={"worker_id": review_command.worker_id, "command_id": review_command.id, "command": recommended_commands[0]},
+        )
+        return
+
+    if _product_review_has_blocking(product_review):
+        _record_product_review_dissatisfaction(
+            db,
+            job,
+            round_,
+            command,
+            "Static product review found blocking issues and no automated build/test command was available.",
+            product_review,
+            extra,
+        )
+        _advance_to_browser_accepting(
+            db,
+            command,
+            job,
+            round_,
+            "Static product review found issues; dissatisfaction reason was generated and browser acceptance will continue for evidence.",
+            level="warning",
+            extra=extra,
         )
         return
 
@@ -471,6 +527,53 @@ def _handle_run_command_result(db: Session, command: WorkerCommand, result: Work
     extra = _result_extra(command, result)
     returncode = result.data.get("returncode")
     if result.status in {"ok", "success", "completed"} and returncode == 0:
+        remaining_commands = _remaining_commands(command.payload)
+        if remaining_commands:
+            next_command = _enqueue_worker_command(
+                db,
+                command,
+                WorkerCommandType.RUN_COMMAND,
+                {
+                    "command": remaining_commands[0],
+                    "cwd": command.payload.get("cwd") or command.payload.get("workspace_path"),
+                    "timeout": command.payload.get("review_timeout_seconds", command.payload.get("timeout", 180)),
+                    "purpose": "product_review",
+                    "remaining_commands": remaining_commands[1:],
+                    "product_review": command.payload.get("product_review") or {},
+                },
+            )
+            add_log(
+                db,
+                job_id=job.id,
+                round_id=round_.id if round_ else None,
+                stage=JobState.PRODUCT_REVIEWING,
+                message="Additional product review command queued.",
+                extra={"worker_id": next_command.worker_id, "command_id": next_command.id, "command": remaining_commands[0]},
+            )
+            return
+
+        product_review = command.payload.get("product_review") if isinstance(command.payload, dict) else {}
+        if _product_review_has_blocking(product_review):
+            _record_product_review_dissatisfaction(
+                db,
+                job,
+                round_,
+                command,
+                "Product review build/test command passed, but static review still found blocking issues.",
+                product_review,
+                extra,
+            )
+            _advance_to_browser_accepting(
+                db,
+                command,
+                job,
+                round_,
+                "Build/test command passed, but static review still found issues; browser acceptance will continue for evidence.",
+                level="warning",
+                extra=extra,
+            )
+            return
+
         _advance_to_browser_accepting(
             db,
             command,
@@ -491,13 +594,14 @@ def _handle_run_command_result(db: Session, command: WorkerCommand, result: Work
         "Product review build/test command failed; manual review or dissatisfaction reason generation is required.",
         extra,
     )
-    _mark_manual_required(
+    _advance_to_browser_accepting(
         db,
+        command,
         job,
         round_,
-        "Product review build/test command failed; dissatisfaction reason was generated from evidence.",
-        result.status,
-        extra,
+        "Product review build/test command failed; dissatisfaction reason was generated and browser acceptance will continue for evidence.",
+        level="warning",
+        extra=extra,
     )
 
 
@@ -507,14 +611,15 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
         return
     if not _ensure_trace_gate(db, job, round_, command):
         return
+    if not _ensure_trae_session_gate(db, job, round_, command):
+        return
 
     extra = _result_extra(command, result)
     data_status = str(result.data.get("status") or "")
     if result.status in {"ok", "success", "completed"} and data_status == "passed":
-        job.status = JobState.GITHUB_SUBMITTING
-        if round_:
-            round_.status = JobState.GITHUB_SUBMITTING
-            round_.github_status = "submitting"
+        if round_ and round_.round_index == 1 and not _has_dissatisfaction_reason(db, job.id, round_.id):
+            _discard_first_round_satisfied(db, job, round_, extra)
+            return
         add_log(
             db,
             job_id=job.id,
@@ -523,39 +628,27 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
             message="Browser acceptance passed with local page evidence.",
             extra=extra,
         )
-        add_log(
-            db,
-            job_id=job.id,
-            round_id=round_.id if round_ else None,
-            stage=JobState.GITHUB_SUBMITTING,
-            message="Browser acceptance gate passed; git_submit worker command queued.",
-            extra={"worker_id": command.worker_id, "command_id": command.id},
-        )
-        git_command = _enqueue_worker_command(
+        _advance_to_github_submitting(
             db,
             command,
-            WorkerCommandType.GIT_SUBMIT,
-            {
-                "commit_message": _commit_message(job, round_),
-                "push": command.payload.get("github_push", True),
-                "remote": command.payload.get("github_remote", "origin"),
-                "branch": command.payload.get("github_branch", ""),
-                "timeout": command.payload.get("github_timeout_seconds", 120),
-            },
-        )
-        add_log(
-            db,
-            job_id=job.id,
-            round_id=round_.id if round_ else None,
-            stage=JobState.GITHUB_SUBMITTING,
-            message="git_submit worker command queued.",
-            extra={"worker_id": git_command.worker_id, "command_id": git_command.id},
+            job,
+            round_,
+            "Browser acceptance gate passed; git_submit worker command queued.",
+            extra,
         )
         return
 
     message = _browser_acceptance_failure_message(result, data_status)
     _record_dissatisfaction(db, job, round_, command, result, JobState.BROWSER_ACCEPTING, message, extra)
-    _mark_manual_required(db, job, round_, message, result.status, extra)
+    _advance_to_github_submitting(
+        db,
+        command,
+        job,
+        round_,
+        "Browser acceptance did not pass; dissatisfaction reason was generated and GitHub submission will continue for the business record.",
+        extra,
+        level="warning",
+    )
 
 
 def _handle_git_submit_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -593,6 +686,8 @@ def _handle_git_submit_result(db: Session, command: WorkerCommand, result: Worke
         _write_feishu_record(db, job, round_, command, result)
         return
 
+    command.status = "manual_required"
+    command.error = "Git submission failed; stopping before Feishu write."
     _record_dissatisfaction(
         db,
         job,
@@ -615,6 +710,73 @@ def _handle_git_submit_result(db: Session, command: WorkerCommand, result: Worke
         message="Git submission failed; stopping before Feishu write.",
         level="error",
         extra=extra,
+    )
+
+
+def _ensure_github_repo_for_job(db: Session, job: Job, command: WorkerCommand) -> dict:
+    configs = load_user_settings(db, job.user_id)
+    github_config = dict(configs.get("github", {}))
+    if command.payload.get("github_remote_url") and not github_config.get("remote_url"):
+        github_config["remote_url"] = command.payload["github_remote_url"]
+    project_name = str(command.payload.get("project_name") or command.payload.get("github_repo_name") or "")
+    return ensure_github_repository(github_config, project_name=project_name)
+
+
+def _advance_to_github_submitting(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+    level: str = "info",
+) -> None:
+    job.status = JobState.GITHUB_SUBMITTING
+    if round_:
+        round_.status = JobState.GITHUB_SUBMITTING
+        round_.github_status = "submitting"
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message=message,
+        level=level,
+        extra={"worker_id": command.worker_id, "command_id": command.id, **extra},
+    )
+    github_push = command.payload.get("github_push", True)
+    github_repo = _ensure_github_repo_for_job(db, job, command) if github_push else {"ok": True, "skipped": True}
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message="GitHub repository preflight completed before worker git_submit.",
+        level="info" if github_repo.get("ok") else "warning",
+        extra=github_repo,
+    )
+    git_command = _enqueue_worker_command(
+        db,
+        command,
+        WorkerCommandType.GIT_SUBMIT,
+        {
+            "commit_message": _commit_message(job, round_),
+            "push": github_push,
+            "remote": command.payload.get("github_remote", "origin"),
+            "remote_url": github_repo.get("remote_url") or command.payload.get("github_remote_url", ""),
+            "branch": command.payload.get("github_branch", ""),
+            "timeout": command.payload.get("github_timeout_seconds", 120),
+            "github_repo": github_repo,
+            "project_name": command.payload.get("project_name") or command.payload.get("github_repo_name") or "",
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message="git_submit worker command queued.",
+        extra={"worker_id": git_command.worker_id, "command_id": git_command.id},
     )
 
 
@@ -672,9 +834,11 @@ def _write_feishu_record(
         feishu_config["token_cache"] = token_cache
         save_user_settings(db, job.user_id, {"feishu": feishu_config}, allow_internal=True)
 
-    round_.feishu_status = "written"
+    satisfaction = _feishu_satisfaction(db, job.id, round_.id)
+    if satisfaction["satisfied"]:
+        job.satisfied_count += 1
+    round_.feishu_status = str(write_result.get("status") or "written")
     round_.status = JobState.ROUND_COMPLETED
-    job.status = JobState.PROJECT_COMPLETED
     add_log(
         db,
         job_id=job.id,
@@ -683,14 +847,7 @@ def _write_feishu_record(
         message="Feishu business record written.",
         extra=write_result,
     )
-    add_log(
-        db,
-        job_id=job.id,
-        round_id=round_.id,
-        stage=JobState.PROJECT_COMPLETED,
-        message="Round completed and project marked completed.",
-        extra={"round_index": round_.round_index, "feishu_status": round_.feishu_status},
-    )
+    _advance_after_feishu_success(db, job, round_, bool(satisfaction["satisfied"]))
 
 
 def _mark_feishu_failed(
@@ -714,6 +871,141 @@ def _mark_feishu_failed(
         level="error",
         extra=extra,
     )
+
+
+def _advance_after_feishu_success(
+    db: Session,
+    job: Job,
+    round_: TaskRound,
+    satisfied: bool,
+) -> None:
+    decision = _next_round_decision(job, round_, satisfied)
+    if decision["action"] == "continue_project":
+        next_round = TaskRound(
+            job_id=job.id,
+            project_id=round_.project_id,
+            round_index=round_.round_index + 1,
+            status=JobState.GENERATING_PROMPT,
+        )
+        db.add(next_round)
+        db.flush()
+        job.status = JobState.GENERATING_PROMPT
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.ROUND_COMPLETED,
+            message="Round completed; next project round prepared because the result is still dissatisfied.",
+            extra={**decision, "next_round_id": next_round.id, "next_round_index": next_round.round_index},
+        )
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=next_round.id,
+            stage=JobState.GENERATING_PROMPT,
+            message="Next round is ready for prompt generation.",
+            extra={"previous_round_id": round_.id, "round_index": next_round.round_index},
+        )
+        _auto_dispatch_next_round(db, job, next_round)
+        return
+
+    job.status = JobState.PROJECT_COMPLETED
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.PROJECT_COMPLETED,
+        message="Round completed and project marked completed.",
+        extra={
+            **decision,
+            "round_index": round_.round_index,
+            "feishu_status": round_.feishu_status,
+            "submitted_count": job.submitted_count,
+            "satisfied_count": job.satisfied_count,
+        },
+    )
+
+
+def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[str, object]:
+    if job.daily_target and job.submitted_count >= job.daily_target:
+        return {"action": "complete_project", "reason": "daily_target_reached"}
+    if satisfied:
+        return {"action": "complete_project", "reason": "satisfied"}
+    if round_.round_index >= MAX_ROUNDS_PER_PROJECT:
+        return {"action": "complete_project", "reason": "max_round_reached"}
+    return {"action": "continue_project", "reason": "dissatisfied_followup"}
+
+
+def _discard_first_round_satisfied(db: Session, job: Job, round_: TaskRound, extra: dict) -> None:
+    round_.status = "first_round_discarded"
+    project = db.get(Project, round_.project_id) if round_.project_id else None
+    if project:
+        project.status = "discarded_first_round_satisfied"
+    next_round = TaskRound(
+        job_id=job.id,
+        round_index=1,
+        status=JobState.GENERATING_PROMPT,
+    )
+    db.add(next_round)
+    db.flush()
+    job.status = JobState.GENERATING_PROMPT
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="first_round_discarded",
+        message="First round was satisfied, so it was discarded and will not be submitted to GitHub or Feishu.",
+        level="warning",
+        extra={**extra, "next_round_id": next_round.id},
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=next_round.id,
+        stage=JobState.GENERATING_PROMPT,
+        message="A new first round was prepared after discarding the satisfied first round.",
+        extra={"discarded_round_id": round_.id},
+    )
+    _auto_dispatch_next_round(db, job, next_round)
+
+
+def _has_dissatisfaction_reason(db: Session, job_id: str, round_id: str) -> bool:
+    return bool(
+        db.scalar(
+            select(RuntimeLog.id)
+            .where(
+                RuntimeLog.job_id == job_id,
+                RuntimeLog.round_id == round_id,
+                RuntimeLog.stage == "dissatisfaction_reason",
+            )
+            .limit(1)
+        )
+    )
+
+
+def _auto_dispatch_next_round(db: Session, job: Job, round_: TaskRound) -> None:
+    user = db.get(User, job.user_id)
+    if not user:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.MANUAL_REQUIRED,
+            message="Next round cannot continue automatically because the job user was not found.",
+            level="warning",
+        )
+        return
+    try:
+        generate_round_prompt(db, user, job, round_)
+    except PromptGenerationError as exc:
+        mark_prompt_generation_failed(db, job, round_, str(exc))
+        return
+    if job.status != JobState.PROMPT_READY:
+        return
+    try:
+        dispatch_prompt_to_worker(db, user, job, round_)
+    except WorkerDispatchError as exc:
+        mark_worker_dispatch_failed(db, job, round_, str(exc))
 
 
 def _record_dissatisfaction(
@@ -942,6 +1234,29 @@ def _ensure_trace_gate(
     return False
 
 
+def _ensure_trae_session_gate(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    command: WorkerCommand,
+) -> bool:
+    if round_ and round_.trae_session_id:
+        return True
+    job.status = "session_missing_abort"
+    if round_:
+        round_.status = "session_missing_abort"
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage="session_missing_abort",
+        message="Real Trae session id is missing; GitHub and Feishu submission were stopped.",
+        level="error",
+        extra={"command_id": command.id, "command_type": command.command_type},
+    )
+    return False
+
+
 def _mark_trace_missing_abort(
     db: Session,
     job: Job,
@@ -984,6 +1299,60 @@ def _mark_manual_required(
         message=message,
         level="warning" if result_status == "manual_required" else "error",
         extra=extra,
+    )
+
+
+def _store_trae_turn_metadata(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    turn: object,
+) -> None:
+    if not round_ or not isinstance(turn, dict):
+        return
+    if turn.get("status") != "found":
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="session_collected",
+            message="Worker did not find a real Trae session id in local logs.",
+            level="warning",
+            extra={"probe": turn},
+        )
+        return
+    if str(turn.get("turn_status") or "") != "completed":
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="session_collected",
+            message="Worker found a Trae turn, but it is not a completed current turn.",
+            level="warning",
+            extra={"probe": turn},
+        )
+        return
+    session_id = str(turn.get("session_id") or "").strip()
+    if not session_id:
+        return
+    round_.trae_session_id = session_id
+    round_.trae_user_message_id = str(turn.get("user_message_id") or "").strip()
+    round_.trae_task_id = str(turn.get("task_id") or "").strip()
+    round_.trae_trace_id = str(turn.get("trace_id") or "").strip()
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="session_collected",
+        message="Real Trae session metadata collected from worker local logs.",
+        extra={
+            "session_id": round_.trae_session_id,
+            "user_message_id": round_.trae_user_message_id,
+            "task_id": round_.trae_task_id,
+            "trace_id": round_.trae_trace_id,
+            "turn_status": turn.get("turn_status"),
+            "confidence": turn.get("confidence"),
+        },
     )
 
 
@@ -1031,8 +1400,12 @@ def _enqueue_worker_command(
 def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
     result = dict(payload)
     for key in (
+        "prompt",
         "trae_workspace_path",
         "workspace_path",
+        "workspace_root",
+        "project_name",
+        "project_slug",
         "job_id",
         "round_id",
         "round_index",
@@ -1042,7 +1415,13 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "acceptance_url",
         "github_push",
         "github_remote",
+        "github_remote_url",
+        "github_repo_name",
         "github_branch",
+        "sent_at_epoch",
+        "sent_at",
+        "prompt_sent_at_epoch",
+        "prompt_sent_at",
     ):
         if key in source_command.payload and key not in result:
             result[key] = source_command.payload[key]
@@ -1071,6 +1450,50 @@ def _recommended_commands(data: dict) -> list[list[str]]:
         if isinstance(command, list) and all(isinstance(item, str) for item in command):
             result.append(command)
     return result
+
+
+def _remaining_commands(payload: dict) -> list[list[str]]:
+    commands = payload.get("remaining_commands") if isinstance(payload, dict) else []
+    if not isinstance(commands, list):
+        return []
+    result: list[list[str]] = []
+    for command in commands:
+        if isinstance(command, list) and all(isinstance(item, str) for item in command):
+            result.append(command)
+    return result
+
+
+def _product_review_from_data(data: dict) -> dict:
+    review = data.get("product_review") if isinstance(data, dict) else {}
+    return review if isinstance(review, dict) else {}
+
+
+def _product_review_has_blocking(product_review: dict | None) -> bool:
+    if not isinstance(product_review, dict):
+        return False
+    issues = product_review.get("issues")
+    return isinstance(issues, list) and bool(issues)
+
+
+def _record_product_review_dissatisfaction(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    command: WorkerCommand,
+    message: str,
+    product_review: dict,
+    extra: dict,
+) -> None:
+    review_data = {
+        "status": "static_review_failed",
+        "message": message,
+        "product_review": product_review,
+        "issues": product_review.get("issues") if isinstance(product_review, dict) else [],
+        "warnings": product_review.get("warnings") if isinstance(product_review, dict) else [],
+        "evidence": product_review.get("evidence") if isinstance(product_review, dict) else [],
+    }
+    context = {**extra, "command_type": command.command_type, "result_status": "static_review_failed", "data": review_data}
+    _record_dissatisfaction_from_context(db, job, round_, JobState.PRODUCT_REVIEWING, message, context)
 
 
 def _browser_acceptance_url(command: WorkerCommand, extra: dict) -> str:
@@ -1103,29 +1526,49 @@ def _prepare_feishu_fields(
     round_: TaskRound,
     command: WorkerCommand,
     git_result: WorkerResult,
-) -> dict[str, str]:
-    trace_text = _latest_trace_text(db, job.id, round_.id)
+) -> dict[str, object]:
+    if not round_.trae_session_id:
+        raise FeishuWriteError("Real Trae Session ID is missing; refusing to write Feishu business record.")
     screenshot = _latest_attachment(db, job.id, round_.id, "screenshot")
+    log_trace, attachment_paths = _feishu_trace_field_and_attachments(db, job.id, round_.id)
     git_data = git_result.data or {}
     github_url = _github_url(git_data)
-    branch_or_files = str(git_data.get("pushed_branch") or git_data.get("branch") or git_data.get("commit_sha") or "")
-    log_trace = trace_text or _runtime_log_text(db, job.id, round_.id)
+    commit_sha = str(git_data.get("commit_sha") or "")
+    branch_or_files = str(git_data.get("pushed_branch") or git_data.get("branch") or commit_sha or "")
     if screenshot:
-        branch_or_files = f"{branch_or_files}\nScreenshot: {screenshot.path}".strip()
-    return {
+        attachment_paths.append(screenshot.path)
+    satisfaction = _feishu_satisfaction(db, job.id, round_.id)
+    fields = {
         "Trae Session ID": _session_id(job, round_),
-        "轮次": str(round_.round_index),
+        "轮次": _round_label(round_.round_index),
         "User Prompt": round_.prompt or "",
-        "任务类型": "implementation",
-        "业务领域": _first_direction(job),
-        "修改范围": branch_or_files,
-        "任务是否完成": "已完成任务",
-        "产物及过程是否满意": "满意",
-        "不满意原因": "",
+        "任务类型": _infer_feishu_task_type(job, round_),
+        "业务领域": _infer_feishu_business_domain(job, round_),
+        "修改范围": _infer_feishu_change_scope(git_data),
+        "任务是否完成": "完成了任务" if satisfaction["satisfied"] else "未完成任务",
+        "产物及过程是否满意": "满意" if satisfaction["satisfied"] else "不满意",
+        "不满意原因": satisfaction["reason"],
         "github地址": github_url,
+        "commit id": commit_sha,
         "分支/文件夹": branch_or_files,
         "日志轨迹": log_trace,
     }
+    if attachment_paths:
+        fields[FEISHU_ATTACHMENT_FIELD] = attachment_paths
+    return fields
+
+
+def _feishu_trace_field_and_attachments(db: Session, job_id: str, round_id: str) -> tuple[str, list[str]]:
+    attachment = _latest_attachment(db, job_id, round_id, "trace")
+    if not attachment:
+        return _runtime_log_text(db, job_id, round_id), []
+    path = Path(attachment.path)
+    if not path.exists():
+        return _runtime_log_text(db, job_id, round_id), []
+    text = path.read_text(encoding="utf-8")
+    if len(text) > LOG_TRACE_FIELD_SOFT_LIMIT:
+        return LOG_TRACE_OVERFLOW_TEXT, [str(path)]
+    return text, []
 
 
 def _latest_trace_text(db: Session, job_id: str, round_id: str) -> str:
@@ -1156,26 +1599,154 @@ def _runtime_log_text(db: Session, job_id: str, round_id: str) -> str:
             .limit(120)
         ).all()
     )
-    return "\n".join(f"[{item.stage}] {item.message}" for item in rows)[-18000:]
+    return "\n".join(f"[{item.stage}] {item.display_message or item.message}" for item in rows)[-18000:]
 
 
 def _github_url(git_data: dict) -> str:
-    remote_url = str(git_data.get("remote_url") or "")
-    commit_sha = str(git_data.get("commit_sha") or "")
-    if remote_url and commit_sha and "://" in remote_url:
-        cleaned = remote_url.removesuffix(".git")
-        return f"{cleaned}/commit/{commit_sha}"
-    return remote_url or commit_sha
+    for key in ("remote_url", "github_url", "repository_url"):
+        normalized = _normalize_github_clone_url(str(git_data.get(key) or ""))
+        if normalized:
+            return normalized
+    return str(git_data.get("commit_sha") or "")
+
+
+def _normalize_github_clone_url(value: str) -> str:
+    text = str(value or "").strip()
+    if not text:
+        return ""
+    if text.startswith("git@github.com:"):
+        path = text.removeprefix("git@github.com:").strip("/")
+        return f"https://github.com/{path.removesuffix('.git')}.git" if path else ""
+    marker = "github.com/"
+    if marker not in text:
+        return text
+    path = text.split(marker, 1)[1]
+    path = path.split("/commit/", 1)[0]
+    path = path.split("/tree/", 1)[0]
+    path = path.split("/pull/", 1)[0]
+    path = path.strip("/")
+    if not path:
+        return ""
+    return f"https://github.com/{path.removesuffix('.git')}.git"
 
 
 def _session_id(job: Job, round_: TaskRound) -> str:
-    return f"{job.id}-{round_.round_index}"
+    return round_.trae_session_id or ""
 
 
 def _first_direction(job: Job) -> str:
     if isinstance(job.directions, list) and job.directions:
         return str(job.directions[0])
     return ""
+
+
+def _round_label(round_index: int) -> str:
+    labels = ["第一轮", "第二轮", "第三轮", "第四轮", "第五轮"]
+    if 1 <= round_index <= len(labels):
+        return labels[round_index - 1]
+    return labels[-1]
+
+
+def _infer_feishu_task_type(job: Job, round_: TaskRound) -> str:
+    text = f"{_first_direction(job)} {round_.prompt or ''}".lower()
+    if any(item in text for item in ["bug", "修复", "报错", "异常"]):
+        return "Bug修复"
+    if any(item in text for item in ["重构", "refactor"]):
+        return "代码重构"
+    if any(item in text for item in ["测试", "test"]):
+        return "代码测试"
+    if round_.round_index > 1:
+        return "Feature迭代"
+    if any(item in text for item in ["新增", "增加", "添加", "feature", "迭代", "优化"]):
+        return "Feature迭代"
+    if any(item in text for item in ["脚本", "自动化", "worker", "部署", "打包", "命令"]):
+        return "工程化"
+    return "0-1代码生成"
+
+
+def _infer_feishu_business_domain(job: Job, round_: TaskRound) -> str:
+    text = f"{_first_direction(job)} {round_.prompt or ''}".lower()
+    if _looks_like_agentops_fullstack(text):
+        return "全栈Web应用"
+    front = any(item in text for item in ["前端", "页面", "ui", "vue", "react", "vite", "浏览器", "控制台", "看板"])
+    back = any(item in text for item in ["api", "后端", "接口", "数据库", "服务端", "server", "postgres", "redis"])
+    if front and back:
+        return "全栈Web应用"
+    if any(item in text for item in ["前端", "页面", "ui", "vue", "react", "vite"]):
+        return "Web前端"
+    if any(item in text for item in ["api", "后端", "接口", "数据库"]):
+        return "纯后端API服务"
+    if any(item in text for item in ["游戏", "game"]):
+        return "游戏开发"
+    if any(item in text for item in ["3d", "three", "可视化"]):
+        return "3D/交互可视化"
+    if any(item in text for item in ["脚本", "自动化", "worker", "打包", "部署", "命令"]):
+        return "自动化与工具脚本"
+    return "全栈Web应用"
+
+
+def _looks_like_agentops_fullstack(text: str) -> bool:
+    terms = (
+        "agentops",
+        "自动作业平台",
+        "多角色",
+        "角色工作台",
+        "任务看板",
+        "作业控制台",
+        "trae控制",
+        "trae 控制",
+        "worker",
+        "飞书",
+        "github",
+    )
+    return any(term in text for term in terms) and any(
+        term in text for term in ("平台", "控制台", "看板", "配置", "api", "worker", "飞书", "github")
+    )
+
+
+def _infer_feishu_change_scope(git_data: dict) -> str:
+    files = git_data.get("files") or git_data.get("changed_files") or []
+    if isinstance(files, int):
+        if files <= 0:
+            return "模块内多文件"
+        if files == 1:
+            return "单文件"
+        if files <= 5:
+            return "模块内多文件"
+        return "跨模块多文件"
+    if isinstance(files, list):
+        count = len(files)
+        if count <= 0:
+            return "模块内多文件"
+        if count == 1:
+            return "单文件"
+        if count <= 5:
+            return "模块内多文件"
+        return "跨模块多文件"
+    if git_data.get("commit_sha"):
+        return "模块内多文件"
+    return "模块内多文件"
+
+
+def _feishu_satisfaction(db: Session, job_id: str, round_id: str) -> dict[str, str | bool]:
+    reason = db.scalar(
+        select(RuntimeLog)
+        .where(RuntimeLog.job_id == job_id, RuntimeLog.round_id == round_id, RuntimeLog.stage == "dissatisfaction_reason")
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
+    )
+    if not reason:
+        return {"satisfied": True, "reason": ""}
+    text = str(reason.message or "")
+    extra_reason = ""
+    if isinstance(reason.extra, dict):
+        extra_reason = str(
+            reason.extra.get("reason")
+            or reason.extra.get("product_reason")
+            or reason.extra.get("process_reason")
+            or ""
+        )
+    return {"satisfied": False, "reason": (extra_reason or text).strip()}
 
 
 def _commit_message(job: Job, round_: TaskRound | None) -> str:
@@ -1195,6 +1766,10 @@ def _workspace_path(command: WorkerCommand, data: dict) -> str:
         or data.get("root")
         or ""
     )
+
+
+def _recommended_command_cwd(command: WorkerCommand, data: dict) -> str:
+    return str(data.get("recommended_command_cwd") or data.get("project_root") or _workspace_path(command, data))
 
 
 def _result_extra(command: WorkerCommand, result: WorkerResult) -> dict:

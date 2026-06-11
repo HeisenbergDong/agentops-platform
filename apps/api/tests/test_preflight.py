@@ -5,13 +5,16 @@ from sqlalchemy.orm import sessionmaker
 
 from app.api.jobs import StartJobRequest, retry_worker_command, start_job
 from app.api.workers import assigned_worker_config
-from app.db.models import Job, TaskRound, User, Worker, WorkerCommand
+from app.db.models import Job, RuntimeLog, TaskRound, User, Worker, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.session import Base
+from app.services.llm.client import LLMError
 from app.services.orchestrator.states import JobState
+from app.services.orchestrator import prompt_writer
 from app.services.orchestrator.worker_dispatch import dispatch_prompt_to_worker
 from app.services.preflight import REQUIRED_WORKER_CAPABILITIES, build_preflight
-from app.services.user_settings import save_user_settings
+from app.services.user_settings import load_user_settings, save_user_settings
+from app.services.llm.client import model_config_from_settings
 from app.worker_gateway.contracts import WorkerCommandType
 
 
@@ -60,6 +63,43 @@ def test_preflight_is_ready_with_current_user_worker_and_required_settings():
     assert checks["github.token"]["status"] == "warning"
 
 
+def test_model_secret_survives_public_settings_save_without_api_key():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    save_user_settings(
+        db,
+        user.id,
+        {
+            "model": {
+                "provider": "OpenAI",
+                "base_url": "https://pikachu.claudecode.love",
+                "api_key": "sk-real-test-key",
+                "model_name": "gpt-5.5",
+            }
+        },
+    )
+    db.commit()
+
+    save_user_settings(
+        db,
+        user.id,
+        {
+            "model": {
+                "provider": "OpenAI",
+                "base_url": "https://pikachu.claudecode.love",
+                "model_name": "gpt-5.5",
+                "api_key_configured": True,
+                "api_key_mask": "sk-0********",
+            }
+        },
+    )
+    db.commit()
+
+    config = model_config_from_settings(load_user_settings(db, user.id))
+
+    assert config.api_key == "sk-real-test-key"
+
+
 def test_preflight_rejects_worker_bound_to_another_user():
     db = _test_session()
     user = _create_user(db, "user1")
@@ -101,6 +141,133 @@ def test_start_job_preflight_blocker_does_not_create_job():
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail["preflight"]["ready"] is False
     assert db.scalar(select(Job)) is None
+
+
+def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class FailingLLMClient:
+        def complete(self, *_args, **_kwargs):
+            raise LLMError("LLM request failed with status 401: USER_INACTIVE")
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", FailingLLMClient)
+
+    result = start_job(StartJobRequest(directions=["做一个订单看板"]), user=user, db=db)
+
+    command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    fallback_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "prompt_generation_fallback"))
+    assert result["status"] == JobState.SENDING_TO_WORKER
+    assert command is not None
+    assert command.status == "queued"
+    prompt = command.payload["prompt"]
+    assert "做一个订单看板" in command.payload["prompt"]
+    assert "中等规模" in prompt
+    assert any(stack in prompt for stack in ("Python", "Go", "Vue", "Java"))
+    assert "你现在在 Trae CN" not in prompt
+    assert "AgentOps 自动作业" not in prompt
+    assert "平台侧 LLM" not in prompt
+    assert fallback_log is not None
+    assert fallback_log.level == "warning"
+
+
+def test_start_job_fallback_prompt_when_llm_prompt_contains_meta_phrase(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class Result:
+        text = "产物不满意：把证据补齐"
+        model = "gpt-test"
+        wire_api = "responses"
+
+    class MetaPhraseLLMClient:
+        def complete(self, *_args, **_kwargs):
+            return Result()
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", MetaPhraseLLMClient)
+
+    start_job(StartJobRequest(directions=["做一个订单看板"]), user=user, db=db)
+
+    command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    fallback_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "prompt_generation_fallback"))
+    assert command is not None
+    assert "做一个订单看板" in command.payload["prompt"]
+    assert "产物不满意" not in command.payload["prompt"]
+    assert fallback_log is not None
+    assert fallback_log.extra["quality_error"] == "prompt_contains_meta_phrase:产物不满意"
+
+
+def test_prompt_quality_rejects_duplicate_recent_prompt():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["demo"])
+    previous = TaskRound(
+        id="round1",
+        job_id=job.id,
+        round_index=1,
+        status=JobState.ROUND_COMPLETED,
+        prompt="继续把订单看板的筛选和统计联动补完整",
+    )
+    current = TaskRound(id="round2", job_id=job.id, round_index=2, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, previous, current])
+    db.commit()
+
+    error = prompt_writer.prompt_quality_error(db, job, current, "继续把订单看板的筛选和统计联动补完整")
+
+    assert error == "prompt_duplicate_recent"
+
+
+def test_prompt_quality_rejects_first_round_template_prefix():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["demo"])
+    current = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, current])
+    db.commit()
+
+    error = prompt_writer.prompt_quality_error(
+        db,
+        job,
+        current,
+        "按这个项目方向做一个能继续迭代的系统雏形：订单管理系统。",
+    )
+
+    assert error.startswith("first_round_template_prefix:")
+
+
+def test_prompt_quality_rejects_internal_process_language():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["demo"])
+    current = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, current])
+    db.commit()
+
+    error = prompt_writer.prompt_quality_error(
+        db,
+        job,
+        current,
+        "你现在在 trae cn 里帮我根据关键证据继续修复这个项目。",
+    )
+
+    assert error.startswith(("prompt_contains_internal_process:", "prompt_contains_meta_phrase:"))
+
+
+def test_prompt_quality_rejects_first_round_too_small_positive_scope():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["demo"])
+    current = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, current])
+    db.commit()
+
+    error = prompt_writer.prompt_quality_error(db, job, current, "做一个很简单的小 demo，只要一个页面。")
+
+    assert error == "first_round_too_small"
 
 
 def test_assigned_worker_config_is_scoped_to_bound_user_settings():
@@ -153,7 +320,9 @@ def test_worker_dispatch_uses_current_user_worker_settings_only():
 
     assert command.user_id == user.id
     assert command.payload["browser_url"] == "http://localhost:5173"
-    assert command.payload["trae_workspace_path"] == "D:/mr-d"
+    assert command.payload["workspace_root"] == "D:/mr-d"
+    assert command.payload["project_name"].startswith("demo-")
+    assert command.payload["trae_workspace_path"].replace("\\", "/").startswith("D:/mr-d/demo-")
 
 
 def test_retry_worker_command_requeues_failed_command_with_current_settings():

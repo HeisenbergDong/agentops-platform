@@ -4,6 +4,7 @@ import { Button, Card, Form, Input, Modal, Select, Space, Switch, Table, Tag, Ty
 import { useState } from "react";
 import { api } from "../../api/client";
 import type { AuthUser } from "../../auth/AuthContext";
+import { selectPopupProps } from "../../components/selectPopup";
 
 type CreateUserValues = {
   email: string;
@@ -93,6 +94,7 @@ export function AdminUsersPage() {
           </Form.Item>
           <Form.Item name="role" label="角色">
             <Select
+              {...selectPopupProps}
               options={[
                 { label: "普通用户", value: "user" },
                 { label: "管理员", value: "admin" }

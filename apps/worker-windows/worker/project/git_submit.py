@@ -13,13 +13,17 @@ def run_git_submit(
     push: bool = True,
     remote: str = "origin",
     branch: str = "",
+    remote_url: str = "",
+    project_name: str = "",
     timeout: int = 120,
 ) -> dict:
     assert_within_root(project_path, root)
     message = commit_message.strip() or "AgentOps automated update"
     remote_name = (remote or "origin").strip()
-    target_branch = branch.strip()
+    target_branch = branch.strip() or "main"
+    desired_remote_url = str(remote_url or "").strip()
 
+    repo_prepare = _ensure_git_repository(project_path, target_branch, remote_name, desired_remote_url, timeout)
     inside = _git(project_path, ["rev-parse", "--is-inside-work-tree"], timeout)
     if inside.returncode != 0 or inside.stdout.strip() != "true":
         return {
@@ -27,10 +31,10 @@ def run_git_submit(
             "project_path": str(project_path),
             "message": "Project path is not a Git work tree.",
             "rev_parse": _run_result(inside),
+            "repo_prepare": repo_prepare,
         }
 
-    current_branch = _git(project_path, ["rev-parse", "--abbrev-ref", "HEAD"], timeout)
-    branch_name = current_branch.stdout.strip()
+    branch_name = _current_branch(project_path, timeout)
     remote_url = _git(project_path, ["remote", "get-url", remote_name], timeout)
     status_before = _git(project_path, ["status", "--porcelain=v1"], timeout)
     if status_before.returncode != 0:
@@ -44,19 +48,28 @@ def run_git_submit(
             remote_url=remote_url,
         )
 
+    if status_before.stdout.strip():
+        _ensure_default_gitignore(project_path)
+        status_before = _git(project_path, ["status", "--porcelain=v1"], timeout)
+
     if not status_before.stdout.strip():
         head = _git(project_path, ["rev-parse", "HEAD"], timeout)
-        return {
+        base = {
             "status": "nothing_to_commit",
             "project_path": str(project_path),
             "branch": branch_name,
             "remote": remote_name,
             "remote_url": _masked_stdout(remote_url),
+            "project_name": project_name or project_path.name,
+            "repo_prepare": repo_prepare,
             "commit_sha": head.stdout.strip() if head.returncode == 0 else "",
             "changed_files": 0,
             "push_requested": push,
             "message": "Git work tree has no changes to submit.",
         }
+        if not push:
+            return base
+        return _push_existing_head(project_path, base, remote_name, target_branch, branch_name, timeout)
 
     add = _git(project_path, ["add", "-A"], timeout)
     if add.returncode != 0:
@@ -73,16 +86,23 @@ def run_git_submit(
 
     staged = _git(project_path, ["diff", "--cached", "--name-only"], timeout)
     if staged.returncode != 0 or not staged.stdout.strip():
-        return {
+        head = _git(project_path, ["rev-parse", "HEAD"], timeout)
+        base = {
             "status": "nothing_to_commit",
             "project_path": str(project_path),
             "branch": branch_name,
             "remote": remote_name,
             "remote_url": _masked_stdout(remote_url),
+            "project_name": project_name or project_path.name,
+            "repo_prepare": repo_prepare,
+            "commit_sha": head.stdout.strip() if head.returncode == 0 else "",
             "changed_files": 0,
             "push_requested": push,
             "message": "No staged changes remained after Git add.",
         }
+        if not push:
+            return base
+        return _push_existing_head(project_path, base, remote_name, target_branch, branch_name, timeout)
 
     commit = _git(
         project_path,
@@ -117,8 +137,10 @@ def run_git_submit(
         "branch": branch_name,
         "remote": remote_name,
         "remote_url": _masked_stdout(remote_url),
+        "project_name": project_name or project_path.name,
+        "repo_prepare": repo_prepare,
         "commit_sha": commit_sha,
-        "changed_files": len([line for line in staged.stdout.splitlines() if line.strip()]),
+        "changed_files": _changed_file_count(staged.stdout),
         "push_requested": push,
         "commit": _run_result(commit),
         "message": "Git commit created.",
@@ -126,11 +148,7 @@ def run_git_submit(
     if not push:
         return base
 
-    push_args = ["push", remote_name]
-    if target_branch:
-        push_args.append(f"HEAD:{target_branch}")
-    elif branch_name and branch_name != "HEAD":
-        push_args.append(branch_name)
+    push_args = _push_args(project_path, remote_name, target_branch, branch_name, timeout)
     push_result = _git(project_path, push_args, timeout)
     if push_result.returncode != 0:
         return {
@@ -157,6 +175,151 @@ def _git(cwd: Path, args: list[str], timeout: int) -> subprocess.CompletedProces
         timeout=timeout,
         check=False,
     )
+
+
+def _ensure_git_repository(
+    project_path: Path,
+    branch_name: str,
+    remote_name: str,
+    remote_url: str,
+    timeout: int,
+) -> dict:
+    project_path.mkdir(parents=True, exist_ok=True)
+    initialized = False
+    inside = _git(project_path, ["rev-parse", "--is-inside-work-tree"], timeout)
+    if inside.returncode != 0 or inside.stdout.strip() != "true":
+        init = _git(project_path, ["init", "-b", branch_name], timeout)
+        if init.returncode != 0:
+            init = _git(project_path, ["init"], timeout)
+            if init.returncode != 0:
+                return {"ok": False, "stage": "init", "init": _run_result(init)}
+            branch = _git(project_path, ["branch", "-M", branch_name], timeout)
+            if branch.returncode != 0:
+                return {"ok": False, "stage": "branch", "branch": _run_result(branch)}
+        initialized = True
+    else:
+        branch = _current_branch(project_path, timeout)
+        if branch and branch != branch_name:
+            checkout = _git(project_path, ["checkout", branch_name], timeout)
+            if checkout.returncode != 0:
+                checkout = _git(project_path, ["checkout", "-B", branch_name], timeout)
+            if checkout.returncode != 0:
+                return {"ok": False, "stage": "checkout", "checkout": _run_result(checkout)}
+
+    remote_changed = False
+    if remote_url:
+        existing_remote = _git(project_path, ["remote", "get-url", remote_name], timeout)
+        if existing_remote.returncode == 0 and existing_remote.stdout.strip():
+            if existing_remote.stdout.strip() != remote_url:
+                set_url = _git(project_path, ["remote", "set-url", remote_name, remote_url], timeout)
+                if set_url.returncode != 0:
+                    return {"ok": False, "stage": "remote_set_url", "remote": _run_result(set_url)}
+                remote_changed = True
+        else:
+            add = _git(project_path, ["remote", "add", remote_name, remote_url], timeout)
+            if add.returncode != 0:
+                return {"ok": False, "stage": "remote_add", "remote": _run_result(add)}
+            remote_changed = True
+    return {
+        "ok": True,
+        "initialized": initialized,
+        "remote_changed": remote_changed,
+        "branch": branch_name,
+        "remote": remote_name,
+        "remote_url": _mask_remote_url(remote_url),
+    }
+
+
+DEFAULT_IGNORE_LINES = [
+    "node_modules/",
+    "dist/",
+    "build/",
+    "target/",
+    ".next/",
+    ".nuxt/",
+    ".npm-cache/",
+    "screenshots/",
+    "trae_reply_traces/",
+    "pending_*.json",
+    "trae_collect_export.json",
+    "trae_watch_status.json",
+    ".venv/",
+    "venv/",
+    "__pycache__/",
+    ".pytest_cache/",
+    "*.pyc",
+]
+
+
+def _ensure_default_gitignore(project_path: Path) -> None:
+    path = project_path / ".gitignore"
+    existing = path.read_text(encoding="utf-8", errors="replace") if path.exists() else ""
+    existing_lines = {line.strip() for line in existing.splitlines()}
+    additions = [line for line in DEFAULT_IGNORE_LINES if line not in existing_lines]
+    if not additions:
+        return
+    text = existing.rstrip()
+    if text:
+        text += "\n"
+    path.write_text(text + "\n".join(additions) + "\n", encoding="utf-8")
+
+
+def _changed_file_count(value: str) -> int:
+    files = []
+    for line in str(value or "").splitlines():
+        text = line.strip()
+        if not text:
+            continue
+        path = text.split("->")[-1].strip()
+        if path.replace("\\", "/") == ".gitignore":
+            continue
+        files.append(path)
+    return len(files)
+
+
+def _current_branch(project_path: Path, timeout: int) -> str:
+    current = _git(project_path, ["branch", "--show-current"], timeout)
+    if current.returncode == 0 and current.stdout.strip():
+        return current.stdout.strip()
+    fallback = _git(project_path, ["rev-parse", "--abbrev-ref", "HEAD"], timeout)
+    return fallback.stdout.strip() if fallback.returncode == 0 else ""
+
+
+def _push_args(project_path: Path, remote_name: str, target_branch: str, branch_name: str, timeout: int) -> list[str]:
+    if target_branch and target_branch != branch_name:
+        return ["push", remote_name, f"HEAD:{target_branch}"]
+    if branch_name and branch_name != "HEAD":
+        upstream = _git(project_path, ["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"], timeout)
+        if upstream.returncode != 0:
+            return ["push", "--set-upstream", remote_name, branch_name]
+        return ["push", remote_name, branch_name]
+    return ["push", remote_name]
+
+
+def _push_existing_head(
+    project_path: Path,
+    base: dict,
+    remote_name: str,
+    target_branch: str,
+    branch_name: str,
+    timeout: int,
+) -> dict:
+    push_args = _push_args(project_path, remote_name, target_branch, branch_name, timeout)
+    push_result = _git(project_path, push_args, timeout)
+    if push_result.returncode != 0:
+        return {
+            **base,
+            "status": "push_failed",
+            "push": _run_result(push_result),
+            "message": "Git work tree had no new staged changes, but pushing the existing HEAD failed.",
+        }
+    return {
+        **base,
+        "status": "pushed",
+        "pushed_branch": target_branch or branch_name,
+        "push": _run_result(push_result),
+        "message": "Git work tree had no new staged changes; existing HEAD was pushed.",
+    }
 
 
 def _failed(failure_status: str, project_path: Path, message: str, **runs: Any) -> dict:

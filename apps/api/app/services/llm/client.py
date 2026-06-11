@@ -133,7 +133,7 @@ class LLMClient:
         except httpx.HTTPError as exc:
             raise LLMError(f"LLM request failed: {exc.__class__.__name__}") from exc
         if response.status_code >= 400:
-            raise LLMError(f"LLM request failed with status {response.status_code}")
+            raise LLMError(_http_error_message(response))
         try:
             return response.json()
         except ValueError as exc:
@@ -164,3 +164,19 @@ def _extract_chat_text(data: dict[str, Any]) -> str:
     if not isinstance(content, str) or not content.strip():
         raise LLMError("LLM response did not include message content")
     return content.strip()
+
+
+def _http_error_message(response: httpx.Response) -> str:
+    detail = ""
+    try:
+        data = response.json()
+    except ValueError:
+        data = {}
+    if isinstance(data, dict):
+        code = str(data.get("code") or data.get("error", {}).get("code") or "").strip()
+        message = str(data.get("message") or data.get("error", {}).get("message") or "").strip()
+        detail = " ".join(item for item in [code, message] if item)
+    if not detail:
+        detail = response.text.strip().replace("\n", " ")[:300]
+    suffix = f": {detail}" if detail else ""
+    return f"LLM request failed with status {response.status_code}{suffix}"

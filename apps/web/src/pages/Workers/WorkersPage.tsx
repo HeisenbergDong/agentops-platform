@@ -1,23 +1,74 @@
 import { ApiOutlined, LinkOutlined, PlusOutlined, SendOutlined } from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Alert, Button, Card, Descriptions, Input, List, Select, Space, Tag, Typography, message } from "antd";
+import { Alert, Button, Card, Input, List, Select, Space, Tag, Typography, message } from "antd";
 import { useState } from "react";
 import { api } from "../../api/client";
 import { useAuth } from "../../auth/AuthContext";
+import { selectPopupProps } from "../../components/selectPopup";
+
+type WorkerRecord = {
+  worker_id: string;
+  display_name?: string;
+  machine_name?: string;
+  worker_type?: string;
+  version?: string;
+  current_stage?: string;
+  current_window_title?: string;
+  busy?: boolean;
+  status?: string;
+  capabilities?: string[];
+  supported_apps?: string[];
+  last_seen_at?: string;
+  user_id?: string | null;
+};
+
+type AdminUser = {
+  id: string;
+  display_name: string;
+  email: string;
+};
+
+type WorkerCommandRecord = {
+  command_id: string;
+  worker_id: string;
+  type: string;
+  status: string;
+  message?: string;
+  error?: string;
+  updated_at?: string;
+  finished_at?: string | null;
+};
 
 export function WorkersPage() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [latestCode, setLatestCode] = useState("");
-  const workers = useQuery({
+  const workers = useQuery<WorkerRecord[]>({
     queryKey: ["workers"],
-    queryFn: async () => (await api.get("/workers")).data,
+    queryFn: async () => (await api.get<WorkerRecord[]>("/workers")).data,
     refetchInterval: 5000
   });
-  const users = useQuery({
+  const users = useQuery<AdminUser[]>({
     queryKey: ["admin-users-for-workers"],
-    queryFn: async () => (await api.get("/admin/users")).data,
+    queryFn: async () => (await api.get<AdminUser[]>("/admin/users")).data,
     enabled: user?.role === "admin"
+  });
+  const recentCommands = useQuery<Record<string, WorkerCommandRecord[]>>({
+    queryKey: ["worker-recent-commands", workers.data?.map((worker) => worker.worker_id).join(",") || ""],
+    queryFn: async () => {
+      const entries = await Promise.all(
+        (workers.data || []).map(async (worker) => {
+          const response = await api.get<{ commands: WorkerCommandRecord[] }>(
+            `/workers/${worker.worker_id}/recent-commands`,
+            { params: { limit: 3 } }
+          );
+          return [worker.worker_id, response.data.commands] as const;
+        })
+      );
+      return Object.fromEntries(entries);
+    },
+    enabled: Boolean(workers.data?.length),
+    refetchInterval: 3000
   });
 
   async function createRegistrationCode() {
@@ -33,11 +84,12 @@ export function WorkersPage() {
   }
 
   async function sendMockCommand(workerId: string) {
-    await api.post(`/workers/${workerId}/commands`, {
+    const response = await api.post<WorkerCommandRecord>(`/workers/${workerId}/commands`, {
       type: "diagnose_ui",
       payload: { source: "web", note: "manual mock command" }
     });
-    message.success("测试命令已排队");
+    message.success(`测试命令已排队：${response.data.command_id.slice(0, 8)}`);
+    await queryClient.invalidateQueries({ queryKey: ["worker-recent-commands"] });
   }
 
   return (
@@ -64,62 +116,109 @@ export function WorkersPage() {
         <List
           loading={workers.isLoading}
           dataSource={workers.data || []}
-          renderItem={(worker: any) => (
-            <List.Item
-              actions={[
-                <Button key="mock" icon={<SendOutlined />} onClick={() => void sendMockCommand(worker.worker_id)}>
-                  测试命令
-                </Button>
-              ]}
-            >
-              <List.Item.Meta
-                avatar={<ApiOutlined />}
-                title={
-                  <Space>
-                    <Typography.Text strong>{worker.display_name || worker.worker_id}</Typography.Text>
-                    <Tag color={worker.busy ? "orange" : "green"}>{worker.busy ? "忙碌" : "空闲"}</Tag>
-                    <Tag>{worker.status}</Tag>
-                  </Space>
-                }
-                description={
-                  <Space direction="vertical" size={4}>
-                    <Typography.Text type="secondary">{worker.worker_id}</Typography.Text>
-                    <Typography.Text type="secondary">
-                      {worker.machine_name} / {worker.worker_type} / {worker.version || "-"}
-                    </Typography.Text>
-                    <Typography.Text type="secondary">
-                      {worker.current_stage} / {worker.current_window_title || "-"}
-                    </Typography.Text>
+          renderItem={(worker) => {
+            const capabilityText =
+              (worker.capabilities?.length ? worker.capabilities : worker.supported_apps || []).join(", ") || "-";
+            const latestCommand = recentCommands.data?.[worker.worker_id]?.[0];
+            return (
+              <List.Item className="worker-list-item">
+                <div className="worker-row">
+                  <div className="worker-main">
+                    <div className="worker-title-row">
+                      <ApiOutlined className="worker-icon" />
+                      <Typography.Text strong className="worker-name">
+                        {worker.display_name || worker.worker_id}
+                      </Typography.Text>
+                      <Tag color={worker.busy ? "orange" : "green"}>{worker.busy ? "忙碌" : "空闲"}</Tag>
+                      <Tag>{worker.status || "-"}</Tag>
+                    </div>
+
+                    <Space direction="vertical" size={4} className="worker-meta-lines">
+                      <Typography.Text type="secondary">{worker.worker_id}</Typography.Text>
+                      <Typography.Text type="secondary">
+                        {worker.machine_name || "-"} / {worker.worker_type || "-"} / {worker.version || "-"}
+                      </Typography.Text>
+                      <Typography.Text type="secondary">
+                        {worker.current_stage || "-"} / {worker.current_window_title || "-"}
+                      </Typography.Text>
+                    </Space>
+
                     {user?.role === "admin" ? (
-                      <Space>
+                      <div className="worker-bind-row">
                         <LinkOutlined />
                         <Select
+                          {...selectPopupProps}
                           allowClear
                           size="small"
                           placeholder="绑定用户"
                           value={worker.user_id || undefined}
-                          style={{ width: 260 }}
-                          options={(users.data || []).map((item: any) => ({
+                          className="worker-bind-select"
+                          options={(users.data || []).map((item) => ({
                             label: `${item.display_name} (${item.email})`,
                             value: item.id
                           }))}
                           onChange={(value) => void bindWorker(worker.worker_id, value || null)}
                         />
-                      </Space>
+                      </div>
                     ) : null}
-                  </Space>
-                }
-              />
-              <Descriptions size="small" column={1}>
-                <Descriptions.Item label="能力">
-                  {(worker.capabilities?.length ? worker.capabilities : worker.supported_apps || []).join(", ") || "-"}
-                </Descriptions.Item>
-                <Descriptions.Item label="最后心跳">{worker.last_seen_at}</Descriptions.Item>
-              </Descriptions>
-            </List.Item>
-          )}
+                  </div>
+
+                  <div className="worker-actions">
+                    <Button icon={<SendOutlined />} onClick={() => void sendMockCommand(worker.worker_id)}>
+                      测试命令
+                    </Button>
+                  </div>
+                </div>
+
+                <div className="worker-detail-grid">
+                  <Typography.Text type="secondary" className="worker-detail-label">
+                    能力
+                  </Typography.Text>
+                  <Typography.Text className="worker-detail-value worker-capabilities">{capabilityText}</Typography.Text>
+                  <Typography.Text type="secondary" className="worker-detail-label">
+                    最后心跳
+                  </Typography.Text>
+                  <Typography.Text className="worker-detail-value">{worker.last_seen_at || "-"}</Typography.Text>
+                  <Typography.Text type="secondary" className="worker-detail-label">
+                    最近命令
+                  </Typography.Text>
+                  <div className="worker-detail-value worker-command-status">
+                    {latestCommand ? (
+                      <>
+                        <Tag color={commandStatusColor(latestCommand.status)}>{latestCommand.status}</Tag>
+                        <Typography.Text>{latestCommand.type}</Typography.Text>
+                        <Typography.Text type="secondary">
+                          {latestCommand.finished_at || latestCommand.updated_at || "-"}
+                        </Typography.Text>
+                        {latestCommand.error ? (
+                          <Typography.Text type="danger">{latestCommand.error}</Typography.Text>
+                        ) : latestCommand.message ? (
+                          <Typography.Text type="secondary">{latestCommand.message}</Typography.Text>
+                        ) : null}
+                      </>
+                    ) : (
+                      <Typography.Text type="secondary">暂无命令</Typography.Text>
+                    )}
+                  </div>
+                </div>
+              </List.Item>
+            );
+          }}
         />
       </Card>
     </Space>
   );
+}
+
+function commandStatusColor(status?: string) {
+  if (status === "success" || status === "completed") {
+    return "green";
+  }
+  if (status === "failed" || status === "manual_required" || status === "cancelled") {
+    return "red";
+  }
+  if (status === "claimed" || status === "running") {
+    return "blue";
+  }
+  return "default";
 }

@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { Alert, Button, Card, Col, Form, Input, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useEffect, useMemo, useState } from "react";
 import { api } from "../../api/client";
+import { selectPopupProps } from "../../components/selectPopup";
 
 type SettingsResponse = {
   sections: Record<string, any>;
@@ -91,8 +92,8 @@ export function SettingsPage() {
         type="info"
         message="用户只配置凭证和偏好；仓库、飞书资源、Trae 执行细节由对应角色和 Worker 在流程中自动处理。"
       />
-      <Form form={form} layout="vertical" onFinish={(values) => void save(values)}>
-        <Card title="模型配置" loading={settings.isLoading}>
+      <Form className="settings-form" form={form} layout="vertical" onFinish={(values) => void save(values)}>
+        <Card className="settings-card" title="模型配置" loading={settings.isLoading}>
           <Row gutter={16}>
             <Col span={6}>
               <Form.Item name={["model", "provider"]} label="Provider">
@@ -124,6 +125,7 @@ export function SettingsPage() {
             <Col span={6}>
               <Form.Item name={["model", "wire_api"]} label="接口类型">
                 <Select
+                  {...selectPopupProps}
                   options={[
                     { label: "Responses", value: "responses" },
                     { label: "Chat Completions", value: "chat_completions" }
@@ -134,6 +136,7 @@ export function SettingsPage() {
             <Col span={6}>
               <Form.Item name={["model", "reasoning_effort"]} label="推理强度">
                 <Select
+                  {...selectPopupProps}
                   allowClear
                   options={["minimal", "low", "medium", "high", "xhigh"].map((value) => ({ label: value, value }))}
                 />
@@ -142,7 +145,7 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card title="GitHub 凭证">
+        <Card className="settings-card" title="GitHub 凭证">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["github", "token"]} label="GitHub Token">
@@ -165,6 +168,7 @@ export function SettingsPage() {
         </Card>
 
         <Card
+          className="settings-card"
           title="飞书授权"
           extra={
             <Button icon={<CloudSyncOutlined />} loading={discovering} onClick={() => void discoverFeishu()}>
@@ -214,17 +218,18 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card title="Webhook">
+        <Card className="settings-card" title="Webhook">
           <Form.Item name={["webhook", "url"]} label="Webhook 地址">
             <Input placeholder="https://example.com/hook" />
           </Form.Item>
         </Card>
 
-        <Card title="Trae / Worker">
+        <Card className="settings-card" title="Trae / Worker">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["worker", "worker_id"]} label="关联 Worker">
                 <Select
+                  {...selectPopupProps}
                   allowClear
                   placeholder="选择已注册 Worker"
                   options={(workers.data || []).map((worker: any) => ({
@@ -253,11 +258,12 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Card title="默认项">
+        <Card className="settings-card" title="默认项">
           <Row gutter={16}>
             <Col span={12}>
               <Form.Item name={["defaults", "default_rule_version_id"]} label="默认规则版本">
                 <Select
+                  {...selectPopupProps}
                   allowClear
                   placeholder="选择规则版本"
                   options={(ruleVersions.data || []).map((item: any) => ({
@@ -270,9 +276,11 @@ export function SettingsPage() {
           </Row>
         </Card>
 
-        <Button type="primary" htmlType="submit" icon={<SaveOutlined />}>
-          保存配置
-        </Button>
+        <div className="settings-action-bar">
+          <Button type="primary" htmlType="submit" icon={<SaveOutlined />}>
+            保存配置
+          </Button>
+        </div>
       </Form>
     </Space>
   );

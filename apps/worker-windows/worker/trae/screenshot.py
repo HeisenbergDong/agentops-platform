@@ -1,4 +1,5 @@
 from datetime import datetime
+import os
 from pathlib import Path
 
 
@@ -6,8 +7,8 @@ def capture_screenshot() -> dict:
     import mss
     from PIL import Image
 
-    out_dir = Path("screenshots")
-    out_dir.mkdir(exist_ok=True)
+    out_dir = _screenshot_dir()
+    out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"worker-screen-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
     with mss.mss() as sct:
         monitor = sct.monitors[1]
@@ -21,3 +22,10 @@ def capture_screenshot() -> dict:
         "content_type": "image/png",
         "size_bytes": path.stat().st_size,
     }
+
+
+def _screenshot_dir() -> Path:
+    appdata = os.environ.get("APPDATA")
+    if appdata:
+        return Path(appdata) / "AgentOps" / "screenshots"
+    return Path.home() / ".agentops" / "screenshots"

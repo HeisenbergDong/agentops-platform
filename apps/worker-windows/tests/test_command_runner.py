@@ -23,15 +23,17 @@ def test_runner_uses_configured_worker_id():
 def test_send_prompt_opens_workspace_and_sends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     workspace = tmp_path / "project"
     workspace.mkdir()
-    opened = []
+    ensured = []
 
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
     monkeypatch.setattr(command_runner.settings, "trae_exe_path", Path("C:/Trae/Trae.exe"))
     monkeypatch.setattr(
         command_runner,
-        "open_trae",
-        lambda exe, workspace_path: opened.append((exe, workspace_path))
-        or {"status": "launched", "workspace_path": str(workspace_path)},
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        )
+        or {"status": "launched", "workspace_path": str(workspace_path), "window_title": "Trae"},
     )
     monkeypatch.setattr(
         command_runner,
@@ -59,7 +61,45 @@ def test_send_prompt_opens_workspace_and_sends(monkeypatch: pytest.MonkeyPatch, 
     assert result["status"] == "success"
     assert result["data"]["status"] == "sent"
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
-    assert opened == [(Path("C:/Trae/Trae.exe"), workspace)]
+    assert result["data"]["open_trae"]["status"] == "launched"
+    assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, True)]
+
+
+def test_send_prompt_auto_starts_trae_without_workspace_payload(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    ensured = []
+    settings = command_runner.WorkerSettings(
+        workspace_root=tmp_path,
+        trae_exe_path=Path("C:/Trae/Trae.exe"),
+    )
+
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        )
+        or {"status": "already_running", "workspace_path": str(workspace_path), "window_title": "Trae"},
+    )
+    monkeypatch.setattr(
+        command_runner,
+        "send_prompt",
+        lambda prompt, submit, submit_hotkey: {
+            "status": "sent",
+            "chars": len(prompt),
+            "submitted": submit,
+            "submit_hotkey": submit_hotkey,
+        },
+    )
+
+    result = CommandRunner(worker_id="worker-test", runtime_settings=settings).run(
+        {"command_id": "cmd-2b", "type": "send_prompt", "payload": {"prompt": "Build the feature"}}
+    )
+
+    assert result["status"] == "success"
+    assert result["data"]["open_trae"]["status"] == "already_running"
+    assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
 
 
 def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytest.MonkeyPatch):
@@ -74,6 +114,31 @@ def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytes
 
     assert result["status"] == "manual_required"
     assert result["error"] == "no window"
+
+
+def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    ensured = []
+    settings = command_runner.WorkerSettings(
+        workspace_root=tmp_path,
+        trae_exe_path=Path("C:/Trae/Trae.exe"),
+    )
+
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        )
+        or {"status": "launched", "window_title": "Trae"},
+    )
+
+    result = CommandRunner(worker_id="worker-test", runtime_settings=settings).run(
+        {"command_id": "cmd-3b", "type": "focus_trae", "payload": {}}
+    )
+
+    assert result["status"] == "success"
+    assert result["data"]["status"] == "launched"
+    assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
 
 
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -184,13 +249,15 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
     received = {}
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
 
-    def fake_git_submit(root, project_path, commit_message, push, remote, branch, timeout):
+    def fake_git_submit(root, project_path, commit_message, push, remote, branch, remote_url, project_name, timeout):
         received["root"] = root
         received["project_path"] = project_path
         received["commit_message"] = commit_message
         received["push"] = push
         received["remote"] = remote
         received["branch"] = branch
+        received["remote_url"] = remote_url
+        received["project_name"] = project_name
         received["timeout"] = timeout
         return {"status": "committed", "commit_sha": "abc123"}
 
@@ -205,6 +272,8 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
                 "commit_message": "AgentOps test",
                 "push": False,
                 "remote": "upstream",
+                "remote_url": "git@github.com:acme/project.git",
+                "project_name": "project",
                 "branch": "feature/test",
                 "timeout": 5,
             },
@@ -220,6 +289,8 @@ def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Pa
         "push": False,
         "remote": "upstream",
         "branch": "feature/test",
+        "remote_url": "git@github.com:acme/project.git",
+        "project_name": "project",
         "timeout": 5,
     }
 
@@ -247,6 +318,54 @@ def test_run_git_submit_reports_nothing_to_commit(tmp_path: Path):
     result = run_git_submit(tmp_path, project, commit_message="AgentOps test", push=False)
 
     assert result["status"] == "nothing_to_commit"
+
+
+def test_run_git_submit_pushes_existing_clean_commit(tmp_path: Path):
+    remote = tmp_path / "remote.git"
+    project = tmp_path / "project"
+    remote.mkdir()
+    project.mkdir()
+    _git(remote, "init", "--bare")
+    _git(project, "init")
+    _git(project, "config", "user.name", "Test User")
+    _git(project, "config", "user.email", "test@example.invalid")
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+    _git(project, "add", "README.md")
+    _git(project, "commit", "-m", "Initial commit")
+    _git(project, "remote", "add", "origin", str(remote))
+
+    result = run_git_submit(tmp_path, project, commit_message="AgentOps test", push=True)
+
+    assert result["status"] == "pushed"
+    assert result["changed_files"] == 0
+    upstream = _git(project, "rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}")
+    assert upstream.returncode == 0
+
+
+def test_run_git_submit_initializes_project_and_sets_remote(tmp_path: Path):
+    remote = tmp_path / "remote.git"
+    project = tmp_path / "project"
+    remote.mkdir()
+    project.mkdir()
+    _git(remote, "init", "--bare")
+    (project / "README.md").write_text("hello\n", encoding="utf-8")
+
+    result = run_git_submit(
+        tmp_path,
+        project,
+        commit_message="AgentOps test",
+        push=True,
+        remote_url=str(remote),
+        project_name="project",
+    )
+
+    assert result["status"] == "pushed"
+    assert result["repo_prepare"]["initialized"] is True
+    assert result["project_name"] == "project"
+    assert _git(project, "remote", "get-url", "origin").stdout.strip() == str(remote)
+    gitignore = (project / ".gitignore").read_text(encoding="utf-8")
+    assert "screenshots/" in gitignore
+    assert "trae_reply_traces/" in gitignore
 
 
 def test_probe_trace_reports_full_trace_shape():

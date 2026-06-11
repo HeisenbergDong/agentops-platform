@@ -3,6 +3,7 @@ import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { Button, Card, Col, Form, Input, List, Row, Segmented, Select, Space, Switch, Tag, Typography, message } from "antd";
 import { useEffect, useState } from "react";
 import { api } from "../../api/client";
+import { selectPopupProps } from "../../components/selectPopup";
 
 type Role = {
   id: string;
@@ -180,6 +181,7 @@ export function RolesPage() {
               />
               {chatMode === "append_rule_note" || chatMode === "llm_append_rule_note" ? (
                 <Select
+                  {...selectPopupProps}
                   value={targetRule || undefined}
                   placeholder="选择规则文件"
                   onChange={setTargetRule}

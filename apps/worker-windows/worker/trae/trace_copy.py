@@ -1,5 +1,6 @@
 import time
 
+from worker.system.clipboard import ClipboardError, get_clipboard_text, set_clipboard_text
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 COPY_BUTTON_MARKERS = ("\u590d\u5236", "Copy", "copy")
@@ -92,36 +93,18 @@ def _wait_for_clipboard_change(before: str, timeout_seconds: float) -> str:
 
 
 def _read_clipboard_text() -> str:
-    root = None
     try:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        return root.clipboard_get()
-    except Exception:
+        return get_clipboard_text()
+    except ClipboardError:
         return ""
-    finally:
-        if root:
-            root.destroy()
 
 
 def _set_clipboard_text(value: str) -> bool:
-    root = None
     try:
-        import tkinter as tk
-
-        root = tk.Tk()
-        root.withdraw()
-        root.clipboard_clear()
-        root.clipboard_append(value)
-        root.update()
+        set_clipboard_text(value)
         return True
-    except Exception:
+    except ClipboardError:
         return False
-    finally:
-        if root:
-            root.destroy()
 
 
 def probe_trace(text: str) -> dict:

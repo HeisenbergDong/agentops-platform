@@ -1,12 +1,8 @@
-import time
 from typing import Any
 
 import httpx
 
-from app.core.secrets import seal_secret
-from app.services.user_settings import safe_open_secret
-
-FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+from app.services.feishu.auth import FEISHU_BASE_URL, get_feishu_access_token, tenant_access_token
 
 
 class FeishuDiscoveryError(RuntimeError):
@@ -14,42 +10,61 @@ class FeishuDiscoveryError(RuntimeError):
 
 
 def discover_feishu_resources(feishu_config: dict[str, Any]) -> dict[str, Any]:
-    app_id = str(feishu_config.get("app_id") or "").strip()
-    app_secret = safe_open_secret(feishu_config.get("app_secret"))
-    if not app_id or not app_secret:
-        raise FeishuDiscoveryError("Feishu App ID and App Secret are required.")
+    access_token, refreshed_cache, auth_mode = get_feishu_access_token(feishu_config)
+    app_token = str(feishu_config.get("app_token") or "").strip()
+    table_id = str(feishu_config.get("table_id") or "").strip()
 
-    token_payload = _tenant_access_token(app_id, app_secret)
-    tenant_access_token = token_payload["tenant_access_token"]
-    expire = int(token_payload.get("expire", 7200))
-    expires_at = int(time.time()) + max(expire - 300, 60)
-
-    return {
-        "token_cache": {
-            "tenant_access_token": seal_secret(tenant_access_token),
-            "expires_at": expires_at,
-        },
-        "discovered_resources": {
-            "bases": [],
-            "tables": [],
-            "views": [],
-            "message": "飞书授权已验证；具体 base/table/view 将由飞书角色按权限和任务上下文自动发现。",
-            "refreshed_at": int(time.time()),
-        },
+    resources: dict[str, Any] = {
+        "bases": [],
+        "tables": [],
+        "views": [],
+        "fields": [],
+        "auth_mode": auth_mode,
     }
+    if app_token:
+        resources["tables"] = _get_items(
+            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables",
+            access_token,
+            params={"page_size": "100"},
+        )
+    if app_token and table_id:
+        resources["fields"] = _get_items(
+            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            access_token,
+            params={"page_size": "100"},
+        )
+        resources["views"] = _get_items(
+            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/views",
+            access_token,
+            params={"page_size": "100"},
+        )
+
+    result: dict[str, Any] = {"discovered_resources": resources}
+    if refreshed_cache:
+        result["token_cache"] = refreshed_cache
+    return result
 
 
 def _tenant_access_token(app_id: str, app_secret: str) -> dict[str, Any]:
-    url = f"{FEISHU_BASE_URL}/auth/v3/tenant_access_token/internal"
-    response = httpx.post(
+    return tenant_access_token(app_id, app_secret)
+
+
+def _get_items(url: str, access_token: str, params: dict[str, str]) -> list[dict[str, Any]]:
+    response = httpx.get(
         url,
-        json={"app_id": app_id, "app_secret": app_secret},
-        timeout=15,
+        params=params,
+        headers={"Authorization": f"Bearer {access_token}"},
+        timeout=20,
     )
-    response.raise_for_status()
-    data = response.json()
-    if data.get("code") != 0:
-        raise FeishuDiscoveryError(str(data.get("msg") or "Failed to get Feishu tenant token."))
-    if not data.get("tenant_access_token"):
-        raise FeishuDiscoveryError("Feishu response did not include tenant_access_token.")
-    return data
+    try:
+        payload = response.json()
+    except Exception as exc:
+        raise FeishuDiscoveryError(f"Feishu returned non-JSON response: HTTP {response.status_code}") from exc
+    if response.status_code >= 400:
+        raise FeishuDiscoveryError(
+            f"Feishu request failed: HTTP {response.status_code}, code={payload.get('code')}, msg={payload.get('msg')}"
+        )
+    if payload.get("code") != 0:
+        raise FeishuDiscoveryError(str(payload.get("msg") or "Feishu resource discovery failed."))
+    data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
+    return list(data.get("items") or [])
