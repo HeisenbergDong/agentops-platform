@@ -1,11 +1,14 @@
 from datetime import timedelta
+from pathlib import Path
+import re
 
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user, current_worker
-from app.db.models import User, Worker, WorkerCommand
+from app.core.config import settings
+from app.db.models import Attachment, User, Worker, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import (
@@ -186,6 +189,44 @@ def post_log(
     return {"status": "received", "log_id": log.id}
 
 
+@router.post("/{worker_id}/attachments")
+def upload_worker_attachment(
+    worker_id: str,
+    kind: str = Form(...),
+    job_id: str | None = Form(None),
+    round_id: str | None = Form(None),
+    file: UploadFile = File(...),
+    worker: Worker = Depends(current_worker),
+    db: Session = Depends(get_db),
+) -> dict:
+    if worker.worker_id != worker_id:
+        raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
+    safe_kind = _safe_path_part(kind or "artifact")
+    safe_filename = _safe_filename(file.filename or f"{safe_kind}.bin")
+    out_dir = settings.attachment_root / "workers" / _safe_path_part(worker_id) / safe_kind
+    out_dir.mkdir(parents=True, exist_ok=True)
+    path = _unique_path(out_dir / safe_filename)
+    size_bytes = 0
+    with path.open("wb") as target:
+        while chunk := file.file.read(1024 * 1024):
+            size_bytes += len(chunk)
+            target.write(chunk)
+    attachment = Attachment(
+        user_id=worker.user_id,
+        job_id=job_id,
+        round_id=round_id,
+        kind=safe_kind,
+        filename=path.name,
+        path=str(path),
+        content_type=file.content_type or "application/octet-stream",
+        size_bytes=size_bytes,
+    )
+    db.add(attachment)
+    db.commit()
+    db.refresh(attachment)
+    return {"status": "uploaded", "attachment": serialize_attachment(attachment)}
+
+
 def assigned_worker_config(db: Session, worker: Worker) -> dict:
     if not worker.user_id:
         return {}
@@ -222,6 +263,21 @@ def serialize_worker(item: Worker) -> dict:
     }
 
 
+def serialize_attachment(item: Attachment) -> dict:
+    return {
+        "id": item.id,
+        "user_id": item.user_id,
+        "job_id": item.job_id,
+        "round_id": item.round_id,
+        "kind": item.kind,
+        "filename": item.filename,
+        "path": item.path,
+        "content_type": item.content_type,
+        "size_bytes": item.size_bytes,
+        "created_at": item.created_at.isoformat(),
+    }
+
+
 def effective_worker_status(item: Worker) -> str:
     if item.revoked_at:
         return "revoked"
@@ -255,3 +311,26 @@ def serialize_command(item) -> dict:
         "claimed_at": item.claimed_at.isoformat() if item.claimed_at else None,
         "finished_at": item.finished_at.isoformat() if item.finished_at else None,
     }
+
+
+def _safe_path_part(value: str) -> str:
+    text = re.sub(r"[^a-zA-Z0-9._-]+", "-", str(value or "").strip())
+    return text.strip(".-_")[:120] or "item"
+
+
+def _safe_filename(value: str) -> str:
+    name = Path(str(value or "attachment.bin")).name
+    name = re.sub(r"[^a-zA-Z0-9._ -]+", "-", name).strip(". ")
+    return name[:180] or "attachment.bin"
+
+
+def _unique_path(path: Path) -> Path:
+    if not path.exists():
+        return path
+    stem = path.stem or "attachment"
+    suffix = path.suffix
+    for index in range(1, 1000):
+        candidate = path.with_name(f"{stem}-{index}{suffix}")
+        if not candidate.exists():
+            return candidate
+    return path.with_name(f"{stem}-{now_utc().strftime('%Y%m%d%H%M%S%f')}{suffix}")

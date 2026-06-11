@@ -384,6 +384,15 @@ def _handle_click_continue_result(db: Session, command: WorkerCommand, result: W
 
 
 def _record_screenshot_attachment(db: Session, command: WorkerCommand, result: WorkerResult) -> Attachment:
+    uploaded = result.data.get("server_attachment")
+    if isinstance(uploaded, dict) and uploaded.get("id"):
+        attachment = db.get(Attachment, str(uploaded.get("id")))
+        if attachment and attachment.user_id == command.user_id:
+            attachment.job_id = attachment.job_id or command.job_id
+            attachment.round_id = attachment.round_id or command.round_id
+            attachment.kind = "screenshot"
+            db.flush()
+            return attachment
     path = str(result.data.get("path") or "")
     filename = str(result.data.get("filename") or Path(path).name or "screenshot.png")
     size_bytes = int(result.data.get("size_bytes") or 0)

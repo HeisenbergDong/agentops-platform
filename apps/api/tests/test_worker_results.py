@@ -276,6 +276,47 @@ def test_capture_screenshot_records_attachment_and_advances_to_product_reviewing
     assert next_command.status == "queued"
 
 
+def test_capture_screenshot_uses_uploaded_server_attachment():
+    db = _test_session()
+    job, round_, command = _create_capture_screenshot_rows(db)
+    uploaded = Attachment(
+        id="att-uploaded",
+        user_id=command.user_id,
+        job_id=job.id,
+        round_id=round_.id,
+        kind="screenshot",
+        filename="server-screen.png",
+        path="storage/workers/worker1/screenshot/server-screen.png",
+        content_type="image/png",
+        size_bytes=4321,
+    )
+    db.add(uploaded)
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "status": "captured",
+                "path": "C:/Users/PC/AppData/Roaming/AgentOps/screenshots/local.png",
+                "filename": "local.png",
+                "content_type": "image/png",
+                "size_bytes": 1234,
+                "server_attachment": {"id": uploaded.id},
+            },
+        ),
+    )
+
+    attachments = list(db.scalars(select(Attachment).where(Attachment.kind == "screenshot")).all())
+    assert len(attachments) == 1
+    assert attachments[0].id == uploaded.id
+    assert attachments[0].path == "storage/workers/worker1/screenshot/server-screen.png"
+
+
 def test_scan_project_with_recommended_command_queues_product_review_command():
     db = _test_session()
     job, round_, command = _create_scan_project_rows(db)

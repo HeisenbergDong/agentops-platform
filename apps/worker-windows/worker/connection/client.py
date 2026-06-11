@@ -71,3 +71,28 @@ class WorkerClient:
         )
         response.raise_for_status()
         return response.json()
+
+    def upload_attachment(
+        self,
+        worker_id: str,
+        path,
+        *,
+        kind: str,
+        job_id: str | None = None,
+        round_id: str | None = None,
+        content_type: str = "application/octet-stream",
+    ) -> dict:
+        with open(path, "rb") as file_obj:
+            response = httpx.post(
+                f"{self.server_url}/api/workers/{worker_id}/attachments",
+                headers=self.headers,
+                data={
+                    "kind": kind,
+                    "job_id": job_id or "",
+                    "round_id": round_id or "",
+                },
+                files={"file": (getattr(path, "name", None) or "attachment", file_obj, content_type)},
+                timeout=60,
+            )
+        response.raise_for_status()
+        return response.json()

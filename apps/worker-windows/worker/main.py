@@ -14,6 +14,7 @@ if __package__ in {None, ""}:
 from worker.capabilities import CAPABILITIES, SUPPORTED_APPS
 from worker.config import WorkerSettings, default_config_path, load_worker_settings
 from worker.connection.client import WorkerClient
+from worker.connection.uploader import AttachmentUploader
 from worker.registration import RegistrationOptions, is_registered, machine_fingerprint, register_worker
 from worker.system.console import disable_quick_edit_mode
 
@@ -61,6 +62,7 @@ def run_once(
             continue
         post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
         result = runner.run(command)
+        result = attach_worker_uploads(client, worker_settings.worker_id, command, result)
         post_worker_event(
             client,
             worker_settings.worker_id,
@@ -242,6 +244,34 @@ def attach_cancellation_checker(
         return is_cancelled_command(command)
 
     runner.cancellation_checker = checker
+
+
+def attach_worker_uploads(
+    client: WorkerClient,
+    worker_id: str,
+    command: dict,
+    result: dict,
+) -> dict:
+    command_type = str(command.get("type") or "")
+    data = result.get("data") if isinstance(result, dict) else None
+    if command_type != "capture_screenshot" or not isinstance(data, dict):
+        return result
+    path = Path(str(data.get("path") or ""))
+    if not path:
+        return result
+    try:
+        attachment = AttachmentUploader(client, worker_id).upload(
+            path,
+            "screenshot",
+            job_id=str(command.get("job_id") or ""),
+            round_id=str(command.get("round_id") or ""),
+            content_type=str(data.get("content_type") or "image/png"),
+        )
+    except Exception as exc:
+        result["data"] = {**data, "upload_status": "failed", "upload_error": str(exc)}
+        return result
+    result["data"] = {**data, "upload_status": "uploaded", "server_attachment": attachment}
+    return result
 
 
 def try_auto_launch_trae(runner: Any) -> None:
