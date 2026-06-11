@@ -61,6 +61,7 @@ def register_worker(options: RegistrationOptions) -> tuple[WorkerSettings, Path,
         version=current.version,
         trae_exe_path=options.trae_exe_path or current.trae_exe_path,
         workspace_root=options.workspace_root or current.workspace_root,
+        browser_url=current.browser_url,
         poll_interval_seconds=options.poll_interval_seconds or current.poll_interval_seconds,
         auto_launch_trae_on_startup=current.auto_launch_trae_on_startup,
     )

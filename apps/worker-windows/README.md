@@ -73,3 +73,5 @@ The EXE bundles Python and worker dependencies. The target machine still needs T
 ## Server Binding
 
 Registration only creates the worker record and token. The admin or user still needs to bind the worker to the target user and set the user's worker settings in AgentOps Web.
+
+The worker applies the bound user's Trae workspace path and browser acceptance URL from the server on every heartbeat. These runtime values do not overwrite the local registration token file; command payload values still take precedence for a single command.

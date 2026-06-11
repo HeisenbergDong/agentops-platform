@@ -173,7 +173,7 @@ class CommandRunner:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         result["trae_turn"] = probe_latest_trae_turn(
             prompt=str(payload.get("prompt") or ""),
-            workspace_path=str(workspace_path or ""),
+            workspace_path=str(workspace_path or self.settings.workspace_root),
             sent_after_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
@@ -209,7 +209,13 @@ class CommandRunner:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         return run_browser_acceptance(
             str(workspace_path or self.settings.workspace_root),
-            url=str(payload.get("url") or payload.get("browser_url") or payload.get("acceptance_url") or ""),
+            url=str(
+                payload.get("url")
+                or payload.get("browser_url")
+                or payload.get("acceptance_url")
+                or self.settings.browser_url
+                or ""
+            ),
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
             cancellation_check=cancellation.raise_if_cancelled,
         )

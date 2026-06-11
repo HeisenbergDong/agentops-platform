@@ -1,6 +1,7 @@
 import json
 import os
 import sys
+from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
@@ -18,6 +19,7 @@ class WorkerSettings(BaseSettings):
     version: str = "0.1.0"
     trae_exe_path: Path = Path(r"D:\app\Trae CN\Trae CN.exe")
     workspace_root: Path = Path(r"D:\code-space\coding-soler")
+    browser_url: str = ""
     poll_interval_seconds: float = 3.0
     auto_launch_trae_on_startup: bool = True
 
@@ -49,6 +51,31 @@ def save_worker_settings(
     return path
 
 
+def apply_assigned_config(
+    worker_settings: WorkerSettings,
+    assigned_config: Mapping[str, Any] | None,
+) -> dict[str, str]:
+    """Apply server-assigned runtime config without persisting local registration secrets."""
+    if not isinstance(assigned_config, Mapping):
+        return {}
+
+    changes: dict[str, str] = {}
+    workspace_value = _first_non_empty(assigned_config, "trae_workspace_path", "workspace_root")
+    if workspace_value is not None:
+        workspace_root = Path(str(workspace_value)).expanduser()
+        if worker_settings.workspace_root != workspace_root:
+            worker_settings.workspace_root = workspace_root
+            changes["workspace_root"] = str(workspace_root)
+
+    if "browser_url" in assigned_config:
+        browser_url = str(assigned_config.get("browser_url") or "").strip()
+        if worker_settings.browser_url != browser_url:
+            worker_settings.browser_url = browser_url
+            changes["browser_url"] = browser_url
+
+    return changes
+
+
 def running_from_frozen_exe() -> bool:
     return bool(getattr(sys, "frozen", False))
 
@@ -63,6 +90,14 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     if not isinstance(data, dict):
         raise ValueError(f"Worker config must be a JSON object: {path}")
     return data
+
+
+def _first_non_empty(data: Mapping[str, Any], *keys: str) -> Any | None:
+    for key in keys:
+        value = data.get(key)
+        if str(value or "").strip():
+            return value
+    return None
 
 
 settings = load_worker_settings()

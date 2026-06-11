@@ -12,7 +12,7 @@ if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
 from worker.capabilities import CAPABILITIES, SUPPORTED_APPS
-from worker.config import WorkerSettings, default_config_path, load_worker_settings
+from worker.config import WorkerSettings, apply_assigned_config, default_config_path, load_worker_settings
 from worker.connection.client import WorkerClient
 from worker.connection.uploader import AttachmentUploader
 from worker.registration import RegistrationOptions, is_registered, machine_fingerprint, register_worker
@@ -45,7 +45,8 @@ def run_once(
         "current_window_title": runner.state.current_window_title,
         "busy": runner.state.busy,
     }
-    client.heartbeat(heartbeat)
+    heartbeat_result = client.heartbeat(heartbeat)
+    sync_runtime_config(worker_settings, runner, heartbeat_result)
     commands = client.poll_commands(worker_settings.worker_id)
     processed = 0
     for command in commands:
@@ -244,6 +245,29 @@ def attach_cancellation_checker(
         return is_cancelled_command(command)
 
     runner.cancellation_checker = checker
+
+
+def sync_runtime_config(worker_settings: WorkerSettings, runner: Any, heartbeat_result: dict | None) -> dict[str, str]:
+    assigned_config = heartbeat_result.get("assigned_config") if isinstance(heartbeat_result, dict) else None
+    changes = apply_assigned_config(worker_settings, assigned_config)
+    if not changes:
+        return {}
+    if getattr(runner, "settings", None) is not worker_settings:
+        runner.settings = worker_settings
+    log(f"Applied server worker config: {format_runtime_config_changes(changes)}")
+    return changes
+
+
+def format_runtime_config_changes(changes: dict[str, str]) -> str:
+    ordered = []
+    if "workspace_root" in changes:
+        ordered.append(f"workspace_root={changes['workspace_root']}")
+    if "browser_url" in changes:
+        ordered.append(f"browser_url={changes['browser_url'] or '-'}")
+    for key, value in changes.items():
+        if key not in {"workspace_root", "browser_url"}:
+            ordered.append(f"{key}={value}")
+    return ", ".join(ordered)
 
 
 def attach_worker_uploads(

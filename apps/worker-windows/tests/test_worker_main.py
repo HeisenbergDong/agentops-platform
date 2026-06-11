@@ -5,13 +5,14 @@ from worker import main as worker_main
 
 
 class FakeClient:
-    def __init__(self, commands, ack_response):
+    def __init__(self, commands, ack_response, heartbeat_response=None):
         self.commands = commands
         self.ack_response = ack_response
+        self.heartbeat_response = heartbeat_response or {"status": "ok"}
         self.results = []
 
     def heartbeat(self, payload):
-        return {"status": "ok"}
+        return self.heartbeat_response
 
     def poll_commands(self, worker_id):
         return self.commands
@@ -117,3 +118,32 @@ def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):
     assert client.results[0]["data"]["upload_status"] == "uploaded"
     assert client.results[0]["data"]["server_attachment"]["id"] == "att1"
     assert client.results[0]["data"]["server_attachment"]["job_id"] == "job1"
+
+
+def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
+    assigned_root = tmp_path / "assigned-root"
+    client = FakeClient(
+        commands=[],
+        ack_response={},
+        heartbeat_response={
+            "status": "ok",
+            "assigned_config": {
+                "trae_workspace_path": str(assigned_root),
+                "browser_url": "http://localhost:5173",
+            },
+        },
+    )
+    runner = FakeRunner()
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path / "old-root",
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=runner, worker_settings=settings)
+
+    assert processed == 0
+    assert settings.workspace_root == assigned_root
+    assert settings.browser_url == "http://localhost:5173"
+    assert runner.settings is settings

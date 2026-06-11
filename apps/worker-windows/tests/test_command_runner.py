@@ -332,6 +332,43 @@ def test_browser_acceptance_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_
     }
 
 
+def test_browser_acceptance_uses_configured_url_when_payload_omits_it(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    received = {}
+    settings = command_runner.WorkerSettings(
+        workspace_root=tmp_path,
+        browser_url="http://localhost:5173",
+    )
+
+    def fake_browser_acceptance(project_path: str, url: str, timeout_seconds: float, cancellation_check=None):
+        received["project_path"] = project_path
+        received["url"] = url
+        received["timeout_seconds"] = timeout_seconds
+        received["cancellable"] = callable(cancellation_check)
+        return {"status": "passed", "url": url}
+
+    monkeypatch.setattr(command_runner, "run_browser_acceptance", fake_browser_acceptance)
+
+    result = CommandRunner(worker_id="worker-test", runtime_settings=settings).run(
+        {
+            "command_id": "cmd-8b",
+            "type": "browser_acceptance",
+            "payload": {"workspace_path": "project", "timeout_seconds": 3},
+        }
+    )
+
+    assert result["status"] == "success"
+    assert received == {
+        "project_path": str(workspace),
+        "url": "http://localhost:5173",
+        "timeout_seconds": 3.0,
+        "cancellable": True,
+    }
+
+
 def test_git_submit_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     workspace = tmp_path / "project"
     workspace.mkdir()
