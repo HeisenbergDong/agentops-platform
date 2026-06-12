@@ -1,8 +1,10 @@
 import ctypes
 import time
+from pathlib import Path
 from typing import Any
 
 from worker.system.clipboard import ClipboardError, set_clipboard_text
+from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 PROMPT_INPUT_X_RATIO = 0.26
@@ -15,6 +17,7 @@ SOLO_INPUT_BOTTOM_MAX_RATIO = 0.985
 PROMPT_INPUT_MIN_WIDTH = 80
 PROMPT_INPUT_MIN_HEIGHT = 12
 PROMPT_INPUT_CANDIDATE_LIMIT = 2
+SUBMISSION_PROBE_INTERVAL_SECONDS = 0.75
 PROMPT_INPUT_NAME_MARKERS = (
     "ask",
     "chat",
@@ -33,14 +36,29 @@ class PromptSendError(RuntimeError):
     pass
 
 
-def send_prompt(prompt: str, submit: bool = True, submit_hotkey: str = "{ENTER}") -> dict:
+def send_prompt(
+    prompt: str,
+    submit: bool = True,
+    submit_hotkey: str = "{ENTER}",
+    workspace_path: str | Path | None = None,
+    verify_submission: bool = False,
+    sent_at_epoch: float | None = None,
+    submission_timeout_seconds: float = 15.0,
+) -> dict:
     prompt = prompt.strip()
     if not prompt:
         raise PromptSendError("Prompt is empty")
 
     try:
-        focus_result = focus_trae()
-        window = find_trae_window(timeout_seconds=3.0)
+        focus_result = focus_trae(
+            workspace_path=workspace_path,
+            require_workspace_match=bool(workspace_path),
+        )
+        window = find_trae_window(
+            timeout_seconds=3.0,
+            workspace_path=workspace_path,
+            require_workspace_match=bool(workspace_path),
+        )
     except TraeAutomationError as exc:
         raise PromptSendError(str(exc)) from exc
 
@@ -54,14 +72,85 @@ def send_prompt(prompt: str, submit: bool = True, submit_hotkey: str = "{ENTER}"
     _send_keys("^v")
     if submit:
         _send_keys(submit_hotkey)
+    submission = {}
+    if submit and verify_submission:
+        submission = _verify_prompt_submission(
+            prompt=prompt,
+            workspace_path=workspace_path,
+            sent_at_epoch=sent_at_epoch,
+            timeout_seconds=submission_timeout_seconds,
+        )
     return {
         "status": "sent",
         "chars": len(prompt),
         "submitted": submit,
         "submit_hotkey": submit_hotkey if submit else "",
         "window_title": focus_result.get("window_title", ""),
+        "workspace_match": focus_result.get("workspace_match", False),
         "input": input_result,
+        "submission": submission,
     }
+
+
+def _verify_prompt_submission(
+    prompt: str,
+    workspace_path: str | Path | None,
+    sent_at_epoch: float | None,
+    timeout_seconds: float,
+) -> dict:
+    started = float(sent_at_epoch or time.time())
+    deadline = time.monotonic() + max(0.5, timeout_seconds)
+    last_probe: dict[str, Any] = {}
+    while time.monotonic() < deadline:
+        last_probe = probe_latest_trae_turn(
+            prompt=prompt,
+            workspace_path=str(workspace_path or ""),
+            sent_after_epoch=started,
+        )
+        if _submission_probe_passed(last_probe):
+            return {
+                "status": "confirmed",
+                "probe": _compact_submission_probe(last_probe),
+                "sent_after_epoch": started,
+            }
+        time.sleep(SUBMISSION_PROBE_INTERVAL_SECONDS)
+    compact = _compact_submission_probe(last_probe)
+    raise PromptSendError(
+        "Prompt was pasted/submitted, but no new Trae user turn was detected. "
+        f"submission_probe={compact}"
+    )
+
+
+def _submission_probe_passed(probe: dict[str, Any]) -> bool:
+    if probe.get("status") == "found":
+        return True
+    if probe.get("status") == "missing" and probe.get("reason") == "awaiting_current_continuation":
+        return bool(probe.get("candidate"))
+    return False
+
+
+def _compact_submission_probe(probe: dict[str, Any]) -> dict:
+    if not isinstance(probe, dict):
+        return {}
+    candidate = probe.get("candidate") if isinstance(probe.get("candidate"), dict) else {}
+    result: dict[str, Any] = {
+        "status": str(probe.get("status") or ""),
+        "reason": str(probe.get("reason") or ""),
+        "probe_scope": str(probe.get("probe_scope") or ""),
+        "workspace_count": probe.get("workspace_count", 0),
+        "log_files_scanned": probe.get("log_files_scanned", 0),
+    }
+    if candidate:
+        result["candidate"] = {
+            "session_id": str(candidate.get("session_id") or ""),
+            "user_message_id": str(candidate.get("user_message_id") or ""),
+            "turn_status": str(candidate.get("turn_status") or ""),
+            "start_time": str(candidate.get("start_time") or ""),
+            "end_time": str(candidate.get("end_time") or ""),
+            "workspace_folder": str(candidate.get("workspace_folder") or ""),
+            "match_score": candidate.get("match_score", 0),
+        }
+    return result
 
 
 def _focus_prompt_input(window: Any) -> dict:

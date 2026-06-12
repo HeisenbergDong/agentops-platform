@@ -127,10 +127,12 @@ def resolve_trae_executable(trae_exe_path: Path) -> Path:
     )
 
 
-def open_trae(trae_exe_path: Path, workspace_path: Path | None = None) -> dict:
+def open_trae(trae_exe_path: Path, workspace_path: Path | None = None, reuse_window: bool = False) -> dict:
     exe_path = resolve_trae_executable(trae_exe_path)
 
     args = [str(exe_path)]
+    if reuse_window and workspace_path:
+        args.append("--reuse-window")
     if workspace_path:
         args.append(str(workspace_path))
     subprocess.Popen(args)
@@ -138,6 +140,7 @@ def open_trae(trae_exe_path: Path, workspace_path: Path | None = None) -> dict:
         "status": "launched",
         "trae_exe_path": str(exe_path),
         "workspace_path": str(workspace_path) if workspace_path else "",
+        "reuse_window": bool(reuse_window and workspace_path),
     }
 
 
@@ -147,47 +150,84 @@ def ensure_trae_running(
     launch_timeout_seconds: float = 30.0,
     force_open_workspace: bool = False,
 ) -> dict:
-    existing = _try_find_trae_window()
-    if existing and not (force_open_workspace and workspace_path):
+    existing = _try_find_trae_window(
+        workspace_path=workspace_path,
+        require_workspace_match=bool(workspace_path),
+    )
+    if existing and not force_open_workspace:
         title = _focus_window(existing)
         return {
             "status": "already_running",
             "window_title": title,
             "workspace_path": str(workspace_path) if workspace_path else "",
-            "window_diagnostics": trae_window_diagnostics(selected_hwnd=existing.hwnd),
+            "workspace_match": _title_matches_workspace(title, workspace_path),
+            "window_diagnostics": trae_window_diagnostics(selected_hwnd=existing.hwnd, workspace_path=workspace_path),
         }
 
-    launch_result = open_trae(trae_exe_path, workspace_path)
-    if existing and force_open_workspace:
+    existing_any = _try_find_trae_window()
+    reuse_window = bool(existing_any and workspace_path and not force_open_workspace)
+    launch_result = open_trae(trae_exe_path, workspace_path, reuse_window=reuse_window)
+    if existing_any:
         time.sleep(2.0)
-    window = find_trae_window(timeout_seconds=launch_timeout_seconds)
+    window = find_trae_window(
+        timeout_seconds=launch_timeout_seconds,
+        workspace_path=workspace_path,
+        require_workspace_match=bool(workspace_path),
+    )
     title = _focus_window(window)
     return {
         **launch_result,
         "window_title": title,
-        "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd),
+        "workspace_match": _title_matches_workspace(title, workspace_path),
+        "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd, workspace_path=workspace_path),
     }
 
 
-def find_trae_window(timeout_seconds: float = 10.0) -> TraeWindow:
+def find_trae_window(
+    timeout_seconds: float = 10.0,
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+) -> TraeWindow:
     deadline = time.monotonic() + timeout_seconds
     while time.monotonic() < deadline:
-        hwnd = _find_top_level_window("Trae")
+        hwnd = _find_top_level_window(
+            "Trae",
+            workspace_path=workspace_path,
+            require_workspace_match=require_workspace_match,
+        )
         if hwnd:
             return TraeWindow(hwnd)
         time.sleep(0.5)
+    marker = _workspace_title_marker(workspace_path)
+    if require_workspace_match and marker:
+        diagnostics = trae_window_diagnostics(workspace_path=workspace_path)
+        raise TraeAutomationError(f"Trae window for workspace '{marker}' was not found. diagnostics={diagnostics}")
     raise TraeAutomationError("Trae window was not found")
 
 
-def focus_trae(timeout_seconds: float = 10.0) -> dict:
-    window = find_trae_window(timeout_seconds)
+def focus_trae(
+    timeout_seconds: float = 10.0,
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+) -> dict:
+    window = find_trae_window(
+        timeout_seconds,
+        workspace_path=workspace_path,
+        require_workspace_match=require_workspace_match,
+    )
     title = _focus_window(window)
-    return {"status": "focused", "window_title": title, "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd)}
-
-
-def trae_window_diagnostics(selected_hwnd: int | None = None) -> dict:
-    windows = _find_top_level_windows("Trae")
     return {
+        "status": "focused",
+        "window_title": title,
+        "workspace_match": _title_matches_workspace(title, workspace_path),
+        "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd, workspace_path=workspace_path),
+    }
+
+
+def trae_window_diagnostics(selected_hwnd: int | None = None, workspace_path: Path | str | None = None) -> dict:
+    windows = _find_top_level_windows("Trae")
+    marker = _workspace_title_marker(workspace_path)
+    result = {
         "count": len(windows),
         "selected_hwnd": int(selected_hwnd or 0),
         "windows": [
@@ -199,6 +239,44 @@ def trae_window_diagnostics(selected_hwnd: int | None = None) -> dict:
             for hwnd, title in windows
         ],
     }
+    if marker:
+        result["workspace_marker"] = marker
+        result["matching_count"] = len([title for _hwnd, title in windows if _title_matches_workspace(title, workspace_path)])
+        for item in result["windows"]:
+            item["workspace_match"] = _title_matches_workspace(str(item["title"]), workspace_path)
+    return result
+
+
+def _workspace_title_marker(workspace_path: Path | str | None) -> str:
+    if not workspace_path:
+        return ""
+    text = str(workspace_path).strip().rstrip("\\/")
+    if not text:
+        return ""
+    normalized = text.replace("\\", "/")
+    return normalized.rsplit("/", 1)[-1].strip()
+
+
+def _title_matches_workspace(title: str, workspace_path: Path | str | None) -> bool:
+    marker = _workspace_title_marker(workspace_path)
+    if not marker:
+        return False
+    return marker.lower() in str(title or "").lower()
+
+
+def _select_top_level_window(
+    windows: list[tuple[int, str]],
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+) -> int:
+    marker = _workspace_title_marker(workspace_path)
+    if marker:
+        for hwnd, title in windows:
+            if marker.lower() in title.lower():
+                return hwnd
+        if require_workspace_match:
+            return 0
+    return windows[0][0] if windows else 0
 
 
 def window_text_snapshot(window: Any, limit: int = 300) -> str:
@@ -221,9 +299,17 @@ def window_text_snapshot(window: Any, limit: int = 300) -> str:
     return ""
 
 
-def _find_top_level_window(title_marker: str) -> int:
+def _find_top_level_window(
+    title_marker: str,
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+) -> int:
     windows = _find_top_level_windows(title_marker)
-    return windows[0][0] if windows else 0
+    return _select_top_level_window(
+        windows,
+        workspace_path=workspace_path,
+        require_workspace_match=require_workspace_match,
+    )
 
 
 def _find_top_level_windows(title_marker: str) -> list[tuple[int, str]]:
@@ -243,8 +329,15 @@ def _find_top_level_windows(title_marker: str) -> list[tuple[int, str]]:
     return found
 
 
-def _try_find_trae_window() -> TraeWindow | None:
-    hwnd = _find_top_level_window("Trae")
+def _try_find_trae_window(
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+) -> TraeWindow | None:
+    hwnd = _find_top_level_window(
+        "Trae",
+        workspace_path=workspace_path,
+        require_workspace_match=require_workspace_match,
+    )
     if not hwnd:
         return None
     return TraeWindow(hwnd)

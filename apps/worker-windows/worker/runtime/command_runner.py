@@ -151,11 +151,16 @@ class CommandRunner:
             launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
             force_open_workspace=bool(payload.get("force_open_workspace", False)),
         )
+        prompt_workspace_path = self._launch_workspace_path(workspace_path)
         sent_at_epoch = time.time()
         send_result = send_prompt(
             prompt,
             submit=bool(payload.get("submit", True)),
             submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
+            workspace_path=prompt_workspace_path,
+            verify_submission=bool(payload.get("verify_submission", True)),
+            sent_at_epoch=sent_at_epoch,
+            submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
         )
         send_result["sent_at_epoch"] = sent_at_epoch
         send_result["open_trae"] = open_result

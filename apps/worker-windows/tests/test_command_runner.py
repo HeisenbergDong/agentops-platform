@@ -41,11 +41,13 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     monkeypatch.setattr(
         command_runner,
         "send_prompt",
-        lambda prompt, submit, submit_hotkey: {
+        lambda prompt, submit, submit_hotkey, **kwargs: {
             "status": "sent",
             "chars": len(prompt),
             "submitted": submit,
             "submit_hotkey": submit_hotkey,
+            "verify_submission": kwargs.get("verify_submission"),
+            "workspace_path": str(kwargs.get("workspace_path") or ""),
         },
     )
 
@@ -64,6 +66,8 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["status"] == "success"
     assert result["data"]["status"] == "sent"
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
+    assert result["data"]["verify_submission"] is True
+    assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
 
@@ -88,11 +92,13 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
     monkeypatch.setattr(
         command_runner,
         "send_prompt",
-        lambda prompt, submit, submit_hotkey: {
+        lambda prompt, submit, submit_hotkey, **kwargs: {
             "status": "sent",
             "chars": len(prompt),
             "submitted": submit,
             "submit_hotkey": submit_hotkey,
+            "verify_submission": kwargs.get("verify_submission"),
+            "workspace_path": str(kwargs.get("workspace_path") or ""),
         },
     )
 
@@ -102,6 +108,8 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
 
     assert result["status"] == "success"
     assert result["data"]["open_trae"]["status"] == "already_running"
+    assert result["data"]["verify_submission"] is True
+    assert result["data"]["workspace_path"] == str(tmp_path)
     assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
 
 
@@ -164,6 +172,50 @@ def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.Monk
         {"hwnd": 101, "title": "Trae CN - first", "selected": False},
         {"hwnd": 202, "title": "Trae CN - second", "selected": True},
     ]
+
+
+def test_find_trae_window_requires_workspace_match(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        trae_window,
+        "_find_top_level_windows",
+        lambda marker: [(101, "permission-system-old - Trae CN")],
+    )
+    monkeypatch.setattr(trae_window.time, "sleep", lambda seconds: None)
+
+    with pytest.raises(TraeAutomationError) as exc:
+        trae_window.find_trae_window(
+            timeout_seconds=0.01,
+            workspace_path="D:/code-space/coding-soler/permission-system-new",
+            require_workspace_match=True,
+        )
+
+    assert "permission-system-new" in str(exc.value)
+
+
+def test_ensure_trae_running_reuses_existing_window_for_target_workspace(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    calls = []
+
+    monkeypatch.setattr(trae_window, "resolve_trae_executable", lambda path: Path("C:/Trae/Trae.exe"))
+    monkeypatch.setattr(
+        trae_window,
+        "_find_top_level_windows",
+        lambda marker: [(101, "old-project - Trae CN")]
+        if len(calls) == 0
+        else [(101, "target-project - Trae CN")],
+    )
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "target-project - Trae CN")
+    monkeypatch.setattr(trae_window.subprocess, "Popen", lambda args: calls.append(args))
+    monkeypatch.setattr(trae_window.time, "sleep", lambda seconds: None)
+
+    result = trae_window.ensure_trae_running(
+        Path("C:/Trae/Trae.exe"),
+        tmp_path / "target-project",
+        launch_timeout_seconds=0.1,
+    )
+
+    assert calls == [[str(Path("C:/Trae/Trae.exe")), "--reuse-window", str(tmp_path / "target-project")]]
+    assert result["reuse_window"] is True
+    assert result["workspace_match"] is True
 
 
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

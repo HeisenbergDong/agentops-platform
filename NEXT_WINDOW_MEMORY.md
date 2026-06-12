@@ -488,3 +488,72 @@ npm.cmd run build
 - 测试前先关闭旧 Worker，确认本机只运行一个最新 `agentops-worker.exe`；本轮本地打包时曾发现两个旧 Worker 进程占用 EXE。
 - 打开 Worker 后点“重开”，应只聚焦/打开一个 Trae 窗口，不应连续打开两个。
 - 如果仍然双窗口或没有输入 prompt，优先看 Worker 命令返回里的 `data.open_trae.window_diagnostics` 和 `data.input.method/click_x/click_y`。
+## 2026-06-12 Worker 打开 Trae 但不输入提示词修复记录
+
+用户新一轮手工测试反馈：
+- Worker 这次只打开了一个 Trae，但没有把提示词输入 Trae。
+- Dashboard 后续日志却进入了“等待 Trae 回复 / 复制回复 / 点击继续”的阶段。
+
+现场证据：
+- 生产库最近 `send_prompt` 命令返回 `status=sent`，`input.method=solo_coordinate_primary`，点击坐标为窗口内左下区域。
+- 但目标工作区是 `permission-system-2eae1f4b`，实际聚焦的 Trae 标题是 `permission-system-d6ad0e56 - Trae CN`，说明 Worker 复用了错误工作区窗口。
+- 后续 `wait_completion` 只读取到 `最小化\n最大化\n关闭`，仍被判定为稳定完成，导致继续进入复制回复和点击继续的错误链路。
+
+根因判断：
+- 上轮为了避免双开 Trae，关闭了默认强制打开工作区，但没有同步补上“目标工作区窗口匹配”。
+- `send_prompt()` 只要完成坐标点击、粘贴和回车就返回成功，没有验证 Trae 本地日志里是否出现了本轮用户消息。
+- `wait_completion()` 对“只读到窗口标题栏控件文本”的空壳状态没有拦截。
+
+已完成代码改动：
+- `apps/worker-windows/worker/trae/window.py`
+  - 查找 Trae 窗口时支持按目标工作区目录名匹配窗口标题。
+  - `ensure_trae_running()` 优先复用目标工作区窗口；如果只有其他项目窗口，则用 `--reuse-window <workspace>` 打开目标工作区，并等待标题匹配。
+  - `window_diagnostics` 增加 `workspace_marker`、`matching_count`、每个窗口的 `workspace_match`。
+  - 要求工作区匹配时，不再回退到第一个 Trae 窗口，避免错项目发送 prompt。
+- `apps/worker-windows/worker/trae/prompt.py`
+  - `send_prompt()` 支持传入 `workspace_path`，聚焦和查找 Trae 时要求目标工作区匹配。
+  - 增加提交后校验：回车后轮询 Trae 本地日志 `probe_latest_trae_turn()`，确认出现本轮新用户消息。
+  - 若没有检测到新 Trae turn，直接抛 `PromptSendError`，Worker 命令返回 `manual_required`，不再假装发送成功。
+- `apps/worker-windows/worker/runtime/command_runner.py`
+  - `send_prompt` 命令默认启用 `verify_submission=true`。
+  - 将实际工作区路径、发送时间、提交校验超时传给 `send_prompt()`。
+- `apps/worker-windows/worker/trae/wait.py`
+  - 如果稳定文本只有 `最小化/最大化/关闭` 等窗口控件文本，直接报错，不再返回 `completed`。
+- `apps/api/app/services/orchestrator/worker_dispatch.py`
+  - 服务端下发 `send_prompt` 时显式带 `verify_submission=true` 和 `submission_timeout_seconds=20`。
+- 测试补充：
+  - 目标工作区窗口必须匹配，否则不能复用旧 Trae。
+  - 已有旧 Trae 窗口时，打开目标工作区走 `--reuse-window`。
+  - 提交后能检测到 Trae turn 才算发送成功。
+  - 提交后检测不到 Trae turn 会报 `PromptSendError`。
+  - 只读到窗口控件文本时，`wait_completion` 不再判定完成。
+  - API 下发 payload 必须包含 `verify_submission`。
+
+已验证：
+- Worker 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`77 passed, 2 warnings`
+- API 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`88 passed, 3 warnings`
+- Web 构建：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过；仍有 Vite chunk size warning。
+- Windows Worker 打包：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功。
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27289192`
+
+下一轮真实测试重点：
+- 测试前关闭旧 Worker，只运行最新版 Worker。
+- 点击“重开”后，如果当前 Trae 是旧项目窗口，Worker 应尝试用 `--reuse-window` 切到目标工作区，而不是把 prompt 发到旧项目。
+- 如果提示词仍未进入 Trae，当前命令应停在 `manual_required`，不要再进入 `wait_completion/copy_latest_reply/click_continue` 循环。
+- 优先查看 Worker 命令结果里的：
+  - `data.open_trae.window_diagnostics.workspace_marker/matching_count/windows`
+  - `data.submission.probe`
+  - 若失败则看 `error` 中的 `submission_probe`

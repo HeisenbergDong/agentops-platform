@@ -17,6 +17,8 @@ BUSY_MARKERS = (
     "Thinking",
 )
 RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
+WINDOW_CHROME_TEXTS = {"最小化", "最大化", "关闭", "Minimize", "Maximize", "Close"}
+MIN_COMPLETION_TEXT_CHARS = 80
 
 
 def wait_completion(
@@ -83,6 +85,10 @@ def wait_completion(
                     raise TraeAutomationError(
                         f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention failed"
                     )
+                if _looks_like_window_chrome_only(latest_text):
+                    raise TraeAutomationError(
+                        "Trae output did not contain assistant content; only window chrome text was detected"
+                    )
                 return {
                     "status": "completed",
                     "stable_seconds": stable_seconds,
@@ -109,6 +115,15 @@ def wait_completion(
         _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
 
     raise TraeAutomationError("Trae output did not become stable before wait_completion timeout")
+
+
+def _looks_like_window_chrome_only(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return True
+    if len("\n".join(lines)) < MIN_COMPLETION_TEXT_CHARS and all(line in WINDOW_CHROME_TEXTS for line in lines):
+        return True
+    return False
 
 
 def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], None] | None) -> None:

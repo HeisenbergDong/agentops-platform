@@ -170,3 +170,32 @@ def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pyte
 
     assert result["status"] == "completed"
     assert interventions == [{"mode": "click-point", "x": 1, "y": 2}]
+
+
+def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "最小化\n最大化\n关闭")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+
+    with pytest.raises(wait_module.TraeAutomationError) as exc:
+        wait_module.wait_completion(
+            timeout_seconds=3,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=100,
+            max_interventions=0,
+        )
+
+    assert "only window chrome text" in str(exc.value)
