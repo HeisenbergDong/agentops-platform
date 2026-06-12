@@ -151,26 +151,26 @@ def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int
     left, top, right, bottom = window_rect
     width = max(1, right - left)
     height = max(1, bottom - top)
-    scan_left = int(width * 0.22)
-    scan_right = int(width * 0.43)
-    scan_top = int(height * 0.82)
-    scan_bottom = int(height * 0.99)
+    scan_left = int(width * 0.25)
+    scan_right = int(width * 0.45)
+    scan_top = int(height * 0.86)
+    scan_bottom = int(height * 0.97)
     pixels = image.load()
     clusters: list[tuple[int, int, int]] = []
     step = 2
     for y in range(scan_top, min(scan_bottom, image.height), step):
         for x in range(scan_left, min(scan_right, image.width), step):
             red, green, blue = pixels[x, y]
-            if green >= 95 and green > red * 1.25 and green > blue * 1.15:
+            if green >= 60 and green > red * 1.2 and green > blue * 1.05:
                 clusters.append((x, y, green - max(red, blue)))
-    if len(clusters) < 8:
+    if len(clusters) < 20:
         return None
     total_weight = sum(max(1, item[2]) for item in clusters)
     cx = int(sum(item[0] * max(1, item[2]) for item in clusters) / total_weight)
     cy = int(sum(item[1] * max(1, item[2]) for item in clusters) / total_weight)
     spread_x = max(item[0] for item in clusters) - min(item[0] for item in clusters)
     spread_y = max(item[1] for item in clusters) - min(item[1] for item in clusters)
-    if spread_x > width * 0.08 or spread_y > height * 0.08:
+    if spread_x > width * 0.10 or spread_y > height * 0.08:
         confidence = 0.68
     else:
         confidence = 0.86

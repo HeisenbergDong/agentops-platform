@@ -20,11 +20,12 @@ def capture_screenshot(
     target: str = "trae_window",
     timeout_seconds: float = 10.0,
     quality_required: bool = True,
+    workspace_path: str | Path | None = None,
 ) -> dict:
     out_dir = _screenshot_dir()
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / f"trae-{target}-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-    capture = _capture_target(path, target=target, timeout_seconds=timeout_seconds)
+    capture = _capture_target(path, target=target, timeout_seconds=timeout_seconds, workspace_path=workspace_path)
     quality = assess_screenshot_quality(path, capture)
     if quality_required and not quality["ok"]:
         raise TraeAutomationError(f"Screenshot quality check failed: {quality['reason']}")
@@ -62,10 +63,15 @@ def assess_screenshot_quality(path: str | Path, capture: dict | None = None) -> 
     return {"ok": True, "reason": "ok", "width": width, "height": height, **stats}
 
 
-def _capture_target(path: Path, target: str, timeout_seconds: float) -> dict:
+def _capture_target(
+    path: Path,
+    target: str,
+    timeout_seconds: float,
+    workspace_path: str | Path | None = None,
+) -> dict:
     if target != "full_screen":
         try:
-            return _capture_trae_window(path, timeout_seconds=timeout_seconds)
+            return _capture_trae_window(path, timeout_seconds=timeout_seconds, workspace_path=workspace_path)
         except Exception as exc:
             if target == "trae_window":
                 raise
@@ -75,14 +81,17 @@ def _capture_target(path: Path, target: str, timeout_seconds: float) -> dict:
     return _capture_full_screen(path)
 
 
-def _capture_trae_window(path: Path, timeout_seconds: float) -> dict:
-    focus_trae(timeout_seconds=timeout_seconds)
-    window = find_trae_window(timeout_seconds=timeout_seconds)
-    try:
-        window.restore()
-        window.set_focus()
-    except Exception:
-        pass
+def _capture_trae_window(path: Path, timeout_seconds: float, workspace_path: str | Path | None = None) -> dict:
+    focus_result = focus_trae(
+        timeout_seconds=timeout_seconds,
+        workspace_path=workspace_path,
+        require_workspace_match=bool(workspace_path),
+    )
+    window = find_trae_window(
+        timeout_seconds=timeout_seconds,
+        workspace_path=workspace_path,
+        require_workspace_match=bool(workspace_path),
+    )
     time.sleep(0.25)
     rect = _window_rect(int(window.hwnd))
     if not rect:
@@ -97,6 +106,7 @@ def _capture_trae_window(path: Path, timeout_seconds: float) -> dict:
         "target": "trae_window",
         "window_title": window.window_text(),
         "bounds": {"left": left, "top": top, "right": right, "bottom": bottom, "width": width, "height": height},
+        "focus": focus_result,
     }
 
 

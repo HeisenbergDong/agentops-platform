@@ -155,16 +155,34 @@ class CommandRunner:
         )
         prompt_workspace_path = self._launch_workspace_path(workspace_path)
         sent_at_epoch = time.time()
-        send_result = send_prompt(
-            prompt,
-            submit=bool(payload.get("submit", True)),
-            submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
-            workspace_path=prompt_workspace_path,
-            verify_submission=bool(payload.get("verify_submission", True)),
-            sent_at_epoch=sent_at_epoch,
-            submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
-            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
-        )
+        try:
+            send_result = send_prompt(
+                prompt,
+                submit=bool(payload.get("submit", True)),
+                submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
+                workspace_path=prompt_workspace_path,
+                verify_submission=bool(payload.get("verify_submission", True)),
+                sent_at_epoch=sent_at_epoch,
+                submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
+                ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+            )
+        except PromptSendError as exc:
+            details = dict(exc.details or {})
+            details.setdefault("open_trae", open_result)
+            details.setdefault("workspace", workspace_info)
+            details.setdefault("sent_at_epoch", sent_at_epoch)
+            try:
+                details.setdefault(
+                    "current_window",
+                    focus_trae(
+                        timeout_seconds=2.0,
+                        workspace_path=prompt_workspace_path,
+                        require_workspace_match=bool(prompt_workspace_path),
+                    ),
+                )
+            except Exception as focus_exc:
+                details.setdefault("current_window", {"status": "not_focused", "error": str(focus_exc)})
+            raise PromptSendError(str(exc), details) from exc
         send_result["sent_at_epoch"] = sent_at_epoch
         send_result["open_trae"] = open_result
         send_result["workspace"] = workspace_info

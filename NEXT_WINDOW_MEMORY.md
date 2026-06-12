@@ -773,3 +773,76 @@ npm.cmd run build
 - 如果 Trae 布局变了，预期链路是：先用缓存；缓存无效用 `adbz` 比例点；失败后截图，本地粗定位；再失败或需高置信时交给 Trae UI Analyst 视觉模型。
 - AI 视觉成功后会缓存坐标，下次同类操作应优先命中缓存。
 - 如果最终仍失败，命令会停在 `manual_required`，同时写 `automation_errors` 并通过 `webhook.url` 发飞书机器人通知。
+
+## 2026-06-12 Trae 最大化后被还原、提示词未输入修复记录（待部署）
+
+用户本轮真实自测反馈：
+- Worker 打开 Trae CN 后，先出现过最大化；随后 Trae CN 被关掉/重开，后续窗口不再最大化。
+- 最终没有把提示词写入 SOLO Agent 输入框，Dashboard 显示 `Worker 命令执行失败或需要人工处理`。
+
+现场证据：
+- 生产库最近 `send_prompt` 命令 `13d2f473777d420e9479c61fa1d9d05e` 状态为 `manual_required`。
+- 命令结果里的初始 `window_rect` 是最大化窗口：`left=-9 top=-9 right=1929 bottom=1039`。
+- 但失败截图 `trae-trae_window-20260612-233150.png` 的实际截图边界是：`left=135 top=51 right=1935 bottom=1084`，说明后续诊断阶段窗口已经被还原/换窗。
+- 代码确认根因之一是 `apps/worker-windows/worker/trae/screenshot.py::_capture_trae_window()` 在截图前调用了 `window.restore()`，会把刚最大化的 Trae 还原。
+- 本地视觉旧阈值没有识别到新版 Trae 的暗绿色发送按钮，只找到输入框；随后调用 AI 视觉接口返回 `504 Gateway Time-out`，导致没有本地兜底。
+- 失败结果没有携带 `open_trae/current_window` 诊断，Dashboard 只能看到笼统错误。
+
+已完成代码改动：
+- `apps/worker-windows/worker/trae/screenshot.py`
+  - 截图前不再 `restore()` Trae，避免诊断步骤把最大化窗口还原。
+  - 截图支持传入 `workspace_path`，多窗口时按目标工作区找窗口。
+  - 截图结果保留 `focus` 诊断信息。
+- `apps/worker-windows/worker/trae/window.py`
+  - 新增 `wait_for_stable_trae_window()`，等待 Trae 启动/复用工作区后的窗口 hwnd、标题、矩形稳定，再最大化聚焦。
+  - `ensure_trae_running()` 和 `focus_trae()` 改为使用稳定窗口，避免启动器/工作区切换过程换窗后仍按旧窗口状态操作。
+  - `trae_window_diagnostics()` 增加每个 Trae 窗口的 `rect`，方便判断是否真最大化、是否发生换窗。
+- `apps/worker-windows/worker/trae/prompt.py`
+  - 视觉诊断截图按目标 workspace 捕获。
+  - 本地/AI 视觉分析改用截图返回的真实 `capture.bounds` 作为坐标基准，避免混用旧最大化矩形与还原后截图矩形。
+  - 只有缓存输入点、没有当前工作区发送按钮缓存时，自动补默认发送按钮候选，避免首轮 `action_mismatch`。
+- `apps/worker-windows/worker/trae/ui_locator.py`
+  - 放宽并收紧范围识别新版 Trae 暗绿色发送按钮；用用户失败截图验证后，现在本地视觉可同时找到 `prompt_input` 和 `send_button`。
+- `apps/worker-windows/worker/runtime/command_runner.py`
+  - `send_prompt` 失败时把 `open_trae`、`workspace`、`sent_at_epoch` 和 `current_window` 诊断带回结果，便于 Dashboard/异常中心排查。
+- 测试同步：
+  - 更新窗口诊断测试，断言新增 `rect`。
+  - 增加本地视觉识别暗绿色发送按钮测试。
+  - 同步截图函数签名变化。
+
+已验证：
+- 用用户本机失败截图验证本地视觉：
+  - 输入框坐标约 `x=603 y=960`，发送按钮约 `x=817 y=1017`。
+  - 结果 `status=found`，同时包含 `prompt_input` 和 `send_button`。
+- Worker targeted：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests\test_prompt_input.py tests\test_command_runner.py tests\test_screenshot.py`
+  - 结果：`45 passed, 2 warnings`
+- Worker 全量：
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`82 passed, 2 warnings`
+- API 全量：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`92 passed, 3 warnings`
+- Web build：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过，仍只有 Vite chunk size warning。
+- `git diff --check`：通过。
+- Worker 打包：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功。
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27317864`
+  - ZIP SHA256：`ae919e543f7a00a8f3cd46732def5ac4b1d53d99090b4dc35a790a6de8c0c606`
+
+待完成：
+- commit/push GitHub。
+- 部署生产：源码、Web dist、Worker ZIP；生产 API 重启；健康检查；验证生产 Worker ZIP 大小/SHA256。
+
+下一轮真实测试重点：
+- 部署后必须重新下载/运行最新版 Worker ZIP，并关闭旧 Worker 进程。
+- 点击“重开/开始”后，预期 Trae 最终窗口保持最大化，不再被截图诊断还原。
+- 如果仍未输入，优先看 Worker 命令结果里的 `data.open_trae.window_diagnostics.windows[*].rect`、`data.current_window`、`data.automation.attempts`、`data.screenshot.capture.bounds`。

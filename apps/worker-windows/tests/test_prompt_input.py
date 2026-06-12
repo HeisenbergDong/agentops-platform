@@ -1,6 +1,8 @@
 import pytest
+from PIL import Image, ImageDraw
 
 from worker.trae import prompt as prompt_module
+from worker.trae.ui_locator import locate_prompt_targets
 
 
 class FakeRect:
@@ -127,7 +129,11 @@ def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
     monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
-    monkeypatch.setattr(prompt_module, "_capture_ui_analysis_screenshot", lambda: {"status": "captured", "path": str(screenshot)})
+    monkeypatch.setattr(
+        prompt_module,
+        "_capture_ui_analysis_screenshot",
+        lambda **kwargs: {"status": "captured", "path": str(screenshot)},
+    )
     monkeypatch.setattr(
         prompt_module,
         "locate_prompt_targets",
@@ -177,6 +183,24 @@ def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch
     assert result["automation"]["strategy"] == "ai_vision"
     assert result["input"]["click_x"] == 240
     assert result["submit"]["click_x"] == 500
+
+
+def test_local_vision_finds_muted_green_send_button(tmp_path):
+    path = tmp_path / "trae-composer.png"
+    image = Image.new("RGB", (1800, 1033), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((270, 830, 735, 1015), fill=(42, 43, 48), outline=(65, 66, 72))
+    draw.rectangle((680, 950, 718, 982), fill=(36, 74, 57))
+    image.save(path)
+
+    result = locate_prompt_targets(path, (0, 0, 1800, 1033))
+
+    actions = {item["action"]: item for item in result["targets"]}
+    assert result["status"] == "found"
+    assert "prompt_input" in actions
+    assert "send_button" in actions
+    assert 660 <= actions["send_button"]["center"]["x"] <= 730
+    assert 940 <= actions["send_button"]["center"]["y"] <= 990
 
 
 def test_send_prompt_does_not_click_send_button_when_submit_false(monkeypatch):

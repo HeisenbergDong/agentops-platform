@@ -188,6 +188,11 @@ def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.Monk
     )
     monkeypatch.setattr(trae_window, "_foreground_window", lambda: 202)
     monkeypatch.setattr(trae_window, "_window_process_id", lambda hwnd: {101: 1001, 202: 2002}.get(hwnd, 0))
+    monkeypatch.setattr(
+        trae_window,
+        "_window_rect",
+        lambda hwnd: {101: (0, 0, 900, 700), 202: (10, 20, 910, 720)}.get(hwnd),
+    )
 
     result = trae_window.trae_window_diagnostics(selected_hwnd=202)
 
@@ -196,8 +201,22 @@ def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.Monk
     assert result["foreground_hwnd"] == 202
     assert result["foreground_pid"] == 2002
     assert result["windows"] == [
-        {"hwnd": 101, "title": "Trae CN - first", "selected": False, "pid": 1001, "foreground": False},
-        {"hwnd": 202, "title": "Trae CN - second", "selected": True, "pid": 2002, "foreground": True},
+        {
+            "hwnd": 101,
+            "title": "Trae CN - first",
+            "selected": False,
+            "pid": 1001,
+            "foreground": False,
+            "rect": {"left": 0, "top": 0, "right": 900, "bottom": 700, "width": 900, "height": 700},
+        },
+        {
+            "hwnd": 202,
+            "title": "Trae CN - second",
+            "selected": True,
+            "pid": 2002,
+            "foreground": True,
+            "rect": {"left": 10, "top": 20, "right": 910, "bottom": 720, "width": 900, "height": 700},
+        },
     ]
 
 

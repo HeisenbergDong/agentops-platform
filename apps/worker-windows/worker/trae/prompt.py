@@ -223,10 +223,11 @@ def _send_prompt_with_adaptive_targets(
             result.setdefault("automation", {})["attempts"] = attempts
             return result
 
-    screenshot_info = _capture_ui_analysis_screenshot()
+    screenshot_info = _capture_ui_analysis_screenshot(workspace_path=workspace_path)
     local_analysis: dict[str, Any] = {}
+    analysis_window_rect = _screenshot_window_rect(screenshot_info) or window_rect
     if screenshot_info.get("path"):
-        local_analysis = locate_prompt_targets(screenshot_info["path"], window_rect)
+        local_analysis = locate_prompt_targets(screenshot_info["path"], analysis_window_rect)
         local_result = _try_analysis_targets(
             local_analysis,
             prompt=prompt,
@@ -235,7 +236,7 @@ def _send_prompt_with_adaptive_targets(
             workspace_path=workspace_path,
             sent_at_epoch=sent_at_epoch,
             submission_timeout_seconds=submission_timeout_seconds,
-            window_rect=window_rect,
+            window_rect=analysis_window_rect,
             workspace_marker=workspace_marker,
             source="local_vision",
         )
@@ -250,7 +251,7 @@ def _send_prompt_with_adaptive_targets(
     ai_error = ""
     if ui_analyst and screenshot_info.get("path"):
         context = _analysis_context(
-            window_rect=window_rect,
+            window_rect=analysis_window_rect,
             window_title=window_title,
             workspace_path=workspace_path,
             failed_attempts=attempts,
@@ -271,7 +272,7 @@ def _send_prompt_with_adaptive_targets(
                 workspace_path=workspace_path,
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=submission_timeout_seconds,
-                window_rect=window_rect,
+                window_rect=analysis_window_rect,
                 workspace_marker=workspace_marker,
                 source="ai_vision",
             )
@@ -287,6 +288,7 @@ def _send_prompt_with_adaptive_targets(
         "stage": "trae_ui_auto_calibration_failed",
         "window_title": window_title,
         "window_rect": _rect_dict(window_rect),
+        "analysis_window_rect": _rect_dict(analysis_window_rect),
         "workspace_path": str(workspace_path or ""),
         "attempts": attempts,
         "screenshot": screenshot_info,
@@ -306,8 +308,9 @@ def _candidate_target_sets(window_rect: tuple[int, int, int, int], workspace_mar
     sets: list[dict[str, Any]] = []
     cached_input = ui_cache.candidate_targets("prompt_input", window_rect, workspace_marker=workspace_marker)
     cached_send = ui_cache.candidate_targets("send_button", window_rect, workspace_marker=workspace_marker)
+    default_send = _point_target("send_button", PROMPT_SEND_X_RATIO, PROMPT_SEND_Y_RATIO, window_rect, "adbz_ratio")
     for input_target in cached_input[:2]:
-        for send_target in (cached_send[:2] or [{}]):
+        for send_target in (cached_send[:2] or [default_send]):
             sets.append(
                 {
                     "source": "cache",
@@ -714,11 +717,31 @@ def _target_from_cache(target: dict[str, Any], action: str) -> dict[str, Any]:
     }
 
 
-def _capture_ui_analysis_screenshot() -> dict[str, Any]:
+def _capture_ui_analysis_screenshot(workspace_path: str | Path | None = None) -> dict[str, Any]:
     try:
-        return capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
+        return capture_screenshot(
+            target="trae_window",
+            timeout_seconds=5.0,
+            quality_required=False,
+            workspace_path=workspace_path,
+        )
     except Exception as exc:
         return {"status": "failed", "error": str(exc)}
+
+
+def _screenshot_window_rect(screenshot_info: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    capture = screenshot_info.get("capture") if isinstance(screenshot_info.get("capture"), dict) else {}
+    bounds = capture.get("bounds") if isinstance(capture.get("bounds"), dict) else {}
+    try:
+        left = int(bounds.get("left"))
+        top = int(bounds.get("top"))
+        right = int(bounds.get("right"))
+        bottom = int(bounds.get("bottom"))
+    except (TypeError, ValueError):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
 
 
 def _analysis_context(

@@ -161,13 +161,18 @@ def ensure_trae_running(
         require_workspace_match=bool(workspace_path),
     )
     if existing and not force_open_workspace:
-        title = _focus_window(existing)
+        window = wait_for_stable_trae_window(
+            workspace_path=workspace_path,
+            timeout_seconds=min(launch_timeout_seconds, 6.0),
+            require_workspace_match=bool(workspace_path),
+        )
+        title = _focus_window(window)
         return {
             "status": "already_running",
             "window_title": title,
             "workspace_path": str(workspace_path) if workspace_path else "",
             "workspace_match": _title_matches_workspace(title, workspace_path),
-            "window_diagnostics": trae_window_diagnostics(selected_hwnd=existing.hwnd, workspace_path=workspace_path),
+            "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd, workspace_path=workspace_path),
         }
 
     existing_any = _try_find_trae_window()
@@ -175,7 +180,7 @@ def ensure_trae_running(
     launch_result = open_trae(trae_exe_path, workspace_path, reuse_window=reuse_window)
     if existing_any:
         time.sleep(2.0)
-    window = find_trae_window(
+    window = wait_for_stable_trae_window(
         timeout_seconds=launch_timeout_seconds,
         workspace_path=workspace_path,
         require_workspace_match=bool(workspace_path),
@@ -211,13 +216,54 @@ def find_trae_window(
     raise TraeAutomationError("Trae window was not found")
 
 
+def wait_for_stable_trae_window(
+    timeout_seconds: float = 10.0,
+    workspace_path: Path | str | None = None,
+    require_workspace_match: bool = False,
+    stable_checks: int = 3,
+    poll_interval_seconds: float = 0.5,
+) -> TraeWindow:
+    """Wait until Trae stops swapping startup/workspace windows."""
+    deadline = time.monotonic() + max(0.5, timeout_seconds)
+    last_signature: tuple[int, str, tuple[int, int, int, int] | None] | None = None
+    stable_count = 0
+    last_window: TraeWindow | None = None
+    while time.monotonic() < deadline:
+        try:
+            window = find_trae_window(
+                timeout_seconds=min(1.0, max(0.1, deadline - time.monotonic())),
+                workspace_path=workspace_path,
+                require_workspace_match=require_workspace_match,
+            )
+        except TraeAutomationError:
+            time.sleep(poll_interval_seconds)
+            continue
+        signature = (int(window.hwnd), window.window_text(), _window_rect(window.hwnd))
+        if signature == last_signature:
+            stable_count += 1
+        else:
+            stable_count = 1
+            last_signature = signature
+        last_window = window
+        if stable_count >= max(1, stable_checks):
+            return window
+        time.sleep(poll_interval_seconds)
+    if last_window:
+        return last_window
+    return find_trae_window(
+        timeout_seconds=0.5,
+        workspace_path=workspace_path,
+        require_workspace_match=require_workspace_match,
+    )
+
+
 def focus_trae(
     timeout_seconds: float = 10.0,
     workspace_path: Path | str | None = None,
     require_workspace_match: bool = False,
 ) -> dict:
-    window = find_trae_window(
-        timeout_seconds,
+    window = wait_for_stable_trae_window(
+        timeout_seconds=timeout_seconds,
         workspace_path=workspace_path,
         require_workspace_match=require_workspace_match,
     )
@@ -246,6 +292,7 @@ def trae_window_diagnostics(selected_hwnd: int | None = None, workspace_path: Pa
                 "selected": bool(selected_hwnd and hwnd == selected_hwnd),
                 "pid": _window_process_id(hwnd),
                 "foreground": bool(foreground_hwnd and hwnd == foreground_hwnd),
+                "rect": _rect_dict(_window_rect(hwnd)),
             }
             for hwnd, title in windows
         ],
@@ -358,6 +405,42 @@ def _focus_window(window: TraeWindow) -> str:
     title = window.window_text()
     _maximize_and_focus_window(window.hwnd)
     return title
+
+
+def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
+    if not hwnd:
+        return None
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    rect = RECT()
+    try:
+        _set_process_dpi_aware()
+        if not ctypes.windll.user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+            return None
+    except Exception:
+        return None
+    return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def _rect_dict(rect: tuple[int, int, int, int] | None) -> dict[str, int]:
+    if not rect:
+        return {}
+    left, top, right, bottom = rect
+    return {
+        "left": left,
+        "top": top,
+        "right": right,
+        "bottom": bottom,
+        "width": max(0, right - left),
+        "height": max(0, bottom - top),
+    }
 
 
 def _window_title(hwnd: int) -> str:
