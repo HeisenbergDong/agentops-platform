@@ -460,3 +460,31 @@ npm.cmd run build
 - 测试前先确认本机只运行一个 `agentops-worker.exe`。
 - 打开 Worker 后点重开，应只打开/聚焦一个 Trae 窗口，不应连续打开两个。
 - 如果仍有两个 Trae 窗口，优先看 Worker 命令返回里的 `data.open_trae.window_diagnostics.count/windows/selected_hwnd`。
+## 2026-06-12 重开双 Trae 窗口修复部署完成记录（`cef5e19`）
+
+- 代码提交：`cef5e19 fix: avoid duplicate Trae workspace launches`，已通过 GitHub SSH 443 push 到 `origin/main`。
+- 生产环境 `/opt/agentops-platform` 仍是发布目录，不是 git 仓库；本轮继续使用 source tar + Web dist tar + Worker ZIP 上传部署。
+- 上传目录：`/tmp/agentops-deploy-cef5e19/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260612-cef5e19/`。
+- 生产 `.deploy-revision`：`cef5e19c3cf98d8b44087869e030f62b1b845318`。
+- 已同步到生产：
+  - API 派发 `send_prompt` 不再携带 `force_open_workspace`。
+  - Worker `_send_prompt()` 默认不再因为 `workspace_path` 强制打开新的 Trae 工作区窗口；只有 payload 显式给 `force_open_workspace=true` 时才强制打开。
+  - Worker `ensure_trae_running()` / `focus_trae()` 返回 `window_diagnostics`，可直接看 Trae 窗口数量、标题、hwnd 和选中窗口。
+  - 新版 `agentops-worker-windows.zip` 已覆盖到 `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 部署过程注意：
+  - 远端部署脚本在文件覆盖和 `.deploy-revision` 写入后，再次遇到 Windows CRLF 导致 `systemctl` 服务名带 `\r` 的问题。
+  - 已随后单独执行 `systemctl restart agentops-api`，服务重启成功。
+- 线上验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - Web dist 文件结构正确：`index.html`、`assets/index-Cy1tcbtz.js`、`assets/index-DFn3rpGU.css`。
+  - 生产 Worker ZIP 大小：`27284782`，文件头：`PK`。
+  - 生产源码确认包含 `window_diagnostics`，且 `command_runner.py` 中 `force_open_workspace=bool(payload.get("force_open_workspace", False))` 已生效。
+
+下一轮真实测试重点：
+
+- 测试前先关闭旧 Worker，确认本机只运行一个最新 `agentops-worker.exe`；本轮本地打包时曾发现两个旧 Worker 进程占用 EXE。
+- 打开 Worker 后点“重开”，应只聚焦/打开一个 Trae 窗口，不应连续打开两个。
+- 如果仍然双窗口或没有输入 prompt，优先看 Worker 命令返回里的 `data.open_trae.window_diagnostics` 和 `data.input.method/click_x/click_y`。
