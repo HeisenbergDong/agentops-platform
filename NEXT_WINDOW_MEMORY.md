@@ -368,3 +368,38 @@ npm.cmd run build
 
 - 本轮依旧无法在用户本机替用户真实点击 Trae 跑作业；部署后需要用户再跑一轮。
 - 如果仍然没有命中输入框，优先看 Worker 命令返回 `data.input.method/click_x/click_y/click_ratio`，以及 Trae 当前窗口尺寸是否和截图一致。
+
+## 2026-06-12 本轮部署完成记录：`e2f420d`
+
+- 代码提交：`e2f420d fix: defer Trae launch and reopen work`，已通过 GitHub SSH 443 push 到 `origin/main`。
+- 生产仍是发布目录，不是 git 仓库；本轮继续采用源码 tar + Web dist + Worker ZIP 上传部署。
+- 上传目录：`/tmp/agentops-deploy-e2f420d/`。
+- 生产备份目录：
+  - `/opt/agentops-deploy-backups/20260612-e2f420d/`
+  - 部署脚本因 Windows 换行重跑过一次，另有 rerun 备份目录。
+- 部署过程中注意：
+  - 第一次远端 bash 命令被 PowerShell 变量展开影响，未覆盖。
+  - 第二次在 Web dist 解压前因 bash here-doc 变量失败退出。
+  - 第三次源码、Worker ZIP、`.deploy-revision` 已覆盖；systemd 重启命令因 CRLF 服务名失败，随后单独重启成功。
+  - PowerShell `Compress-Archive` 生成的 Web zip 在 Linux 上把 `assets\...` 解成反斜杠文件名，已改用 `tar -C apps/web/dist -cf web-dist-e2f420d.tar .` 重新上传并覆盖，最终 Web dist 结构正确。
+- 已同步到生产：
+  - API `/jobs/reopen` 后台化快速返回逻辑。
+  - Worker 启动不自动打开 Trae。
+  - Worker 左下 SOLO Agent 输入框优先定位、UIA 候选收紧、继续文本走聊天输入框。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+  - Web dist 重新部署，结构为 `/assets/index-Cy1tcbtz.js` 和 `/assets/index-DFn3rpGU.css`。
+- 生产 `.deploy-revision`：`e2f420dadb54d337e205e9e4ea214de073b44e1a`。
+- 已重启 `agentops-api`，`systemctl is-active agentops-api` 返回 `active`。
+- 线上验证：
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产 `index.html` 正确引用 `/assets/index-Cy1tcbtz.js` 与 `/assets/index-DFn3rpGU.css`。
+  - 生产 Worker ZIP 大小 `27283528`，文件头为 `PK`。
+  - 生产源码确认包含 `solo_coordinate_primary` 和 `BackgroundTasks` reopen 改动。
+
+下一轮真实验证重点：
+
+- 下载/运行新版 Worker 后，启动 Worker 不应自动打开 Trae CN。
+- 点击开始/重开后，Worker 才应打开/聚焦 Trae，并优先点击截图左下 SOLO Agent 输入区。
+- 如果输入仍失败，优先查看 Dashboard 当前 worker command 的 `result.data.input` 字段。
+- 重开按钮应快速返回，随后日志显示后台 prompt 生成和 Worker 派发。
