@@ -280,3 +280,25 @@ npm.cmd run build
 - 已重新执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`，最终 Worker ZIP 已更新。
 - 打包期间 pip 曾出现一次 PyPI read timeout retry，但构建成功，未阻塞。
 - 提交前又收紧 UIA 输入候选：偏右、过高、过宽且不像 prompt/message/input/send 的控件不再被当作 Trae 输入框，降低误点代码编辑区风险；随后 Worker 测试仍通过，并再次重打最终 Worker ZIP。
+
+## 2026-06-12 部署完成记录
+
+- 代码提交：`38e4acf fix: stabilize Trae prompt input and log scrolling`，已 push 到 GitHub `origin/main`。
+- 生产机 `/opt/agentops-platform` 不是 git 仓库，是发布目录；本轮采用源码补丁包 + Web dist 包 + Worker ZIP 上传部署。
+- 已备份旧产物到 `/opt/agentops-deploy-backups/20260612-38e4acf/`。
+- 已同步以下变更到生产：
+  - Worker prompt 输入定位修复相关源码。
+  - Worker `keep_trae_foreground` 配置与浏览器验收后 Trae 前台恢复。
+  - Dashboard 日志自动滚动前端构建产物。
+  - 新版 `agentops-worker-windows.zip`。
+- 生产 `.deploy-revision` 已写入 `38e4acf88475b64c922a44c46495c89449eaad1f`。
+- 已重启 `agentops-api`，`systemctl is-active agentops-api` 返回 `active`。
+- 线上验证：
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回正常。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`，引用新构建文件 `index-Cy1tcbtz.js`。
+  - 生产 Worker ZIP 大小 `27281074`，文件头为 `PK`。
+
+注意：
+
+- 本轮没有实际替用户点击 Trae 跑真实作业；真实场景还需要用户继续人工跑一轮验证输入框定位是否命中。如果仍有问题，优先看 Worker 命令返回里的 `data.input` 字段：`method`、`candidate`、`click_x/click_y`。
