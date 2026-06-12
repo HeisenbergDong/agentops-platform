@@ -300,7 +300,8 @@ def _prompt(label: str, default: str = "") -> str:
 def create_command_runner(worker_settings: WorkerSettings) -> Any:
     from worker.runtime.command_runner import CommandRunner
 
-    return CommandRunner(worker_settings.worker_id, runtime_settings=worker_settings)
+    client = WorkerClient(worker_settings.server_url, worker_settings.token)
+    return CommandRunner(worker_settings.worker_id, runtime_settings=worker_settings, worker_client=client)
 
 
 def attach_cancellation_checker(

@@ -1,3 +1,4 @@
+import base64
 from dataclasses import dataclass
 from typing import Any
 
@@ -62,17 +63,49 @@ class LLMClient:
     def complete(
         self,
         config: LLMConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         purpose: str = "role_chat",
     ) -> LLMResult:
         if config.wire_api == "chat_completions":
             return self._chat_completions(config, messages, purpose)
         return self._responses(config, messages, purpose)
 
+    def complete_with_image(
+        self,
+        config: LLMConfig,
+        *,
+        prompt: str,
+        image_bytes: bytes,
+        mime_type: str = "image/png",
+        purpose: str = "trae_ui_analyst",
+    ) -> LLMResult:
+        data_url = _image_data_url(image_bytes, mime_type)
+        if config.wire_api == "chat_completions":
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "text", "text": prompt},
+                        {"type": "image_url", "image_url": {"url": data_url}},
+                    ],
+                }
+            ]
+        else:
+            messages = [
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": prompt},
+                        {"type": "input_image", "image_url": data_url},
+                    ],
+                }
+            ]
+        return self.complete(config, messages, purpose=purpose)
+
     def _responses(
         self,
         config: LLMConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         purpose: str,
     ) -> LLMResult:
         url = f"{config.base_url}/v1/responses"
@@ -100,7 +133,7 @@ class LLMClient:
     def _chat_completions(
         self,
         config: LLMConfig,
-        messages: list[dict[str, str]],
+        messages: list[dict[str, Any]],
         purpose: str,
     ) -> LLMResult:
         url = f"{config.base_url}/v1/chat/completions"
@@ -180,3 +213,9 @@ def _http_error_message(response: httpx.Response) -> str:
         detail = response.text.strip().replace("\n", " ")[:300]
     suffix = f": {detail}" if detail else ""
     return f"LLM request failed with status {response.status_code}{suffix}"
+
+
+def _image_data_url(image_bytes: bytes, mime_type: str) -> str:
+    safe_mime = mime_type if mime_type in {"image/png", "image/jpeg", "image/webp"} else "image/png"
+    encoded = base64.b64encode(image_bytes).decode("ascii")
+    return f"data:{safe_mime};base64,{encoded}"

@@ -12,6 +12,7 @@ SECRET_FIELDS = {
     "model": {"api_key"},
     "github": {"token"},
     "feishu": {"app_secret"},
+    "webhook": {"secret"},
 }
 
 INTERNAL_FIELDS = {
@@ -21,7 +22,6 @@ INTERNAL_FIELDS = {
 DEPRECATED_FIELDS = {
     "github": {"repo_url"},
     "feishu": {"base_token"},
-    "webhook": {"secret"},
     "trae": {"workspace_path"},
 }
 

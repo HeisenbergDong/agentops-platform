@@ -132,6 +132,29 @@ def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytes
     assert result["error"] == "no window"
 
 
+def test_send_prompt_manual_required_preserves_diagnostics(monkeypatch: pytest.MonkeyPatch):
+    def raise_prompt_error(*args, **kwargs):
+        raise command_runner.PromptSendError(
+            "auto calibration failed",
+            {"stage": "trae_ui_auto_calibration_failed", "screenshot": {"path": "screen.png"}},
+        )
+
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+    )
+    monkeypatch.setattr(command_runner, "send_prompt", raise_prompt_error)
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {"command_id": "cmd-diag", "type": "send_prompt", "payload": {"prompt": "hello"}}
+    )
+
+    assert result["status"] == "manual_required"
+    assert result["data"]["stage"] == "trae_ui_auto_calibration_failed"
+    assert result["data"]["screenshot"]["path"] == "screen.png"
+
+
 def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     ensured = []
     settings = command_runner.WorkerSettings(

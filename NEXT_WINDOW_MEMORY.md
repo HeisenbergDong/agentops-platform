@@ -665,3 +665,81 @@ npm.cmd run build
   - `data.input.method` 应为 `adbz_coordinate_primary`。
   - `data.submit.method` 应为 `adbz_send_button`。
   - `data.open_trae.window_diagnostics.foreground_hwnd/foreground_pid/windows` 用来判断 Trae 是否真在前台。
+
+## 2026-06-12 Worker Trae UI 自动校准、视觉分析和缓存实现记录
+
+用户本轮纠正和需求：
+- 视觉模型本身支持图片；问题是平台里的 LLM API 封装之前只支持纯文本，没有把截图作为 image input 传给模型。
+- Worker 需要在保留 `D:\adbz` 固定坐标能力的基础上，支持 Trae 位置变化后的自动校准。
+- 自动校准要服务于后续按钮点击，比如继续、运行、删除、保留等；危险按钮要能识别但不自动点击。
+- 点击/输入失败后由 AI 视觉角色介入，成功后缓存成功坐标，下次优先按缓存操作；缓存失败再回到 AI 介入。
+- 以前卡住时通过 webhook 机器人发飞书消息，这个能力必须保留。
+
+本轮结论：
+- 根因不是模型不支持图像，而是 `apps/api/app/services/llm/client.py` 没有 image payload 支持。
+- 旧 `D:\adbz` 路径适合做首选基线，但不能解决窗口布局/按钮位置变化；需要“缓存 -> adbz 比例点 -> 本地视觉粗定位 -> API 视觉模型”的分层链路。
+- 当前项目没有独立的飞书 bot sender 文件；但已有 `webhook.url` 配置。本轮按飞书自定义机器人文本消息格式恢复 `manual_required` webhook 通知。
+
+已完成代码改动：
+- API 视觉模型链路：
+  - `apps/api/app/services/llm/client.py` 新增 `complete_with_image()`，支持 Responses `input_image` 和 Chat Completions `image_url` 两种 wire API。
+  - 新增 `apps/api/app/services/trae_ui_analyst.py`，定义 Trae UI Analyst 角色，输入截图和上下文，只返回 JSON 坐标/风险/置信度。
+  - `apps/api/app/api/workers.py` 新增 Worker token 保护接口：`POST /api/workers/{worker_id}/trae-ui/analyze`。
+- Worker 自适应输入链路：
+  - 新增 `apps/worker-windows/worker/trae/ui_cache.py`，缓存文件位于 `%APPDATA%\AgentOps\trae-ui-cache.json`，按 action/workspace/window ratio 记录成功坐标，连续失败 3 次后禁用该缓存项。
+  - 新增 `apps/worker-windows/worker/trae/ui_locator.py`，提供本地保守定位、action 归一化、风险校验和坐标合法性校验。
+  - `apps/worker-windows/worker/trae/prompt.py` 改成分层尝试：
+    1. 缓存坐标；
+    2. `D:\adbz` 比例点，返回方法名保持 `adbz_coordinate_primary` / `adbz_send_button`；
+    3. 截图后本地视觉粗定位；
+    4. 调 API 视觉模型；
+    5. 成功后写入缓存；失败后把 attempts、截图路径、local_analysis、ai_analysis、ai_error 放进 `PromptSendError.details`。
+  - `apps/worker-windows/worker/runtime/command_runner.py` 把 `PromptSendError.details` 原样带回 API 的 `result.data`，供看板/通知排查。
+- Worker 回复按钮链路：
+  - `apps/worker-windows/worker/trae/intervene.py` 保留原 UIA/diagnose/adbz fallback，同时新增视觉按钮点击：
+    - 先查缓存；
+    - 再截图调 Trae UI Analyst；
+    - 只允许 `continue_button/run_button/confirm_button/keep_button/save_button`；
+    - `delete/discard/remove/reset/cancel` 等危险动作识别后不自动点击。
+- Worker/API 连接：
+  - `apps/worker-windows/worker/connection/client.py` 新增 `analyze_trae_ui()` multipart 上传截图。
+  - `apps/worker-windows/worker/main.py` 给 `CommandRunner` 注入 `WorkerClient`，让 Worker 能调用 API 视觉角色。
+- manual_required webhook 机器人：
+  - 新增 `apps/api/app/services/webhook_notifier.py`，进入 manual_required 后按飞书机器人文本消息格式 POST 到 `webhook.url`。
+  - `webhook.secret` 重新作为加密 secret 支持，兼容飞书机器人签名。
+  - `apps/api/app/services/orchestrator/worker_results.py` 在 manual_required 时创建 `AutomationError`，并发送 webhook；webhook 失败只写 warning 日志，不阻塞主流程。
+
+已验证：
+- Worker targeted：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests\test_prompt_input.py tests\test_trae_intervention.py tests\test_command_runner.py`
+  - 结果：`48 passed`
+- API targeted：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests\test_worker_results.py tests\test_worker_attachments.py tests\test_trae_ui_analyst.py`
+  - 结果：`50 passed`
+- Worker 全量：
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`81 passed, 2 warnings`
+- API 全量：
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`92 passed, 3 warnings`
+- Web build：
+  - `npm.cmd run build`
+  - 结果：通过，仍有 Vite chunk size warning。
+- Worker 打包：
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功；ZIP `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`，大小 `27315131`。
+- `git diff --check`：通过。
+
+下一轮真实测试重点：
+- 下载/运行最新 Worker ZIP，旧 Worker 不会有视觉校准、坐标缓存和 webhook 诊断细节。
+- 若 prompt 仍未进入 Trae，优先看 Worker 命令结果：
+  - `data.automation.strategy`：`cache` / `adbz_ratio` / `local_vision` / `ai_vision`。
+  - `data.automation.attempts`：逐次失败原因。
+  - `data.screenshot.path` 或 `data.automation.screenshot.path`：视觉分析截图。
+  - `data.ai_analysis.targets`：模型返回的候选坐标。
+- 若卡住进入 `manual_required`，看：
+  - `automation_errors.details`
+  - `manual_required_notification` 日志
+  - 飞书 webhook 机器人是否收到消息。

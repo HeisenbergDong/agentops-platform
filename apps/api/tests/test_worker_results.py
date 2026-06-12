@@ -4,11 +4,12 @@ import tempfile
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, UserConfig, WorkerCommand
+from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, UserConfig, WorkerCommand
 from app.db.session import Base
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator import worker_results
 from app.services.orchestrator.worker_results import handle_worker_result
+from app.services import webhook_notifier
 from app.worker_gateway.contracts import WorkerCommandType, WorkerResult
 
 VALID_TRAE_SESSION_ID = "41867a07a0b34471bd185ecc93ebf73b"
@@ -1290,6 +1291,50 @@ def test_send_prompt_manual_required_marks_job_manual_required():
     assert round_.status == JobState.MANUAL_REQUIRED
     assert log is not None
     assert log.level == "warning"
+    error = db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required"))
+    assert error is not None
+    assert error.details["error"] == "Trae window was not found"
+
+
+def test_manual_required_sends_webhook_notification(monkeypatch):
+    db = _test_session()
+    job, _round, command = _create_send_prompt_rows(db)
+    db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/webhook/test"}))
+    db.commit()
+    sent = {}
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+        sent["timeout"] = timeout
+
+        class Response:
+            status_code = 200
+            text = "ok"
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae input not found",
+            data={"manual_hint": "check Trae composer"},
+        ),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "manual_required_notification"))
+    assert sent["url"] == "https://open.feishu.cn/webhook/test"
+    assert sent["json"]["msg_type"] == "text"
+    assert "AgentOps" in sent["json"]["content"]["text"]
+    assert "check Trae composer" in sent["json"]["content"]["text"]
+    assert log is not None
+    assert log.level == "info"
 
 
 def test_late_worker_result_after_stop_is_ignored():

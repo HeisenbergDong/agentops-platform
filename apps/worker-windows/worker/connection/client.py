@@ -1,4 +1,5 @@
 import httpx
+import json
 
 
 class WorkerClient:
@@ -95,6 +96,25 @@ class WorkerClient:
                 },
                 files={"file": (getattr(path, "name", None) or "attachment", file_obj, content_type)},
                 timeout=60,
+            )
+        response.raise_for_status()
+        return response.json()
+
+    def analyze_trae_ui(
+        self,
+        worker_id: str,
+        path,
+        *,
+        context: dict,
+        content_type: str = "image/png",
+    ) -> dict:
+        with open(path, "rb") as file_obj:
+            response = httpx.post(
+                f"{self.server_url}/api/workers/{worker_id}/trae-ui/analyze",
+                headers=self.headers,
+                data={"context": json.dumps(context, ensure_ascii=False)},
+                files={"file": (getattr(path, "name", None) or "trae-ui.png", file_obj, content_type)},
+                timeout=90,
             )
         response.raise_for_status()
         return response.json()

@@ -25,6 +25,7 @@ from app.db.repositories.workers import (
 )
 from app.db.session import get_db
 from app.services.orchestrator.worker_results import handle_worker_result
+from app.services.trae_ui_analyst import analyze_trae_ui
 from app.services.user_settings import load_user_settings
 from app.worker_gateway.contracts import (
     CreateWorkerCommandRequest,
@@ -266,6 +267,42 @@ def upload_worker_attachment(
     db.commit()
     db.refresh(attachment)
     return {"status": "uploaded", "attachment": serialize_attachment(attachment)}
+
+
+@router.post("/{worker_id}/trae-ui/analyze")
+def analyze_worker_trae_ui(
+    worker_id: str,
+    context: str = Form("{}"),
+    file: UploadFile = File(...),
+    worker: Worker = Depends(current_worker),
+    db: Session = Depends(get_db),
+) -> dict:
+    if worker.worker_id != worker_id:
+        raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
+    if not worker.user_id:
+        raise HTTPException(status_code=400, detail="Worker is not bound to a user; model settings are unavailable")
+    try:
+        import json
+
+        parsed_context = json.loads(context or "{}")
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail="context must be valid JSON") from exc
+    if not isinstance(parsed_context, dict):
+        raise HTTPException(status_code=400, detail="context must be a JSON object")
+    image_bytes = file.file.read()
+    if not image_bytes:
+        raise HTTPException(status_code=400, detail="screenshot file is empty")
+    configs = load_user_settings(db, worker.user_id)
+    try:
+        analysis = analyze_trae_ui(
+            configs,
+            image_bytes=image_bytes,
+            mime_type=file.content_type or "image/png",
+            context=parsed_context,
+        )
+    except Exception as exc:
+        raise HTTPException(status_code=502, detail=f"Trae UI Analyst failed: {exc}") from exc
+    return {"status": "analyzed", "analysis": analysis}
 
 
 def assigned_worker_config(db: Session, worker: Worker) -> dict:

@@ -36,10 +36,12 @@ class CommandRunner:
         worker_id: str | None = None,
         runtime_settings: WorkerSettings | None = None,
         cancellation_checker: Callable[[str], bool] | None = None,
+        worker_client: Any | None = None,
     ) -> None:
         self.settings = runtime_settings or settings
         self.worker_id = worker_id or self.settings.worker_id
         self.cancellation_checker = cancellation_checker
+        self.worker_client = worker_client
         self.state = WorkerRuntimeState()
 
     def run(self, command: dict) -> dict:
@@ -93,7 +95,7 @@ class CommandRunner:
         except CommandCancelled as exc:
             return self._cancelled(command_id, str(exc), lease_id=lease_id)
         except (TraeAutomationError, PromptSendError) as exc:
-            return self._manual_required(command_id, str(exc), lease_id=lease_id)
+            return self._manual_required(command_id, exc, lease_id=lease_id)
         except Exception as exc:
             return self._failed(command_id, str(exc), lease_id=lease_id)
         finally:
@@ -161,6 +163,7 @@ class CommandRunner:
             verify_submission=bool(payload.get("verify_submission", True)),
             sent_at_epoch=sent_at_epoch,
             submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
         )
         send_result["sent_at_epoch"] = sent_at_epoch
         send_result["open_trae"] = open_result
@@ -191,7 +194,20 @@ class CommandRunner:
         return result
 
     def _click_continue(self, payload: dict[str, Any]) -> dict:
-        return click_continue(timeout_seconds=float(payload.get("timeout_seconds", 10)))
+        return click_continue(
+            timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+        )
+
+    def _analyze_trae_ui(self, screenshot_path: str, context: dict[str, Any]) -> dict:
+        if not self.worker_client:
+            return {"status": "unavailable", "reason": "worker_client_not_configured"}
+        return self.worker_client.analyze_trae_ui(
+            self.worker_id,
+            Path(screenshot_path),
+            context=context,
+            content_type="image/png",
+        )
 
     def _scan_project(self, payload: dict[str, Any]) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
@@ -282,15 +298,16 @@ class CommandRunner:
             "data": data,
         }
 
-    def _manual_required(self, command_id: str, error: str, lease_id: str = "") -> dict:
+    def _manual_required(self, command_id: str, error: Any, lease_id: str = "") -> dict:
+        details = getattr(error, "details", None)
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
             "lease_id": lease_id,
             "status": "manual_required",
             "message": "Command requires manual worker intervention",
-            "data": {},
-            "error": error,
+            "data": details if isinstance(details, dict) else {},
+            "error": str(error),
         }
 
     def _cancelled(self, command_id: str, message: str, lease_id: str = "") -> dict:

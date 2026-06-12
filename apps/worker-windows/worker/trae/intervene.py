@@ -2,11 +2,15 @@ from __future__ import annotations
 
 import ctypes
 import time
-from typing import Any
+from pathlib import Path
+from typing import Any, Callable
 
 from worker.system.clipboard import ClipboardError, set_clipboard_text
+from worker.trae import ui_cache
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.prompt import send_prompt, _send_keys
+from worker.trae.screenshot import capture_screenshot
+from worker.trae.ui_locator import normalize_action, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 CONTINUE_MARKERS = (
@@ -42,7 +46,10 @@ UNSAFE_MARKERS = (
 )
 
 
-def click_continue(timeout_seconds: float = 10.0) -> dict:
+def click_continue(
+    timeout_seconds: float = 10.0,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict:
     focus_trae(timeout_seconds=timeout_seconds)
     diagnosis = diagnose_ui(timeout_seconds=timeout_seconds, scroll_bottom=True)
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
@@ -60,6 +67,14 @@ def click_continue(timeout_seconds: float = 10.0) -> dict:
         button_text, button = candidates[0]
         button.click_input()
         return {"status": "clicked", "button_text": button_text, "diagnosis": _compact_diagnosis(diagnosis)}
+
+    visual = click_visual_intervention(
+        action=_action_from_diagnosis(diagnosis),
+        timeout_seconds=timeout_seconds,
+        ui_analyst=ui_analyst,
+    )
+    if visual.get("status") == "clicked":
+        return {"status": "clicked", "intervention": visual, "diagnosis": _compact_diagnosis(diagnosis)}
 
     fallback = click_primary_fallback()
     if fallback.get("status") == "clicked":
@@ -118,6 +133,82 @@ def click_screen_point(x: Any, y: Any) -> dict:
     return {"status": "applied", "mode": "click-point", "x": click_x, "y": click_y}
 
 
+def click_visual_intervention(
+    action: str = "continue_button",
+    timeout_seconds: float = 10.0,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict:
+    window = find_trae_window(timeout_seconds=timeout_seconds)
+    hwnd = int(getattr(window, "hwnd", 0) or 0)
+    rect = _window_rect(hwnd)
+    action = normalize_action(action or "continue_button")
+    if not rect:
+        return {"status": "not_clicked", "mode": "visual-intervention", "reason": "missing_window_rect"}
+
+    cached = ui_cache.candidate_targets(action, rect)
+    for target in cached[:2]:
+        candidate = _target_from_cache(target, action)
+        ok, reason = validate_target(candidate, action, rect, min_confidence=0.5)
+        if not ok:
+            continue
+        clicked = _click_target(candidate, mode="cache-visual-intervention")
+        ui_cache.record_success(action, candidate["center"], rect, source="cache", confidence=float(candidate.get("confidence") or 0.7))
+        return {**clicked, "action": action, "source": "cache"}
+
+    screenshot = _capture_for_visual_intervention()
+    ai_analysis = {}
+    ai_error = ""
+    if ui_analyst and screenshot.get("path"):
+        try:
+            response = ui_analyst(
+                str(screenshot["path"]),
+                _visual_intervention_context(rect, window.window_text(), action),
+            )
+            ai_analysis = response.get("analysis") if isinstance(response, dict) else {}
+            if not isinstance(ai_analysis, dict):
+                ai_analysis = {}
+        except Exception as exc:
+            ai_error = str(exc)
+    target = target_for_action(ai_analysis, action, min_confidence=0.75) if ai_analysis else None
+    if target:
+        ok, reason = validate_target(target, action, rect, min_confidence=0.75)
+        if ok:
+            clicked = _click_target(target, mode="ai-visual-intervention")
+            ui_cache.record_success(
+                action,
+                target["center"],
+                rect,
+                source="ai_vision",
+                method=str(target.get("method") or "ai_vision"),
+                confidence=float(target.get("confidence") or 0.75),
+                label=str(target.get("label") or ""),
+            )
+            return {
+                **clicked,
+                "action": action,
+                "source": "ai_vision",
+                "screenshot": screenshot,
+                "ai_analysis": ai_analysis,
+            }
+        return {
+            "status": "not_clicked",
+            "mode": "visual-intervention",
+            "reason": reason,
+            "action": action,
+            "screenshot": screenshot,
+            "ai_analysis": ai_analysis,
+        }
+    return {
+        "status": "not_clicked",
+        "mode": "visual-intervention",
+        "reason": "no_visual_target",
+        "action": action,
+        "screenshot": screenshot,
+        "ai_analysis": ai_analysis,
+        "ai_error": ai_error,
+    }
+
+
 def click_primary_fallback() -> dict:
     window = find_trae_window(timeout_seconds=5.0)
     hwnd = int(getattr(window, "hwnd", 0) or 0)
@@ -146,6 +237,78 @@ def click_primary_fallback() -> dict:
         clicked.append({"name": name, "x": x, "y": y})
         time.sleep(0.15)
     return {"status": "clicked", "mode": "primary-fallback", "points": clicked}
+
+
+def _target_from_cache(target: dict[str, Any], action: str) -> dict[str, Any]:
+    return {
+        "action": action,
+        "center": target.get("center") if isinstance(target.get("center"), dict) else {},
+        "ratio": target.get("ratio") if isinstance(target.get("ratio"), dict) else {},
+        "confidence": float(target.get("confidence") or 0.7),
+        "risk": "safe",
+        "method": str(target.get("method") or "cache"),
+        "label": str(target.get("label") or ""),
+    }
+
+
+def _click_target(target: dict[str, Any], mode: str) -> dict:
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    x = int(float(center.get("x")))
+    y = int(float(center.get("y")))
+    _mouse_click(x, y)
+    return {
+        "status": "clicked",
+        "mode": mode,
+        "x": x,
+        "y": y,
+        "ratio": target.get("ratio") or {},
+        "confidence": target.get("confidence"),
+        "label": target.get("label") or "",
+    }
+
+
+def _capture_for_visual_intervention() -> dict[str, Any]:
+    try:
+        return capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+def _visual_intervention_context(
+    rect: tuple[int, int, int, int],
+    window_title: str,
+    action: str,
+) -> dict[str, Any]:
+    left, top, right, bottom = rect
+    return {
+        "task": "find_reply_action_button",
+        "requested_action": action,
+        "window": {
+            "title": window_title,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "width": max(1, right - left),
+                "height": max(1, bottom - top),
+            },
+        },
+        "allowed_actions": ["continue_button", "run_button", "confirm_button", "keep_button", "save_button"],
+        "blocked_actions": ["delete_button", "discard_button", "remove_button", "reset_button", "cancel_button"],
+        "instructions": "Find the safe visible button for the requested action in Trae's assistant reply area. Return JSON only.",
+    }
+
+
+def _action_from_diagnosis(diagnosis: dict) -> str:
+    suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
+    action = suggested.get("action") if isinstance(suggested, dict) else ""
+    if action:
+        return normalize_action(str(action))
+    state = str(diagnosis.get("state") or "") if isinstance(diagnosis, dict) else ""
+    if "continue" in state or "\u7ee7\u7eed" in state:
+        return "continue_button"
+    return "continue_button"
 
 
 def _matching_buttons(window, markers: tuple[str, ...]) -> list[tuple[str, object]]:

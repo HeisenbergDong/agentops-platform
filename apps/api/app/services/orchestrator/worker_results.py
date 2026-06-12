@@ -4,7 +4,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
+from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import create_worker_command
 from app.services.feishu.writer import FeishuWriteError, write_feishu_record
@@ -21,6 +21,7 @@ from app.services.orchestrator.prompt_writer import (
 from app.services.orchestrator.states import JobState
 from app.services.trace.validator import is_recoverable_trace_reason, validate_full_trace
 from app.services.user_settings import load_user_settings, save_user_settings
+from app.services.webhook_notifier import WebhookNotifyError, notify_manual_required
 from app.services.orchestrator.worker_dispatch import (
     WorkerDispatchError,
     dispatch_prompt_to_worker,
@@ -1497,6 +1498,16 @@ def _mark_manual_required(
     job.status = JobState.MANUAL_REQUIRED
     if round_:
         round_.status = JobState.MANUAL_REQUIRED
+    db.add(
+        AutomationError(
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            kind="manual_required",
+            stage=JobState.MANUAL_REQUIRED,
+            message=message,
+            details=extra,
+        )
+    )
     add_log(
         db,
         job_id=job.id,
@@ -1505,6 +1516,47 @@ def _mark_manual_required(
         message=message,
         level="warning" if result_status == "manual_required" else "error",
         extra=extra,
+    )
+    _notify_manual_required(db, job, round_, message, extra)
+
+
+def _notify_manual_required(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> None:
+    configs = load_user_settings(db, job.user_id)
+    webhook_config = dict(configs.get("webhook", {}))
+    if not webhook_config.get("url"):
+        return
+    try:
+        result = notify_manual_required(
+            webhook_config,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            message=message,
+            details=extra,
+        )
+    except WebhookNotifyError as exc:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="manual_required_notification",
+            message="Manual-required webhook notification failed.",
+            level="warning",
+            extra={"error": str(exc)},
+        )
+        return
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage="manual_required_notification",
+        message="Manual-required webhook notification sent.",
+        extra=result,
     )
 
 

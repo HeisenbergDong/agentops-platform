@@ -6,7 +6,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api import workers
-from app.db.models import Attachment, User, Worker
+from app.db.models import Attachment, User, UserConfig, Worker
 from app.db.session import Base
 
 
@@ -65,6 +65,41 @@ def test_download_worker_package_reports_missing(monkeypatch):
         assert exc.status_code == 404
     else:
         raise AssertionError("Expected missing worker package to return 404")
+
+
+def test_worker_trae_ui_analyze_uses_bound_user_model_settings(monkeypatch, tmp_path: Path):
+    db = _test_session()
+    worker = Worker(worker_id="worker1", user_id="user1", machine_name="host1", token_hash="hash")
+    db.add(worker)
+    db.add(UserConfig(user_id="user1", category="model", data={"api_key": "enc", "model_name": "vision"}))
+    db.commit()
+    source = tmp_path / "screen.png"
+    source.write_bytes(b"png")
+    captured = {}
+
+    def fake_analyze(configs, image_bytes, mime_type, context):
+        captured["configs"] = configs
+        captured["image_bytes"] = image_bytes
+        captured["mime_type"] = mime_type
+        captured["context"] = context
+        return {"status": "found", "targets": [{"action": "send_button"}]}
+
+    monkeypatch.setattr(workers, "analyze_trae_ui", fake_analyze)
+
+    with source.open("rb") as file_obj:
+        response = workers.analyze_worker_trae_ui(
+            worker_id="worker1",
+            context='{"task":"find_prompt_input_and_send_button"}',
+            file=UploadFile(file=file_obj, filename="screen.png"),
+            worker=worker,
+            db=db,
+        )
+
+    assert response["status"] == "analyzed"
+    assert response["analysis"]["status"] == "found"
+    assert captured["image_bytes"] == b"png"
+    assert captured["context"]["task"] == "find_prompt_input_and_send_button"
+    assert captured["configs"]["model"]["model_name"] == "vision"
 
 
 def test_worker_package_path_checks_repo_storage_for_relative_attachment_root(monkeypatch, tmp_path: Path):

@@ -1,3 +1,5 @@
+import pytest
+
 from worker.trae import prompt as prompt_module
 
 
@@ -39,6 +41,11 @@ class FakeWindow:
         if control_type == "Edit":
             return self.controls
         return []
+
+
+@pytest.fixture(autouse=True)
+def isolate_ui_cache(monkeypatch, tmp_path):
+    monkeypatch.setattr(prompt_module.ui_cache, "default_cache_path", lambda: tmp_path / "trae-ui-cache.json")
 
 
 def test_send_prompt_clicks_solo_input_area_before_paste(monkeypatch):
@@ -104,6 +111,72 @@ def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
     assert keys == ["^a", "{BACKSPACE}", "^v"]
     assert result["submission"]["status"] == "confirmed"
     assert result["submission"]["probe"]["status"] == "found"
+
+
+def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch, tmp_path):
+    fake_window = FakeWindow([])
+    clicks: list[tuple[int, int]] = []
+    probe_calls = {"count": 0}
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"png")
+
+    monkeypatch.setattr(prompt_module.ui_cache, "default_cache_path", lambda: tmp_path / "cache.json")
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module, "_capture_ui_analysis_screenshot", lambda: {"status": "captured", "path": str(screenshot)})
+    monkeypatch.setattr(
+        prompt_module,
+        "locate_prompt_targets",
+        lambda path, rect: {"status": "not_found", "targets": []},
+    )
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+
+    def fake_verify(**kwargs):
+        probe_calls["count"] += 1
+        if probe_calls["count"] == 1:
+            raise prompt_module.PromptSendError("no new Trae user turn was detected")
+        return {"status": "confirmed", "probe": {"status": "found"}}
+
+    def fake_ai(path, context):
+        return {
+            "analysis": {
+                "status": "found",
+                "targets": [
+                    {
+                        "action": "prompt_input",
+                        "center": {"x": 240, "y": 700},
+                        "ratio": {"x": 0.2, "y": 0.875},
+                        "confidence": 0.92,
+                        "risk": "safe",
+                    },
+                    {
+                        "action": "send_button",
+                        "center": {"x": 500, "y": 760},
+                        "ratio": {"x": 0.417, "y": 0.95},
+                        "confidence": 0.94,
+                        "risk": "safe",
+                    },
+                ],
+            }
+        }
+
+    monkeypatch.setattr(prompt_module, "_verify_prompt_submission", fake_verify)
+
+    result = prompt_module.send_prompt(
+        "build it",
+        verify_submission=True,
+        submission_timeout_seconds=0.5,
+        ui_analyst=fake_ai,
+    )
+
+    assert clicks == [(312, 704), (436, 756), (240, 700), (500, 760)]
+    assert result["automation"]["strategy"] == "ai_vision"
+    assert result["input"]["click_x"] == 240
+    assert result["submit"]["click_x"] == 500
 
 
 def test_send_prompt_does_not_click_send_button_when_submit_false(monkeypatch):

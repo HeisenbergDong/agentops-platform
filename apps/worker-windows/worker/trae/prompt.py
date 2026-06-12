@@ -1,10 +1,13 @@
 import ctypes
 import time
 from pathlib import Path
-from typing import Any
+from typing import Any, Callable
 
 from worker.system.clipboard import ClipboardError, set_clipboard_text
+from worker.trae import ui_cache
 from worker.trae.session_probe import probe_latest_trae_turn
+from worker.trae.screenshot import capture_screenshot
+from worker.trae.ui_locator import locate_prompt_targets, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 PROMPT_INPUT_X_RATIO = 0.26
@@ -35,7 +38,9 @@ PROMPT_INPUT_NAME_MARKERS = (
 
 
 class PromptSendError(RuntimeError):
-    pass
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 def send_prompt(
@@ -46,6 +51,7 @@ def send_prompt(
     verify_submission: bool = False,
     sent_at_epoch: float | None = None,
     submission_timeout_seconds: float = 15.0,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     prompt = prompt.strip()
     if not prompt:
@@ -68,35 +74,60 @@ def send_prompt(
         set_clipboard_text(prompt)
     except ClipboardError as exc:
         raise PromptSendError(str(exc)) from exc
-    input_result = _focus_prompt_input(window)
-    _send_keys("^a")
-    _send_keys("{BACKSPACE}")
-    _send_keys("^v")
-    time.sleep(0.7)
-    submit_result = {}
-    if submit:
-        submit_result = _click_send_button(
-            _window_rect(int(getattr(window, "hwnd", 0) or 0)),
-        )
-    submission = {}
-    if submit and verify_submission:
-        submission = _verify_prompt_submission(
-            prompt=prompt,
-            workspace_path=workspace_path,
-            sent_at_epoch=sent_at_epoch,
-            timeout_seconds=submission_timeout_seconds,
-        )
+
+    window_rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
+    if not window_rect:
+        input_result = _focus_prompt_input(window)
+        _send_keys("^a")
+        _send_keys("{BACKSPACE}")
+        _send_keys("^v")
+        if submit:
+            _send_keys(submit_hotkey)
+        submission = {}
+        if submit and verify_submission:
+            submission = _verify_prompt_submission(
+                prompt=prompt,
+                workspace_path=workspace_path,
+                sent_at_epoch=sent_at_epoch,
+                timeout_seconds=submission_timeout_seconds,
+            )
+        return {
+            "status": "sent",
+            "chars": len(prompt),
+            "submitted": submit,
+            "submit_hotkey": submit_hotkey if submit else "",
+            "submit_method": submit_hotkey if submit else "",
+            "submit": {"method": submit_hotkey} if submit else {},
+            "window_title": focus_result.get("window_title", ""),
+            "workspace_match": focus_result.get("workspace_match", False),
+            "input": input_result,
+            "submission": submission,
+            "automation": {"strategy": "uia_no_window_rect"},
+        }
+
+    attempt_result = _send_prompt_with_adaptive_targets(
+        prompt=prompt,
+        submit=submit,
+        verify_submission=verify_submission,
+        workspace_path=workspace_path,
+        sent_at_epoch=sent_at_epoch,
+        submission_timeout_seconds=submission_timeout_seconds,
+        window_rect=window_rect,
+        window_title=str(focus_result.get("window_title") or ""),
+        ui_analyst=ui_analyst,
+    )
     return {
         "status": "sent",
         "chars": len(prompt),
         "submitted": submit,
         "submit_hotkey": submit_hotkey if submit else "",
-        "submit_method": submit_result.get("method", "") if submit else "",
-        "submit": submit_result,
+        "submit_method": attempt_result.get("submit", {}).get("method", "") if submit else "",
+        "submit": attempt_result.get("submit", {}),
         "window_title": focus_result.get("window_title", ""),
         "workspace_match": focus_result.get("workspace_match", False),
-        "input": input_result,
-        "submission": submission,
+        "input": attempt_result.get("input", {}),
+        "submission": attempt_result.get("submission", {}),
+        "automation": attempt_result.get("automation", {}),
     }
 
 
@@ -159,6 +190,250 @@ def _compact_submission_probe(probe: dict[str, Any]) -> dict:
             "match_score": candidate.get("match_score", 0),
         }
     return result
+
+
+def _send_prompt_with_adaptive_targets(
+    *,
+    prompt: str,
+    submit: bool,
+    verify_submission: bool,
+    workspace_path: str | Path | None,
+    sent_at_epoch: float | None,
+    submission_timeout_seconds: float,
+    window_rect: tuple[int, int, int, int],
+    window_title: str,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+) -> dict[str, Any]:
+    attempts: list[dict[str, Any]] = []
+    workspace_marker = _workspace_marker(workspace_path)
+    for candidate_set in _candidate_target_sets(window_rect, workspace_marker):
+        result = _try_candidate_set(
+            candidate_set,
+            prompt=prompt,
+            submit=submit,
+            verify_submission=verify_submission,
+            workspace_path=workspace_path,
+            sent_at_epoch=sent_at_epoch,
+            submission_timeout_seconds=submission_timeout_seconds,
+            window_rect=window_rect,
+            workspace_marker=workspace_marker,
+        )
+        attempts.append(_compact_attempt(result))
+        if result.get("status") == "sent":
+            result.setdefault("automation", {})["attempts"] = attempts
+            return result
+
+    screenshot_info = _capture_ui_analysis_screenshot()
+    local_analysis: dict[str, Any] = {}
+    if screenshot_info.get("path"):
+        local_analysis = locate_prompt_targets(screenshot_info["path"], window_rect)
+        local_result = _try_analysis_targets(
+            local_analysis,
+            prompt=prompt,
+            submit=submit,
+            verify_submission=verify_submission,
+            workspace_path=workspace_path,
+            sent_at_epoch=sent_at_epoch,
+            submission_timeout_seconds=submission_timeout_seconds,
+            window_rect=window_rect,
+            workspace_marker=workspace_marker,
+            source="local_vision",
+        )
+        attempts.append(_compact_attempt(local_result))
+        if local_result.get("status") == "sent":
+            local_result.setdefault("automation", {})["attempts"] = attempts
+            local_result["automation"]["screenshot"] = screenshot_info
+            local_result["automation"]["local_analysis"] = local_analysis
+            return local_result
+
+    ai_analysis: dict[str, Any] = {}
+    ai_error = ""
+    if ui_analyst and screenshot_info.get("path"):
+        context = _analysis_context(
+            window_rect=window_rect,
+            window_title=window_title,
+            workspace_path=workspace_path,
+            failed_attempts=attempts,
+        )
+        try:
+            response = ui_analyst(str(screenshot_info["path"]), context)
+            ai_analysis = response.get("analysis") if isinstance(response, dict) else {}
+            if not isinstance(ai_analysis, dict):
+                ai_analysis = {}
+        except Exception as exc:
+            ai_error = str(exc)
+        if ai_analysis:
+            ai_result = _try_analysis_targets(
+                ai_analysis,
+                prompt=prompt,
+                submit=submit,
+                verify_submission=verify_submission,
+                workspace_path=workspace_path,
+                sent_at_epoch=sent_at_epoch,
+                submission_timeout_seconds=submission_timeout_seconds,
+                window_rect=window_rect,
+                workspace_marker=workspace_marker,
+                source="ai_vision",
+            )
+            attempts.append(_compact_attempt(ai_result))
+            if ai_result.get("status") == "sent":
+                ai_result.setdefault("automation", {})["attempts"] = attempts
+                ai_result["automation"]["screenshot"] = screenshot_info
+                ai_result["automation"]["local_analysis"] = local_analysis
+                ai_result["automation"]["ai_analysis"] = ai_analysis
+                return ai_result
+
+    details = {
+        "stage": "trae_ui_auto_calibration_failed",
+        "window_title": window_title,
+        "window_rect": _rect_dict(window_rect),
+        "workspace_path": str(workspace_path or ""),
+        "attempts": attempts,
+        "screenshot": screenshot_info,
+        "local_analysis": local_analysis,
+        "ai_analysis": ai_analysis,
+        "ai_error": ai_error,
+        "manual_hint": "Please inspect Trae and click the correct input/send controls manually.",
+    }
+    last_error = _last_attempt_error(attempts)
+    message = "Worker could not locate and verify Trae prompt controls automatically."
+    if last_error:
+        message = f"{message} Last error: {last_error}"
+    raise PromptSendError(message, details)
+
+
+def _candidate_target_sets(window_rect: tuple[int, int, int, int], workspace_marker: str) -> list[dict[str, Any]]:
+    sets: list[dict[str, Any]] = []
+    cached_input = ui_cache.candidate_targets("prompt_input", window_rect, workspace_marker=workspace_marker)
+    cached_send = ui_cache.candidate_targets("send_button", window_rect, workspace_marker=workspace_marker)
+    for input_target in cached_input[:2]:
+        for send_target in (cached_send[:2] or [{}]):
+            sets.append(
+                {
+                    "source": "cache",
+                    "input": _target_from_cache(input_target, "prompt_input"),
+                    "send": _target_from_cache(send_target, "send_button") if send_target else None,
+                }
+            )
+    sets.append(
+        {
+            "source": "adbz_ratio",
+            "input": _point_target("prompt_input", PROMPT_INPUT_X_RATIO, PROMPT_INPUT_Y_RATIO, window_rect, "adbz_ratio"),
+            "send": _point_target("send_button", PROMPT_SEND_X_RATIO, PROMPT_SEND_Y_RATIO, window_rect, "adbz_ratio"),
+        }
+    )
+    return sets
+
+
+def _try_analysis_targets(
+    analysis: dict[str, Any],
+    *,
+    prompt: str,
+    submit: bool,
+    verify_submission: bool,
+    workspace_path: str | Path | None,
+    sent_at_epoch: float | None,
+    submission_timeout_seconds: float,
+    window_rect: tuple[int, int, int, int],
+    workspace_marker: str,
+    source: str,
+) -> dict[str, Any]:
+    input_target = target_for_action(analysis, "prompt_input", min_confidence=0.55 if source == "local_vision" else 0.75)
+    send_target = target_for_action(analysis, "send_button", min_confidence=0.55 if source == "local_vision" else 0.75)
+    return _try_candidate_set(
+        {"source": source, "input": input_target or {}, "send": send_target or {}},
+        prompt=prompt,
+        submit=submit,
+        verify_submission=verify_submission,
+        workspace_path=workspace_path,
+        sent_at_epoch=sent_at_epoch,
+        submission_timeout_seconds=submission_timeout_seconds,
+        window_rect=window_rect,
+        workspace_marker=workspace_marker,
+    )
+
+
+def _try_candidate_set(
+    candidate_set: dict[str, Any],
+    *,
+    prompt: str,
+    submit: bool,
+    verify_submission: bool,
+    workspace_path: str | Path | None,
+    sent_at_epoch: float | None,
+    submission_timeout_seconds: float,
+    window_rect: tuple[int, int, int, int],
+    workspace_marker: str,
+) -> dict[str, Any]:
+    source = str(candidate_set.get("source") or "unknown")
+    input_target = candidate_set.get("input") if isinstance(candidate_set.get("input"), dict) else {}
+    send_target = candidate_set.get("send") if isinstance(candidate_set.get("send"), dict) else {}
+    ok, reason = validate_target(input_target, "prompt_input", window_rect, min_confidence=0.5 if source != "ai_vision" else 0.75)
+    if not ok:
+        return {"status": "failed", "source": source, "reason": reason, "input": input_target}
+    if submit:
+        ok, reason = validate_target(send_target, "send_button", window_rect, min_confidence=0.5 if source != "ai_vision" else 0.75)
+        if not ok:
+            return {"status": "failed", "source": source, "reason": reason, "input": input_target, "send": send_target}
+    input_result = _click_target(input_target, method=_operation_method(source, "prompt_input"))
+    _send_keys("^a")
+    _send_keys("{BACKSPACE}")
+    _send_keys("^v")
+    time.sleep(0.7)
+    submit_result = {}
+    if submit:
+        submit_result = _click_target(send_target, method=_operation_method(source, "send_button"))
+    try:
+        submission = {}
+        if submit and verify_submission:
+            submission = _verify_prompt_submission(
+                prompt=prompt,
+                workspace_path=workspace_path,
+                sent_at_epoch=sent_at_epoch,
+                timeout_seconds=submission_timeout_seconds,
+            )
+    except PromptSendError as exc:
+        if source.startswith("cache"):
+            ui_cache.record_failure("prompt_input", input_target, reason=str(exc))
+            if send_target:
+                ui_cache.record_failure("send_button", send_target, reason=str(exc))
+        return {
+            "status": "failed",
+            "source": source,
+            "reason": "verification_failed",
+            "error": str(exc),
+            "details": exc.details,
+            "input": input_result,
+            "submit": submit_result,
+        }
+    ui_cache.record_success(
+        "prompt_input",
+        input_target["center"],
+        window_rect,
+        source=source,
+        method=str(input_target.get("method") or source),
+        confidence=float(input_target.get("confidence") or 0.8),
+        label=str(input_target.get("label") or ""),
+        workspace_marker=workspace_marker,
+    )
+    if submit and send_target:
+        ui_cache.record_success(
+            "send_button",
+            send_target["center"],
+            window_rect,
+            source=source,
+            method=str(send_target.get("method") or source),
+            confidence=float(send_target.get("confidence") or 0.8),
+            label=str(send_target.get("label") or ""),
+            workspace_marker=workspace_marker,
+        )
+    return {
+        "status": "sent",
+        "input": input_result,
+        "submit": submit_result,
+        "submission": submission,
+        "automation": {"strategy": source},
+    }
 
 
 def _focus_prompt_input(window: Any) -> dict:
@@ -375,6 +650,143 @@ def _click_send_button(window_rect: tuple[int, int, int, int] | None) -> dict:
         "click_y": y,
         "click_ratio": {"x": PROMPT_SEND_X_RATIO, "y": PROMPT_SEND_Y_RATIO},
     }
+
+
+def _click_target(target: dict[str, Any], method: str) -> dict:
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    x = int(float(center.get("x")))
+    y = int(float(center.get("y")))
+    _mouse_click(x, y)
+    time.sleep(0.2)
+    return {
+        "method": method,
+        "click_x": x,
+        "click_y": y,
+        "click_ratio": target.get("ratio") or {},
+        "confidence": target.get("confidence"),
+        "source_method": target.get("method") or "",
+        "reason": target.get("reason") or "",
+    }
+
+
+def _operation_method(source: str, action: str) -> str:
+    if source == "adbz_ratio" and action == "prompt_input":
+        return "adbz_coordinate_primary"
+    if source == "adbz_ratio" and action == "send_button":
+        return "adbz_send_button"
+    return f"{source}_{action}"
+
+
+def _point_target(
+    action: str,
+    rx: float,
+    ry: float,
+    window_rect: tuple[int, int, int, int],
+    method: str,
+) -> dict[str, Any]:
+    left, top, right, bottom = window_rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    return {
+        "action": action,
+        "center": {"x": int(left + width * rx), "y": int(top + height * ry)},
+        "ratio": {"x": round(rx, 4), "y": round(ry, 4)},
+        "confidence": 0.8,
+        "risk": "safe",
+        "method": method,
+    }
+
+
+def _target_from_cache(target: dict[str, Any], action: str) -> dict[str, Any]:
+    if not target:
+        return {}
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    ratio = target.get("ratio") if isinstance(target.get("ratio"), dict) else {}
+    return {
+        "action": action,
+        "center": center,
+        "ratio": ratio,
+        "confidence": float(target.get("confidence") or 0.75),
+        "risk": "safe",
+        "method": str(target.get("method") or "cache"),
+        "label": str(target.get("label") or ""),
+        "workspace_marker": str(target.get("workspace_marker") or ""),
+    }
+
+
+def _capture_ui_analysis_screenshot() -> dict[str, Any]:
+    try:
+        return capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
+    except Exception as exc:
+        return {"status": "failed", "error": str(exc)}
+
+
+def _analysis_context(
+    *,
+    window_rect: tuple[int, int, int, int],
+    window_title: str,
+    workspace_path: str | Path | None,
+    failed_attempts: list[dict[str, Any]],
+) -> dict[str, Any]:
+    left, top, right, bottom = window_rect
+    return {
+        "task": "find_prompt_input_and_send_button",
+        "window": {
+            "title": window_title,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "width": max(1, right - left),
+                "height": max(1, bottom - top),
+            },
+        },
+        "workspace_path": str(workspace_path or ""),
+        "allowed_actions": ["prompt_input", "send_button"],
+        "blocked_actions": ["delete", "discard", "remove", "reset", "cancel"],
+        "failed_attempts": failed_attempts[-8:],
+        "instructions": "Locate the Trae chat composer input and green send button. Return JSON only.",
+    }
+
+
+def _compact_attempt(result: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "status": result.get("status"),
+        "source": result.get("source") or result.get("automation", {}).get("strategy", ""),
+        "reason": result.get("reason") or "",
+        "error": result.get("error") or "",
+        "input": _compact_target_or_click(result.get("input")),
+        "submit": _compact_target_or_click(result.get("submit")),
+    }
+
+
+def _last_attempt_error(attempts: list[dict[str, Any]]) -> str:
+    for attempt in reversed(attempts):
+        error = str(attempt.get("error") or "").strip()
+        if error:
+            return error
+        reason = str(attempt.get("reason") or "").strip()
+        if reason and reason not in {"verification_failed"}:
+            return reason
+    return ""
+
+
+def _compact_target_or_click(value: Any) -> dict[str, Any]:
+    if not isinstance(value, dict):
+        return {}
+    return {
+        key: value.get(key)
+        for key in ("action", "method", "click_x", "click_y", "click_ratio", "center", "ratio", "confidence", "reason")
+        if key in value
+    }
+
+
+def _workspace_marker(workspace_path: str | Path | None) -> str:
+    if not workspace_path:
+        return ""
+    text = str(workspace_path).strip().rstrip("\\/")
+    return text.replace("\\", "/").rsplit("/", 1)[-1]
 
 
 def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
