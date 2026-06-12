@@ -4,11 +4,12 @@ import {
   PauseCircleOutlined,
   PlayCircleOutlined,
   QuestionCircleOutlined,
+  RedoOutlined,
   ReloadOutlined
 } from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Card, Input, Modal, Space, Tag, Tooltip, Typography, message } from "antd";
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 
@@ -87,7 +88,8 @@ type PreflightCheck = {
 export function DashboardPage() {
   const navigate = useNavigate();
   const [directions, setDirections] = useState("AgentOps 自动作业平台");
-  const [busy, setBusy] = useState<"start" | "continue" | "stop" | "">("");
+  const [directionsTouched, setDirectionsTouched] = useState(false);
+  const [busy, setBusy] = useState<"start" | "continue" | "stop" | "reopen" | "">("");
   const current = useQuery({
     queryKey: ["current-job"],
     queryFn: async () => (await api.get<CurrentJobResponse>("/jobs/current")).data,
@@ -99,7 +101,35 @@ export function DashboardPage() {
     refetchInterval: 5000
   });
 
-  async function runAction(action: "start" | "continue" | "stop") {
+  const job = current.data?.job || null;
+  const round = current.data?.round || null;
+  const logs = current.data?.logs || [];
+  const status = job?.status || current.data?.status || "idle";
+  const currentJobDirections = job?.directions?.join("\n") || "";
+  const preflightData = preflight.data;
+  const directionsList = parseDirections(directions);
+  const hasCurrentJob = Boolean(job);
+  const hasActiveWorkerCommand = Boolean(
+    current.data?.worker_command && ["queued", "claimed", "running"].includes(current.data.worker_command.status)
+  );
+  const preflightReady = Boolean(preflightData?.ready);
+  const canStart = !preflight.isLoading && preflightReady && directionsList.length > 0;
+  const canContinue =
+    !preflight.isLoading &&
+    preflightReady &&
+    hasCurrentJob &&
+    RESUMABLE_STATES.has(status) &&
+    !hasActiveWorkerCommand;
+  const canStop = hasCurrentJob && !isTerminalStatus(status);
+  const canReopen = !preflight.isLoading && preflightReady && hasCurrentJob && directionsList.length > 0;
+
+  useEffect(() => {
+    if (!directionsTouched && currentJobDirections) {
+      setDirections(currentJobDirections);
+    }
+  }, [directionsTouched, currentJobDirections]);
+
+  async function runAction(action: "start" | "continue" | "stop" | "reopen") {
     setBusy(action);
     try {
       if (action === "start") {
@@ -108,6 +138,13 @@ export function DashboardPage() {
         };
         await api.post("/jobs/start", payload);
         message.success("作业已开始");
+      }
+      if (action === "reopen") {
+        const payload = {
+          directions: parseDirections(directions)
+        };
+        const response = await api.post<CurrentJobResponse>("/jobs/reopen", payload);
+        message.success(response.data.message || "已请求重开");
       }
       if (action === "continue") {
         const response = await api.post<CurrentJobResponse>("/jobs/continue");
@@ -128,9 +165,9 @@ export function DashboardPage() {
   function handleStartClick() {
     if (hasCurrentJob && !isTerminalStatus(status)) {
       Modal.confirm({
-        title: "重新开始新作业？",
-        content: "系统会清理当前作业的运行状态，并按上面的作业范围重新开始。",
-        okText: "重新开始",
+        title: "开始新作业？",
+        content: "系统会停止现有作业并创建一条新作业。如果要保留当前作业条目、清空轮次和计数后从第 1 轮重跑，请使用“重开”。",
+        okText: "开始新作业",
         cancelText: "取消",
         onOk: () => runAction("start")
       });
@@ -139,25 +176,18 @@ export function DashboardPage() {
     void runAction("start");
   }
 
-  const job = current.data?.job || null;
-  const round = current.data?.round || null;
-  const logs = current.data?.logs || [];
-  const status = job?.status || current.data?.status || "idle";
-  const preflightData = preflight.data;
-  const directionsList = parseDirections(directions);
-  const hasCurrentJob = Boolean(job);
-  const hasActiveWorkerCommand = Boolean(
-    current.data?.worker_command && ["queued", "claimed", "running"].includes(current.data.worker_command.status)
-  );
-  const preflightReady = Boolean(preflightData?.ready);
-  const canStart = !preflight.isLoading && preflightReady && directionsList.length > 0;
-  const canContinue =
-    !preflight.isLoading &&
-    preflightReady &&
-    hasCurrentJob &&
-    RESUMABLE_STATES.has(status) &&
-    !hasActiveWorkerCommand;
-  const canStop = hasCurrentJob && !isTerminalStatus(status);
+  function handleReopenClick() {
+    Modal.confirm({
+      title: "重开当前作业？",
+      content: hasActiveWorkerCommand
+        ? "系统会取消当前 Worker 命令，清空当前作业的轮次、提交/满意计数和运行记录，并按上方最新作业范围从第 1 轮重新开始。"
+        : "系统会清空当前作业的轮次、提交/满意计数和运行记录，并按上方最新作业范围从第 1 轮重新开始。",
+      okText: "重开",
+      cancelText: "取消",
+      okButtonProps: { danger: true },
+      onOk: () => runAction("reopen")
+    });
+  }
 
   return (
     <Space direction="vertical" size={16} className="page dashboard-simple">
@@ -175,7 +205,10 @@ export function DashboardPage() {
           <Input.TextArea
             rows={6}
             value={directions}
-            onChange={(event) => setDirections(event.target.value)}
+            onChange={(event) => {
+              setDirectionsTouched(true);
+              setDirections(event.target.value);
+            }}
             placeholder="输入本次要做的作业范围，可以多行填写。"
           />
           <Space wrap>
@@ -188,7 +221,7 @@ export function DashboardPage() {
                   disabled={!canStart}
                   onClick={handleStartClick}
                 >
-                  {hasCurrentJob && !isTerminalStatus(status) ? "重新开始" : "开始"}
+                  开始
                 </Button>
               </span>
             </Tooltip>
@@ -220,6 +253,23 @@ export function DashboardPage() {
                   onClick={() => void runAction("stop")}
                 >
                   停止
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip
+              title={
+                canReopen ? "" : reopenDisabledReason(preflight.isLoading, preflightData, directionsList, hasCurrentJob)
+              }
+            >
+              <span>
+                <Button
+                  danger
+                  icon={<RedoOutlined />}
+                  loading={busy === "reopen"}
+                  disabled={!canReopen}
+                  onClick={handleReopenClick}
+                >
+                  重开
                 </Button>
               </span>
             </Tooltip>
@@ -394,6 +444,19 @@ function continueDisabledReason(
 function stopDisabledReason(status: string, hasCurrentJob: boolean): string {
   if (!hasCurrentJob) return "当前没有运行中的作业";
   if (isTerminalStatus(status)) return "当前作业已停止或已结束";
+  return "";
+}
+
+function reopenDisabledReason(
+  loading: boolean,
+  data: PreflightResponse | undefined,
+  directions: string[],
+  hasCurrentJob: boolean
+): string {
+  if (loading) return "正在检查运行条件";
+  if (!hasCurrentJob) return "当前没有可重开的作业";
+  if (!directions.length) return "请先填写最新作业范围";
+  if (!data?.ready) return data?.summary || "运行前检查未通过";
   return "";
 }
 

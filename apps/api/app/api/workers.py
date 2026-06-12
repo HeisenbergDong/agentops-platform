@@ -209,10 +209,17 @@ def post_log(
 ) -> dict:
     if worker.worker_id != worker_id:
         raise HTTPException(status_code=403, detail="Worker token does not match worker_id")
+    command = None
+    if payload.command_id:
+        command = db.scalar(
+            select(WorkerCommand).where(WorkerCommand.id == payload.command_id, WorkerCommand.worker_id == worker_id)
+        )
+        if command and command.job_id != payload.job_id:
+            return {"status": "ignored", "reason": "stale_command_context"}
     log = add_log(
         db,
         job_id=payload.job_id,
-        round_id=payload.round_id,
+        round_id=payload.round_id if not command else command.round_id,
         level=payload.level,
         stage=payload.stage,
         message=payload.message,

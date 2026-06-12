@@ -18,6 +18,7 @@ from app.db.repositories.jobs import (
     current_job,
     latest_round,
     list_logs,
+    reset_job_for_reopen,
 )
 from app.db.repositories.rules import active_rule_version
 from app.db.repositories.workers import create_worker_command, expire_worker_command_leases, get_worker_by_worker_id
@@ -126,6 +127,102 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
                 dispatch_prompt_to_worker(db, user, job, round_)
             except WorkerDispatchError as exc:
                 mark_worker_dispatch_failed(db, job, round_, str(exc))
+    db.commit()
+    db.refresh(job)
+    return serialize_job(db, job)
+
+
+@router.post("/reopen")
+def reopen_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+    directions = [item.strip() for item in payload.directions if item.strip()]
+    if not directions:
+        raise HTTPException(status_code=400, detail="At least one direction is required")
+    preflight = build_preflight(db, user)
+    if not preflight["ready"]:
+        raise HTTPException(
+            status_code=400,
+            detail={"message": preflight["summary"], "preflight": preflight},
+        )
+    expire_worker_command_leases(db)
+    job = current_job(db, user.id)
+    if not job:
+        return {"status": "no_job", "message": "No existing job to reopen."}
+
+    rule_version = active_rule_version(db)
+    round_, reset = reset_job_for_reopen(
+        db,
+        job,
+        directions=directions,
+        rule_version_id=rule_version.id if rule_version else None,
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.CLEANING_OLD_RUNTIME,
+        message="Reopen requested; current job rounds, counters, runtime logs, attachments, errors, and queued commands were reset.",
+        extra=reset,
+    )
+    if reset["cancelled_active_commands"]:
+        command = enqueue_stop_worker_command(db, user.id, job.id, None, reason="user_reopen")
+        if command:
+            add_log(
+                db,
+                job_id=job.id,
+                round_id=round_.id,
+                stage="worker_stop_command",
+                message="Stop command queued for the previous local Worker activity before reopen continues.",
+                level="warning",
+                extra={"worker_id": command.worker_id, "command_id": command.id},
+            )
+        else:
+            add_log(
+                db,
+                job_id=job.id,
+                round_id=round_.id,
+                stage="worker_stop_command",
+                message="Previous active worker commands were cancelled, but no bound online worker could receive an explicit stop command.",
+                level="warning",
+                extra={"cancelled_active_commands": reset["cancelled_active_commands"]},
+            )
+    preflight_level = "warning" if preflight["warnings"] else "info"
+    preflight_message = (
+        "Preflight checks passed with warnings."
+        if preflight["warnings"]
+        else "Preflight checks passed for reopened job."
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="preflight",
+        message=preflight_message,
+        level=preflight_level,
+        extra=preflight,
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.LOADING_RULES,
+        message="User roles and rule files are ready for reopened orchestration.",
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.GENERATING_PROMPT,
+        message="Prompt generation is starting from round 1 with the latest directions.",
+    )
+    try:
+        generate_round_prompt(db, user, job, round_)
+    except PromptGenerationError as exc:
+        mark_prompt_generation_failed(db, job, round_, str(exc))
+    if job.status == JobState.PROMPT_READY:
+        try:
+            dispatch_prompt_to_worker(db, user, job, round_)
+        except WorkerDispatchError as exc:
+            mark_worker_dispatch_failed(db, job, round_, str(exc))
     db.commit()
     db.refresh(job)
     return serialize_job(db, job)
@@ -498,7 +595,7 @@ def refreshed_retry_payload(payload: dict | None, worker_settings: dict, previou
     return result
 
 
-def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id: str | None):
+def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id: str | None, reason: str = "user_stop"):
     settings = load_user_settings(db, user_id)
     worker_id = settings.get("worker", {}).get("worker_id")
     if not worker_id:
@@ -516,7 +613,7 @@ def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id
             type=WorkerCommandType.STOP_CURRENT_TASK,
             job_id=job_id,
             round_id=round_id,
-            payload={"reason": "user_stop"},
+            payload={"reason": reason},
         ),
     )
 

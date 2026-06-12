@@ -1,7 +1,7 @@
 from sqlalchemy import delete, desc, select
 from sqlalchemy.orm import Session
 
-from app.db.models import Attachment, AutomationError, Job, RuntimeLog, TaskRound, WorkerCommand
+from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, WorkerCommand
 from app.services.orchestrator.events import build_display_message
 from app.services.orchestrator.states import JobState
 
@@ -98,6 +98,67 @@ def cleanup_user_runtime_state(db: Session, user_id: str) -> dict:
         "deleted_logs": deleted_logs,
         "deleted_errors": deleted_errors,
         "deleted_attachments": deleted_attachments,
+    }
+
+
+def reset_job_for_reopen(
+    db: Session,
+    job: Job,
+    directions: list[str],
+    rule_version_id: str | None,
+) -> tuple[TaskRound, dict]:
+    old_round_ids = list(db.scalars(select(TaskRound.id).where(TaskRound.job_id == job.id)).all())
+    old_project_ids = list(db.scalars(select(Project.id).where(Project.job_id == job.id)).all())
+    old_command_ids = list(db.scalars(select(WorkerCommand.id).where(WorkerCommand.job_id == job.id)).all())
+    active_commands = list(
+        db.scalars(
+            select(WorkerCommand).where(
+                WorkerCommand.job_id == job.id,
+                WorkerCommand.status.in_({"claimed", "running"}),
+            )
+        ).all()
+    )
+    active_command_ids = {command.id for command in active_commands}
+    for command in active_commands:
+        command.status = "cancelled"
+        command.message = "Cancelled by Reopen reset."
+        command.job_id = None
+        command.round_id = None
+        command.lease_id = ""
+        command.lease_expires_at = None
+    db.flush()
+
+    command_delete_query = delete(WorkerCommand).where(WorkerCommand.job_id == job.id)
+    if active_command_ids:
+        command_delete_query = command_delete_query.where(WorkerCommand.id.not_in(active_command_ids))
+    deleted_commands = db.execute(command_delete_query).rowcount or 0
+    deleted_attachments = db.execute(delete(Attachment).where(Attachment.job_id == job.id)).rowcount or 0
+    deleted_logs = db.execute(delete(RuntimeLog).where(RuntimeLog.job_id == job.id)).rowcount or 0
+    deleted_errors = db.execute(delete(AutomationError).where(AutomationError.job_id == job.id)).rowcount or 0
+    deleted_rounds = db.execute(delete(TaskRound).where(TaskRound.job_id == job.id)).rowcount or 0
+    deleted_projects = db.execute(delete(Project).where(Project.job_id == job.id)).rowcount or 0
+
+    job.rule_version_id = rule_version_id
+    job.directions = directions
+    job.submitted_count = 0
+    job.satisfied_count = 0
+    job.status = JobState.GENERATING_PROMPT
+
+    round_ = TaskRound(job_id=job.id, round_index=1, status=JobState.GENERATING_PROMPT)
+    db.add(round_)
+    db.flush()
+    return round_, {
+        "old_rounds": len(old_round_ids),
+        "old_projects": len(old_project_ids),
+        "old_commands": len(old_command_ids),
+        "cancelled_active_commands": len(active_commands),
+        "deleted_commands": deleted_commands,
+        "deleted_attachments": deleted_attachments,
+        "deleted_logs": deleted_logs,
+        "deleted_errors": deleted_errors,
+        "deleted_rounds": deleted_rounds,
+        "deleted_projects": deleted_projects,
+        "directions": directions,
     }
 
 
