@@ -1,7 +1,15 @@
-import { ApiOutlined, LinkOutlined, PlusOutlined, SendOutlined } from "@ant-design/icons";
+import {
+  ApiOutlined,
+  DownloadOutlined,
+  LinkOutlined,
+  PlusOutlined,
+  SendOutlined,
+  SettingOutlined
+} from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Alert, Button, Card, Input, List, Select, Space, Tag, Typography, message } from "antd";
+import { Alert, Button, Card, Col, Input, List, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useState } from "react";
+import { Link } from "react-router-dom";
 import { api } from "../../api/client";
 import { useAuth } from "../../auth/AuthContext";
 import { selectPopupProps } from "../../components/selectPopup";
@@ -38,6 +46,29 @@ type WorkerCommandRecord = {
   updated_at?: string;
   finished_at?: string | null;
 };
+
+const workerGuideSteps = [
+  {
+    index: "1",
+    title: "登录并补全配置",
+    description: "使用管理员分配的账号登录，在用户配置里填写模型、GitHub、飞书和 Trae 工作目录等个人配置。"
+  },
+  {
+    index: "2",
+    title: "下载并解压 Worker",
+    description: "在自己的 Windows 电脑上下载 Worker 安装包，解压到固定目录，电脑上需要能正常打开 Trae CN。"
+  },
+  {
+    index: "3",
+    title: "用注册码注册",
+    description: "向管理员获取 Worker 注册码，在本机执行注册命令。注册码如果已分配给你，注册后会自动绑定到你的账号。"
+  },
+  {
+    index: "4",
+    title: "启动并保持在线",
+    description: "注册后启动 Worker，推荐安装登录自启任务。回到本页看到 Worker 在线后，就可以发起作业。"
+  }
+];
 
 export function WorkersPage() {
   const { user } = useAuth();
@@ -92,6 +123,26 @@ export function WorkersPage() {
     await queryClient.invalidateQueries({ queryKey: ["worker-recent-commands"] });
   }
 
+  async function downloadWorkerPackage() {
+    try {
+      const response = await api.get<Blob>("/workers/package", { responseType: "blob" });
+      const disposition = String(response.headers["content-disposition"] || "");
+      const filename = filenameFromDisposition(disposition) || "agentops-worker-windows.zip";
+      const url = window.URL.createObjectURL(response.data);
+      const link = document.createElement("a");
+      link.href = url;
+      link.download = filename;
+      document.body.appendChild(link);
+      link.click();
+      link.remove();
+      window.URL.revokeObjectURL(url);
+      message.success("Worker 安装包开始下载");
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      message.error(typeof detail === "string" ? detail : "Worker 安装包暂不可下载，请联系管理员");
+    }
+  }
+
   return (
     <Space direction="vertical" size={16} className="page">
       <Space className="toolbar">
@@ -102,6 +153,46 @@ export function WorkersPage() {
           </Button>
         ) : null}
       </Space>
+
+      <Card
+        title="普通用户接入说明"
+        extra={
+          <Button icon={<DownloadOutlined />} onClick={() => void downloadWorkerPackage()}>
+            下载 Windows Worker
+          </Button>
+        }
+      >
+        <Space direction="vertical" size={14} className="worker-guide">
+          <Alert
+            showIcon
+            type="info"
+            message="管理员创建账号后，你需要登录平台补全自己的配置，并在自己的 Windows 电脑上启动 Worker。平台负责下发任务，Worker 负责操作本机 Trae CN、采集日志和截图，再把结果回传到平台。"
+          />
+          <Row gutter={[12, 12]}>
+            {workerGuideSteps.map((item) => (
+              <Col xs={24} md={12} xl={6} key={item.title}>
+                <div className="worker-guide-step">
+                  <div className="worker-guide-index">{item.index}</div>
+                  <Typography.Text strong>{item.title}</Typography.Text>
+                  <Typography.Paragraph type="secondary">{item.description}</Typography.Paragraph>
+                </div>
+              </Col>
+            ))}
+          </Row>
+          <div className="worker-guide-command">
+            <Typography.Text type="secondary">注册命令示例</Typography.Text>
+            <pre>{`agentops-worker.exe register --server-url http://115.190.113.8 --registration-code <管理员提供的注册码> --workspace-root "D:\\agentops-workspace"`}</pre>
+          </div>
+          <Space wrap>
+            <Button icon={<SettingOutlined />}>
+              <Link to="/settings#settings-worker">打开 Worker 配置</Link>
+            </Button>
+            <Button icon={<DownloadOutlined />} onClick={() => void downloadWorkerPackage()}>
+              下载 Windows Worker 安装包
+            </Button>
+          </Space>
+        </Space>
+      </Card>
 
       {latestCode ? (
         <Alert
@@ -221,4 +312,10 @@ function commandStatusColor(status?: string) {
     return "blue";
   }
   return "default";
+}
+
+function filenameFromDisposition(disposition: string) {
+  const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
+  const value = match?.[1] || match?.[2] || "";
+  return value ? decodeURIComponent(value) : "";
 }

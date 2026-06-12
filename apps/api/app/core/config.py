@@ -22,6 +22,7 @@ class Settings(BaseSettings):
     worker_command_claim_lease_seconds: int = 60
     worker_command_run_lease_seconds: int = 120
     worker_command_max_claim_attempts: int = 3
+    worker_package_path: Path | None = None
 
     @cached_property
     def cors_origins(self) -> list[str]:

@@ -3,6 +3,7 @@ from pathlib import Path
 import re
 
 from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
@@ -66,6 +67,21 @@ def heartbeat(
 def get_workers(user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
     owner_id = None if user.role == "admin" else user.id
     return [serialize_worker(item) for item in list_workers(db, user_id=owner_id)]
+
+
+@router.get("/package")
+def download_worker_package(user: User = Depends(current_user)) -> FileResponse:
+    package = _worker_package_path()
+    if not package:
+        raise HTTPException(
+            status_code=404,
+            detail="Worker package is not available. Ask an administrator to upload or build agentops-worker-windows.zip.",
+        )
+    return FileResponse(
+        package,
+        media_type="application/zip",
+        filename=package.name,
+    )
 
 
 @router.post("/{worker_id}/commands")
@@ -354,3 +370,21 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     return path.with_name(f"{stem}-{now_utc().strftime('%Y%m%d%H%M%S%f')}{suffix}")
+
+
+def _worker_package_path() -> Path | None:
+    candidates: list[Path] = []
+    if settings.worker_package_path:
+        candidates.append(Path(settings.worker_package_path))
+    candidates.extend(
+        [
+            settings.attachment_root / "worker-packages" / "agentops-worker-windows.zip",
+            settings.repo_root / "apps" / "worker-windows" / "dist" / "agentops-worker-windows.zip",
+            settings.repo_root / "apps" / "worker-windows" / "dist" / "agentops-worker-windows" / "agentops-worker-windows.zip",
+        ]
+    )
+    for candidate in candidates:
+        path = candidate.expanduser().resolve()
+        if path.is_file():
+            return path
+    return None
