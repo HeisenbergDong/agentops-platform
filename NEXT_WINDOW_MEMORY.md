@@ -878,6 +878,7 @@ npm.cmd run build
   - 生产 Worker ZIP 大小：`27317864`。
   - 生产 Worker ZIP SHA256：`ae919e543f7a00a8f3cd46732def5ac4b1d53d99090b4dc35a790a6de8c0c606`。
   - 生产 Worker ZIP 文件头：`PK`。
+- 部署后追加记忆文件提交：`b2082d5 docs: record Trae maximize prompt deployment`，完整 commit 为 `b2082d55c8470bba7a5d64613827be64fc739678`；已同步生产 `NEXT_WINDOW_MEMORY.md` 并把 `.deploy-revision` 更正为该完整值，API health 仍正常。
 
 下一轮真实测试重点：
 - 重新下载并运行生产最新版 Worker ZIP，关闭所有旧 `agentops-worker.exe`。
