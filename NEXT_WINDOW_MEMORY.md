@@ -634,3 +634,34 @@ npm.cmd run build
 - 先确认本机只运行一个最新版 Worker。
 - 点“重开/开始作业”后，Worker 应最大化 Trae，并在命令结果中看到 `input.method=adbz_coordinate_primary`、`submit.method=adbz_send_button`。
 - 若仍未输入，优先看 `data.open_trae.window_diagnostics.foreground_hwnd/foreground_pid/windows`，判断 Trae 是否真的被切到前台。
+
+## 2026-06-12 D:\adbz Trae 操作能力部署完成记录（`5e97a23`）
+
+- 代码提交：`5e97a23 fix: use adbz Trae prompt automation`，已通过 GitHub SSH 443 push 到 `origin/main`。
+- 完整 commit：`5e97a23802a203fcadc373a6086aa2d54a72a083`。
+- 本轮继续部署到发布目录 `/opt/agentops-platform`，不是 git 仓库。
+- 上传目录：`/tmp/agentops-deploy-5e97a23/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260612-5e97a23/`。
+- 生产 `.deploy-revision`：`5e97a23802a203fcadc373a6086aa2d54a72a083`。
+- 已同步到生产：
+  - Worker 源码包含 `adbz_coordinate_primary`、`adbz_send_button`、`SW_MAXIMIZE`、`foreground_pid`。
+  - 新版 Worker ZIP 已覆盖到 `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+  - Web dist 仍为 `/assets/index-Cy1tcbtz.js` 和 `/assets/index-DFn3rpGU.css`。
+- 部署过程注意：
+  - 第一次远端部署脚本生成失败，因为本机 PowerShell 不支持 `-Encoding UTF8NoBOM`，未覆盖生产。
+  - 第二次部署实际完成覆盖和重启，但脚本末尾因 CRLF 导致 `cat .deploy-revision` 路径带 `\r`，返回失败码。
+  - 已通过 `tr -d '\015'` 清理远端脚本后重跑成功。
+- 线上验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 公网 `http://115.190.113.8/api/health` 返回正常。
+  - 生产 Worker ZIP 大小：`27291367`，文件头：`PK`。
+
+下一轮真实测试重点：
+- 必须下载/运行本轮最新 Worker ZIP；旧 Worker 不会有 `adbz_send_button`。
+- 测试前关闭旧 Worker 进程，只保留一个最新版 `agentops-worker.exe`。
+- 若仍未输入，优先看 Worker 命令结果：
+  - `data.input.method` 应为 `adbz_coordinate_primary`。
+  - `data.submit.method` 应为 `adbz_send_button`。
+  - `data.open_trae.window_diagnostics.foreground_hwnd/foreground_pid/windows` 用来判断 Trae 是否真在前台。
