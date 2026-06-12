@@ -302,3 +302,69 @@ npm.cmd run build
 注意：
 
 - 本轮没有实际替用户点击 Trae 跑真实作业；真实场景还需要用户继续人工跑一轮验证输入框定位是否命中。如果仍有问题，优先看 Worker 命令返回里的 `data.input` 字段：`method`、`candidate`、`click_x/click_y`。
+
+## 2026-06-12 手工测试反馈后修复记录
+
+用户手工测试反馈：
+
+1. Worker 仍然没有找到 Trae 左下 SOLO Agent 输入框。
+2. 打开 Worker 后会直接打开 Trae CN；期望只有开始作业时才打开。
+3. Dashboard 点“重开”会卡住。
+4. 需要确认 Worker 是否具备滚动 Trae 左侧回复栏、寻找运行/删除/保留等自动干预能力。
+
+已完成代码改动：
+
+- `apps/worker-windows/worker/config.py`
+  - `auto_launch_trae_on_startup` 默认从 `true` 改为 `false`。
+- `apps/worker-windows/worker/main.py`
+  - 即使旧配置里残留 `auto_launch_trae_on_startup=true`，启动 Worker 时也不会再自动拉起 Trae；仅记录日志说明 Trae 会在作业命令到达时打开。
+- `apps/worker-windows/worker/registration.py`
+  - 新注册/重注册写入配置时强制 `auto_launch_trae_on_startup=false`，避免旧配置继续继承自动启动行为。
+- `apps/worker-windows/worker/trae/prompt.py`
+  - `send_prompt()` 输入定位改为优先点击 Trae 左下 SOLO Agent 聊天输入区：窗口宽度 26%、高度 89.5%。
+  - UIA `Edit/Document` 候选降为兜底，并加严格几何过滤：只接受左侧底部聊天区域，排除中间编辑器和右侧资源管理器。
+  - 命令结果里的 `data.input` 会返回 `method=solo_coordinate_primary`、点击坐标和目标区域，便于下一轮真实测试定位问题。
+- `apps/worker-windows/worker/trae/intervene.py`
+  - 自动“继续”文本不再往当前焦点直接粘贴，而是复用 `send_prompt("继续")`，明确发到左下聊天输入框。
+  - 终端类确认输入仍保留当前焦点策略，用于 npm/create-vite 等命令行确认。
+- `apps/api/app/api/jobs.py`
+  - `/jobs/reopen` 改为快速返回：同步完成重置、取消旧命令、写日志，然后通过 FastAPI `BackgroundTasks` 后台继续生成 prompt 和派发 Worker。
+  - 保留测试用同步执行路径，后台实际执行时会用新的数据库 Session。
+- 测试补充：
+  - Worker 启动不自动拉起 Trae。
+  - prompt 输入优先命中 SOLO Agent 左下输入区。
+  - UIA 候选排除编辑器/右侧栏。
+  - “继续”干预走聊天输入框。
+  - `/jobs/reopen` 带 background task 时不会同步调用 prompt 生成。
+
+已验证：
+
+- Worker 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`71 passed, 2 warnings`
+- API 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`88 passed, 3 warnings`
+- Web 构建：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过；仍有 Vite chunk size warning。
+- Windows Worker 打包：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功；期间 pip 出现一次 PyPI read timeout retry，但未阻塞。
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27283528`
+
+能力确认：
+
+- Worker 已有 Trae 左侧回复栏滚动能力：`scroll_assistant_to_bottom()` 会优先按左侧回复区坐标滚动，再尝试 UIA scrollable 控件。
+- Worker 已有安全自动干预：继续、继续生成、确认、运行/仍要运行、执行、保留、保存。
+- 删除、清空、重置、取消、放弃、Discard/Delete/Remove 等仍被列为不安全按钮，当前不会自动点击，这是刻意保守策略。
+
+仍需真实验证：
+
+- 本轮依旧无法在用户本机替用户真实点击 Trae 跑作业；部署后需要用户再跑一轮。
+- 如果仍然没有命中输入框，优先看 Worker 命令返回 `data.input.method/click_x/click_y/click_ratio`，以及 Trae 当前窗口尺寸是否和截图一致。

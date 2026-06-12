@@ -151,6 +151,51 @@ def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
     assert runner.settings is settings
 
 
+def test_run_forever_does_not_auto_launch_trae_on_startup(monkeypatch, tmp_path):
+    settings = worker_main.WorkerSettings(
+        server_url="http://server",
+        token="token",
+        worker_id="worker1",
+        trae_exe_path=tmp_path / "Trae.exe",
+        workspace_root=tmp_path,
+        auto_launch_trae_on_startup=True,
+        poll_interval_seconds=0,
+    )
+    calls = {"launch": 0, "run_once": 0}
+
+    class FakeClient:
+        def __init__(self, server_url, token):
+            self.server_url = server_url
+            self.token = token
+
+    class FakeRunner:
+        state = type(
+            "State",
+            (),
+            {
+                "stage": "idle",
+                "current_window_title": "",
+                "busy": False,
+                "current_lease_id": "",
+            },
+        )()
+        cancellation_checker = None
+
+    def fake_run_once(client, runner, worker_settings):
+        calls["run_once"] += 1
+        raise KeyboardInterrupt
+
+    monkeypatch.setattr(worker_main, "WorkerClient", FakeClient)
+    monkeypatch.setattr(worker_main, "create_command_runner", lambda worker_settings: FakeRunner())
+    monkeypatch.setattr(worker_main, "attach_cancellation_checker", lambda runner, client, worker_settings: None)
+    monkeypatch.setattr(worker_main, "try_auto_launch_trae", lambda runner: calls.__setitem__("launch", calls["launch"] + 1))
+    monkeypatch.setattr(worker_main, "run_once", fake_run_once)
+
+    worker_main.run_forever(settings)
+
+    assert calls == {"launch": 0, "run_once": 1}
+
+
 def test_run_once_skips_stale_lease_after_ack(tmp_path: Path):
     command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
     client = FakeClient(commands=[command], ack_response={**command, "status": "stale_lease"})

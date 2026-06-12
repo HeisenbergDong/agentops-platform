@@ -6,7 +6,7 @@ from typing import Any
 
 from worker.system.clipboard import ClipboardError, set_clipboard_text
 from worker.trae.diagnose import diagnose_ui
-from worker.trae.prompt import _send_keys
+from worker.trae.prompt import send_prompt, _send_keys
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 CONTINUE_MARKERS = (
@@ -78,7 +78,14 @@ def apply_intervention(intervention: dict[str, Any], timeout_seconds: float = 10
     if mode == "terminal-input":
         return send_text_to_trae(str(intervention.get("text") or "y"), submit=True)
     if mode == "continue-text":
-        return send_text_to_trae(str(intervention.get("text") or "\u7ee7\u7eed"), submit=True)
+        text = str(intervention.get("text") or "\u7ee7\u7eed")
+        result = send_prompt(text, submit=True)
+        return {
+            "status": "applied",
+            "mode": "continue-text",
+            "text": text,
+            "input": result.get("input") or {},
+        }
     if mode == "primary-fallback":
         return click_primary_fallback()
     raise TraeAutomationError(f"Unsupported Trae intervention mode: {mode}")

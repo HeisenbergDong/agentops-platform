@@ -287,7 +287,7 @@ def test_reopen_job_resets_current_job_rounds_counts_and_runtime(monkeypatch):
     monkeypatch.setattr(jobs_api, "generate_round_prompt", fake_generate)
     monkeypatch.setattr(jobs_api, "dispatch_prompt_to_worker", lambda *_args, **_kwargs: None)
 
-    result = reopen_job(StartJobRequest(directions=["new scope"]), user=user, db=db)
+    result = reopen_job(StartJobRequest(directions=["new scope"]), background_tasks=None, user=user, db=db)
 
     db.refresh(job)
     new_rounds = list(db.scalars(select(TaskRound).where(TaskRound.job_id == job.id)).all())
@@ -317,6 +317,61 @@ def test_reopen_job_resets_current_job_rounds_counts_and_runtime(monkeypatch):
     assert reset_log is not None
     assert reset_log.extra["old_rounds"] == 1
     assert reset_log.extra["cancelled_active_commands"] == 1
+
+
+def test_reopen_job_with_background_task_returns_before_prompt_generation(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+    job = Job(
+        id="job1",
+        user_id=user.id,
+        status=JobState.MANUAL_REQUIRED,
+        directions=["old scope"],
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        round_index=3,
+        status=JobState.MANUAL_REQUIRED,
+        prompt="old prompt",
+    )
+    db.add_all([job, round_])
+    db.commit()
+
+    class FakeBackgroundTasks:
+        def __init__(self):
+            self.tasks = []
+
+        def add_task(self, func, *args, **kwargs):
+            self.tasks.append((func, args, kwargs))
+
+    background = FakeBackgroundTasks()
+    calls = {"generate": 0}
+
+    def fake_generate(*_args, **_kwargs):
+        calls["generate"] += 1
+        raise AssertionError("prompt generation should be deferred")
+
+    monkeypatch.setattr(jobs_api, "generate_round_prompt", fake_generate)
+
+    result = reopen_job(
+        StartJobRequest(directions=["new scope"]),
+        background_tasks=background,
+        user=user,
+        db=db,
+    )
+
+    db.refresh(job)
+    new_round = db.scalar(select(TaskRound).where(TaskRound.job_id == job.id))
+    assert calls["generate"] == 0
+    assert len(background.tasks) == 1
+    assert background.tasks[0][0] is jobs_api.generate_and_dispatch_reopened_round
+    assert background.tasks[0][1] == (user.id, job.id, new_round.id)
+    assert result["status"] == JobState.GENERATING_PROMPT
+    assert result["message"] == "Reopen reset complete; prompt generation is running in the background."
+    assert new_round.prompt == ""
 
 
 def test_prompt_quality_rejects_duplicate_recent_prompt():

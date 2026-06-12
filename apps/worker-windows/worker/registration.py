@@ -63,7 +63,7 @@ def register_worker(options: RegistrationOptions) -> tuple[WorkerSettings, Path,
         workspace_root=options.workspace_root or current.workspace_root,
         browser_url=current.browser_url,
         poll_interval_seconds=options.poll_interval_seconds or current.poll_interval_seconds,
-        auto_launch_trae_on_startup=current.auto_launch_trae_on_startup,
+        auto_launch_trae_on_startup=False,
     )
     saved_path = save_worker_settings(updated, options.config_path)
     return updated, saved_path, response

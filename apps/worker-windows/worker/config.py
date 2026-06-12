@@ -21,7 +21,7 @@ class WorkerSettings(BaseSettings):
     workspace_root: Path = Path(r"D:\code-space\coding-soler")
     browser_url: str = ""
     poll_interval_seconds: float = 3.0
-    auto_launch_trae_on_startup: bool = True
+    auto_launch_trae_on_startup: bool = False
     keep_trae_foreground: bool = True
 
 

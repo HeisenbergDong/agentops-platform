@@ -7,9 +7,14 @@ from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 PROMPT_INPUT_X_RATIO = 0.26
 PROMPT_INPUT_Y_RATIO = 0.88
+SOLO_INPUT_CENTER_X_RATIO = 0.26
+SOLO_INPUT_CENTER_Y_RATIO = 0.895
+SOLO_INPUT_LEFT_MAX_RATIO = 0.40
+SOLO_INPUT_TOP_MIN_RATIO = 0.70
+SOLO_INPUT_BOTTOM_MAX_RATIO = 0.985
 PROMPT_INPUT_MIN_WIDTH = 80
 PROMPT_INPUT_MIN_HEIGHT = 12
-PROMPT_INPUT_CANDIDATE_LIMIT = 3
+PROMPT_INPUT_CANDIDATE_LIMIT = 2
 PROMPT_INPUT_NAME_MARKERS = (
     "ask",
     "chat",
@@ -61,6 +66,10 @@ def send_prompt(prompt: str, submit: bool = True, submit_hotkey: str = "{ENTER}"
 
 def _focus_prompt_input(window: Any) -> dict:
     window_rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
+    solo_result = _click_solo_prompt_area(window_rect)
+    if solo_result.get("status") == "clicked":
+        return solo_result
+
     candidates = _prompt_input_candidates(window, window_rect)
     errors: list[str] = []
     for candidate in candidates[:PROMPT_INPUT_CANDIDATE_LIMIT]:
@@ -155,7 +164,11 @@ def _candidate_score(summary: dict[str, Any], window_rect: tuple[int, int, int, 
 
     if y_ratio < 0.5:
         return 0
-    if x_ratio > 0.72:
+    if y_ratio < SOLO_INPUT_TOP_MIN_RATIO or y_ratio > SOLO_INPUT_BOTTOM_MAX_RATIO:
+        return 0
+    if x_ratio > SOLO_INPUT_LEFT_MAX_RATIO:
+        return 0
+    if int(summary.get("center_x") or 0) > left + window_width * SOLO_INPUT_LEFT_MAX_RATIO:
         return 0
     if int(summary.get("height") or 0) > window_height * 0.25:
         return 0
@@ -169,9 +182,9 @@ def _candidate_score(summary: dict[str, Any], window_rect: tuple[int, int, int, 
         score += 2
     if has_prompt_name:
         score += 3
-    if 0.02 <= x_ratio <= 0.55:
+    if 0.02 <= x_ratio <= SOLO_INPUT_LEFT_MAX_RATIO:
         score += 3
-    elif x_ratio <= 0.72:
+    elif x_ratio <= 0.55:
         score += 1
     if int(summary.get("width") or 0) >= window_width * 0.15:
         score += 1
@@ -216,6 +229,33 @@ def _click_legacy_prompt_point(window_rect: tuple[int, int, int, int] | None) ->
         "click_x": x,
         "click_y": y,
         "click_ratio": {"x": PROMPT_INPUT_X_RATIO, "y": PROMPT_INPUT_Y_RATIO},
+    }
+
+
+def _click_solo_prompt_area(window_rect: tuple[int, int, int, int] | None) -> dict:
+    if not window_rect:
+        return {"status": "not_clicked", "method": "solo_coordinate_primary", "reason": "missing_window_rect"}
+    left, top, right, bottom = window_rect
+    width = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        return {"status": "not_clicked", "method": "solo_coordinate_primary", "reason": "invalid_window_rect"}
+    x = int(left + width * SOLO_INPUT_CENTER_X_RATIO)
+    y = int(top + height * SOLO_INPUT_CENTER_Y_RATIO)
+    _mouse_click(x, y)
+    time.sleep(0.2)
+    return {
+        "status": "clicked",
+        "method": "solo_coordinate_primary",
+        "window_rect": _rect_dict(window_rect),
+        "click_x": x,
+        "click_y": y,
+        "click_ratio": {"x": SOLO_INPUT_CENTER_X_RATIO, "y": SOLO_INPUT_CENTER_Y_RATIO},
+        "target_region": {
+            "left_max_ratio": SOLO_INPUT_LEFT_MAX_RATIO,
+            "top_min_ratio": SOLO_INPUT_TOP_MIN_RATIO,
+            "bottom_max_ratio": SOLO_INPUT_BOTTOM_MAX_RATIO,
+        },
     }
 
 

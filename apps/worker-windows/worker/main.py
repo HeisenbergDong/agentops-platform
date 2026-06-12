@@ -101,7 +101,7 @@ def run_forever(worker_settings: WorkerSettings | None = None) -> None:
     runner = create_command_runner(worker_settings)
     attach_cancellation_checker(runner, client, worker_settings)
     if worker_settings.auto_launch_trae_on_startup:
-        try_auto_launch_trae(runner)
+        log("Trae startup auto-launch is disabled; Trae will open only when a job command arrives.")
     last_idle_log_at = 0.0
     while True:
         try:

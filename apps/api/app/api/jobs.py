@@ -1,13 +1,13 @@
 from datetime import timedelta
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi import Depends
 from pydantic import BaseModel
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
-from app.db.models import Attachment, Job, RuntimeLog, User, WorkerCommand
+from app.db.models import Attachment, Job, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import (
     add_log,
@@ -22,7 +22,7 @@ from app.db.repositories.jobs import (
 )
 from app.db.repositories.rules import active_rule_version
 from app.db.repositories.workers import create_worker_command, expire_worker_command_leases, get_worker_by_worker_id
-from app.db.session import get_db
+from app.db.session import SessionLocal, get_db
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
@@ -133,7 +133,12 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
 
 
 @router.post("/reopen")
-def reopen_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
+def reopen_job(
+    payload: StartJobRequest,
+    background_tasks: BackgroundTasks,
+    user: User = Depends(current_user),
+    db: Session = Depends(get_db),
+) -> dict:
     directions = [item.strip() for item in payload.directions if item.strip()]
     if not directions:
         raise HTTPException(status_code=400, detail="At least one direction is required")
@@ -212,8 +217,39 @@ def reopen_job(payload: StartJobRequest, user: User = Depends(current_user), db:
         job_id=job.id,
         round_id=round_.id,
         stage=JobState.GENERATING_PROMPT,
-        message="Prompt generation is starting from round 1 with the latest directions.",
+        message="Prompt generation will continue in the background from round 1 with the latest directions.",
     )
+    db.commit()
+    db.refresh(job)
+    if background_tasks is not None:
+        background_tasks.add_task(generate_and_dispatch_reopened_round, user.id, job.id, round_.id)
+        result = serialize_job(db, job)
+        result["message"] = "Reopen reset complete; prompt generation is running in the background."
+        return result
+
+    generate_and_dispatch_reopened_round_in_session(db, user.id, job.id, round_.id)
+    db.refresh(job)
+    return serialize_job(db, job)
+
+
+def generate_and_dispatch_reopened_round(user_id: str, job_id: str, round_id: str) -> None:
+    with SessionLocal() as db:
+        generate_and_dispatch_reopened_round_in_session(db, user_id, job_id, round_id)
+
+
+def generate_and_dispatch_reopened_round_in_session(
+    db: Session,
+    user_id: str,
+    job_id: str,
+    round_id: str,
+) -> None:
+    user = db.get(User, user_id)
+    job = db.get(Job, job_id)
+    round_ = db.get(TaskRound, round_id)
+    if not user or not job or not round_:
+        return
+    if job.status in {JobState.STOPPED, JobState.PROJECT_COMPLETED}:
+        return
     try:
         generate_round_prompt(db, user, job, round_)
     except PromptGenerationError as exc:
@@ -224,8 +260,6 @@ def reopen_job(payload: StartJobRequest, user: User = Depends(current_user), db:
         except WorkerDispatchError as exc:
             mark_worker_dispatch_failed(db, job, round_, str(exc))
     db.commit()
-    db.refresh(job)
-    return serialize_job(db, job)
 
 
 @router.post("/continue")
