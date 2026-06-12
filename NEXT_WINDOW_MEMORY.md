@@ -924,3 +924,30 @@ npm.cmd run build
 - commit/push GitHub
 - 部署生产：API 源码、Web dist、新 Worker ZIP。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+## 2026-06-13 Trae 完成闸门与方向队列修复部署完成记录
+
+- 代码提交：`95038fb fix: gate Trae completion and expand job directions`，完整 commit 为 `95038fba973015979012cbd3c63c26d64ca96509`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-95038fb/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-014246-95038fb`。
+- 已同步到生产：
+  - API 源码：`jobs.py`、`prompt_writer.py`、新增 `directions.py` 等。
+  - Worker 源码：`wait.py`、`trace_copy.py`、`command_runner.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision`：`95038fba973015979012cbd3c63c26d64ca96509`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - `curl http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产 Worker ZIP 大小：`27320216`。
+  - 生产 Worker ZIP SHA256：`9fb74bc8da2cb59c1a5043a5c9f2ff7166ff29d729e05c8efe1b4a307ab1047a`。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新 Worker ZIP，旧 Worker 不包含这次完成闸门和窗口保持修复。
+- 测试前关闭旧的 `agentops-worker.exe`，只保留一个最新 Worker。
+- 如果 Trae 仍在执行中，Dashboard 不应再出现提前进入复制回复的日志；应继续等待或进入继续/保留干预。
+- 过程中 Trae 不应再被复制回复滚动步骤还原成非全屏。
+- 多项目范围可以粘贴成多行或编号列表；后端会拆分并扩展为约 20 个项目方向，按每项目最多 5 轮去覆盖 100 轮目标。
