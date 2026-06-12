@@ -1,0 +1,282 @@
+# AgentOps Platform Next Window Memory
+
+更新时间：2026-06-12
+
+## 项目目标
+
+把服务器上的 `HeisenbergDong/agentops-platform` 逐步补齐到能完整实现本地 `D:\adbz` 项目的自动化能力。核心形态是“多角色 LLM + Windows Worker 自动作业平台”：
+
+- 服务端负责作业、配置、调度、状态、日志、附件、GitHub/飞书链路。
+- Windows Worker 负责控制本机 Trae CN、创建/操作项目、采集回复 trace、截图、验收、提交 GitHub。
+
+## 当前仓库
+
+- 本地路径：`D:\code-space\auto-tool\agentops-platform`
+- GitHub：`git@github.com:HeisenbergDong/agentops-platform.git`
+- 当前分支：`main`
+- 最近已推送提交：
+  - `ac415a1 fix: resolve worker package download path`
+  - `45448de feat: add worker user onboarding guide`
+  - `12cd80c feat: harden worker service and automation loop`
+  - `e37f3f4 feat: recover stale worker command leases`
+  - `54ee63e feat: hot sync worker runtime config`
+
+## 当前工作区状态
+
+当前有未提交改动，功能是“作业重开”：
+
+- `apps/api/app/api/jobs.py`
+- `apps/api/app/api/workers.py`
+- `apps/api/app/db/repositories/jobs.py`
+- `apps/api/tests/test_preflight.py`
+- `apps/web/src/pages/Dashboard/DashboardPage.tsx`
+
+这批改动已经本地验证通过，但还没有 commit、push、部署。
+
+## 本轮刚完成的需求：作业“重开”
+
+用户补充需求：
+
+> 开始、继续、停止，额外加个重开。重开就是清空轮次、当前条计数，并且按最新需求范围从零开始。
+
+实现结果：
+
+- 后端新增 `POST /jobs/reopen`。
+- 重开保留当前 `Job` 记录，不新建 job。
+- 用前端输入框里的最新作业范围覆盖 `job.directions`。
+- 重置 `submitted_count = 0`、`satisfied_count = 0`。
+- 删除旧轮次、旧项目、旧运行日志、旧附件、旧错误、旧 queued worker commands。
+- 对已经被 Worker 拿走的 `claimed/running` 命令：标记 `cancelled`，并从当前 job/round 解绑，便于 Worker 查询到取消状态后停止，同时避免旧结果污染新作业。
+- 如果存在旧 active Worker 命令，会额外排一个 `stop_current_task` 命令，payload reason 为 `user_reopen`。
+- 重建第 1 轮 `TaskRound(round_index=1)`，重新生成 prompt，并在 prompt ready 后派发 Worker。
+- Worker 日志入口加了 stale command context 保护：旧命令解绑后返回的日志不会再挂到重开的新轮次上。
+
+前端结果：
+
+- Dashboard 作业控制台现在是四个按钮：`开始`、`继续`、`停止`、`重开`。
+- `开始` 只表示创建新作业；如果已有运行中作业，会弹窗说明这是新作业，并提示如果要保留当前作业条目应点“重开”。
+- `重开` 是独立危险操作按钮，会弹窗说明将清空当前作业轮次、提交/满意计数和运行记录，并按上方最新作业范围从第 1 轮重新开始。
+- 输入框在用户未手动编辑前，会同步当前 job 的 `directions`，避免默认范围误触。
+
+新增测试：
+
+- `apps/api/tests/test_preflight.py::test_reopen_job_resets_current_job_rounds_counts_and_runtime`
+- 覆盖同一个 job 重开后计数归零、新 round 为 1、旧项目/日志/附件/错误/queued 命令清理、running 命令取消解绑、stop 命令排队。
+
+验证已通过：
+
+- API 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`87 passed`
+- Web 构建：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过
+  - 注意：PowerShell 直接跑 `npm run build` 会被执行策略拦截，使用 `npm.cmd run build`。
+
+## 已完成的重要能力
+
+### Worker 配置热同步
+
+- 服务端 heartbeat 返回 `assigned_config`。
+- Worker 动态应用：
+  - `trae_workspace_path` -> `worker_settings.workspace_root`
+  - `browser_url` -> `worker_settings.browser_url`
+- 只更新内存，不覆盖本地 token/注册文件。
+- 命令 payload 仍然优先。
+
+### Worker command lease / 崩溃恢复
+
+- 增加字段：
+  - `worker_commands.lease_id`
+  - `worker_commands.lease_expires_at`
+- migration：
+  - `apps/api/migrations/versions/0010_worker_command_leases.py`
+- 行为：
+  - `queued -> claimed` 时生成 claim lease。
+  - ack 必须带 claim lease，成功后旋转成 running lease。
+  - Worker 执行中查询命令状态时带 running lease，并自动续租。
+  - claimed lease 过期会回到 queued 重派；超过最大 claim 次数后 failed。
+  - running lease 过期会取消命令，并把 job/round 标记为 manual_required，避免盲目重跑已产生副作用的任务。
+  - stale lease 的 ack/result 会被服务端忽略，Worker 也会跳过执行。
+
+### Worker 已补能力
+
+- 当前轮次 trace gate：防旧回复、识别当前轮次、旧回复过滤。
+- UI 复制与本地日志探测结合采集 Trae trace。
+- 自动干预：继续、确认、运行、保留、保存，以及 npm/create/vite、长时间无输出、服务中断等场景的基础处理。
+- 截图：默认 Trae 窗口截图，带截图质量校验，避免整屏空图。
+- 附件上传链路：Worker 截图结果会上传服务端并绑定 job/round。
+- 新项目目录命名：服务端根据 prompt/方向生成英文项目名，并作为 workspace/GitHub repo 名上下文下发。
+
+### Windows Worker 服务化
+
+- 已补齐 Windows Service / 开机服务 / 守护 / 日志轮转相关脚本和 README。
+- 但真实 Trae CN GUI 自动化主方案仍应是“交互式登录计划任务”，因为 Windows Service 通常运行在 Session 0，不能可靠控制桌面 GUI。
+- Windows Service 方案用于 SCM/开机服务/守护能力，不作为 Trae GUI 主路径。
+
+### Worker 用户说明和下载
+
+- 已在前端 Workers 页增加面向“被管理员分配账号的普通用户”的操作说明。
+- 说明覆盖：登录、配置个人设置、注册/绑定 Worker、运行 Worker、排障。
+- 已增加 Worker 打包文件下载链路。
+- 线上 worker zip 路径：
+  - `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`
+
+## 部署上下文
+
+生产服务器：
+
+- SSH key：`D:\code-space\auto-tool\yunkaida-test.pem`
+- SSH：
+  - `ssh -i D:\code-space\auto-tool\yunkaida-test.pem root@115.190.113.8`
+- 生产目录：
+  - `/opt/agentops-platform`
+- API：
+  - systemd service：`agentops-api`
+  - working directory：`/opt/agentops-platform/apps/api`
+- Web：
+  - nginx serving：`/opt/agentops-platform/apps/web/dist`
+- Postgres/Redis：
+  - Docker Compose only
+- 健康检查：
+  - `http://115.190.113.8/api/health`
+- Worker 包下载之前已验证：
+  - 登录后 `GET /api/workers/package`
+  - 返回 `200`
+  - zip header 为 `PK`
+
+GitHub push 可能受 22 端口影响，必要时使用：
+
+```powershell
+git -c core.sshCommand="ssh -o Hostname=ssh.github.com -p 443 -o StrictHostKeyChecking=accept-new" push origin main
+```
+
+## 常用测试命令
+
+API：
+
+```powershell
+cd D:\code-space\auto-tool\agentops-platform\apps\api
+..\worker-windows\.venv\Scripts\python -m pytest tests
+```
+
+Worker：
+
+```powershell
+cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows
+.\.venv\Scripts\python -m pytest tests
+```
+
+Web：
+
+```powershell
+cd D:\code-space\auto-tool\agentops-platform\apps\web
+npm.cmd run build
+```
+
+## 用户硬指标 / 工作约束
+
+- 每次改动都要更新本记忆文件，记录做了什么、验证结果、未完成事项。
+- 每次改代码都要提交并 push 到 GitHub，然后部署到生产服务器。
+- 如果只是线上数据/配置修复且没有代码改动，也要写入本记忆文件；无需强行 commit/push/deploy 代码。
+
+## 2026-06-12 线上配置修复：MR.D GitHub Token
+
+问题：
+
+- 用户反馈 MR.D Dashboard 预检里 GitHub Token 仍显示未配置。
+- 原因是第一次手动写入 MR.D `github.token` 时，没有加载生产 `/opt/agentops-platform/.env`，脚本使用了默认 `APP_SECRET_KEY=change-me` 加密。
+- 线上 `agentops-api` 服务实际通过 systemd `EnvironmentFile=/opt/agentops-platform/.env` 加载 64 位 `APP_SECRET_KEY`，因此运行时无法解开第一次写入的 token。
+
+处理：
+
+- 已重新用生产服务同一环境写入：
+  - 先加载 `/opt/agentops-platform/.env`
+  - 再调用服务端 `save_user_settings()` 写入 `mr.d@handsome.com` 的 `github.token`
+  - token 通过 root-only 临时文件传递，写入后确认 `/tmp/mrd_github_token` 不存在
+- 验证结果：
+  - `public_user_settings()["github"]["token_configured"] == True`
+  - `github_token_mask == ghp_********`
+  - token 明文长度为 40
+  - `build_preflight()` 中 `github.token` 状态为 `pass`
+  - `preflight_warnings=[]`
+- 如果浏览器仍显示旧的 GitHub Token 提醒，刷新 Dashboard 或点“刷新”按钮即可重新拉取预检。
+
+## 下一步建议
+
+如果用户说“提交并部署”，按这个顺序继续：
+
+1. `git diff` 快速复核本轮重开改动。
+2. `git add` 上述 5 个改动文件和本记忆文件（如果用户希望保留）。
+3. commit，建议信息：`feat: reopen current job from latest scope`
+4. push；如 22 端口失败，使用 GitHub SSH 443 命令。
+5. 部署到服务器：
+   - 拉最新代码到 `/opt/agentops-platform`
+   - API 迁移如无新 migration 可跳过 alembic，但仍建议 restart `agentops-api`
+   - Web 重新 build 并让 nginx 继续服务 dist
+6. 线上验证：
+   - `/api/health`
+   - 登录后 Dashboard 是否出现 `开始 / 继续 / 停止 / 重开`
+   - 可用一条测试 job 验证 `/api/jobs/reopen` 返回新 round_index 为 1，计数归零。
+
+## 仍待继续的方向
+
+从“与 `D:\adbz` 对齐”角度继续补：
+
+- Worker 与服务器长期在线状态、异常恢复、日志更细粒度上报。
+- Trae trace 采集是否足够接近 `D:\adbz`，尤其极端 UI 场景。
+- 自动干预场景是否覆盖更多 Trae/终端/浏览器提示。
+- GitHub repo 创建、远端推送、分支/凭据失败恢复。
+- 飞书写入链路真实端到端测试。
+- 全量真实作业跑通，然后按实际报错逐个修。
+
+## 2026-06-12 本轮真实场景问题修复记录（进行中）
+
+用户反馈并要求按顺序修：
+
+1. Worker 没能找到 Trae 输入框输入指令。
+2. Worker 执行时应尽量保持 Trae 在前台，方便用户直接看 Trae 进度；不应让流程结束后停留在网页端。
+3. Dashboard 全过程反馈日志不自动滚动。
+
+已完成代码改动：
+
+- `apps/worker-windows/worker/trae/prompt.py`
+  - `send_prompt()` 发送前会先聚焦 Trae，再尝试定位底部 `Edit/Document` 输入控件并点击。
+  - 若 UIA 找不到可用输入控件，则按旧 `D:\adbz` 项目稳定点位策略兜底：Trae 窗口宽度 26%、高度 88% 处点击输入区。
+  - 粘贴前新增 `Ctrl+A` + `Backspace` 清空输入区，避免残留文本。
+- `apps/worker-windows/worker/config.py`
+  - 新增 `keep_trae_foreground: true` 默认配置。
+- `apps/worker-windows/worker/runtime/command_runner.py`
+  - `browser_acceptance` 结束后尝试把 Trae 拉回前台，并把 `trae_foreground` 结果写入命令返回。
+- `apps/web/src/pages/Dashboard/DashboardPage.tsx`
+  - 给过程日志面板加 `ref`，当最新日志变化时滚动到 `scrollHeight`。
+
+待完成：
+
+- 补 Worker 单元测试。
+- 跑 Worker 测试、Web build，必要时跑 API 测试。
+- 重打 Windows Worker zip。
+- commit/push GitHub 并部署生产。
+
+已验证：
+
+- Worker 测试：`apps/worker-windows` 下 `.\.venv\Scripts\python -m pytest tests`，结果 `67 passed, 2 warnings`。
+- Web 构建：`apps/web` 下 `npm.cmd run build`，通过；仅有 Vite chunk size warning。
+- API 测试：`apps/api` 下 `..\worker-windows\.venv\Scripts\python -m pytest tests`，结果 `87 passed, 3 warnings`。
+- Windows Worker 打包：PowerShell 默认策略阻止直接运行脚本，改用 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean` 成功。
+  - 新 EXE：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows\agentops-worker.exe`
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+
+剩余待完成：
+
+- commit/push GitHub。
+- 部署生产：拉取代码、重启 API、更新 Web dist、上传新版 Worker ZIP。
+
+## 2026-06-12 最终复核补记
+
+- 收紧 Trae 输入候选逻辑后，已重新跑 Worker 测试：`67 passed, 2 warnings`。
+- 已重新执行 `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`，最终 Worker ZIP 已更新。
+- 打包期间 pip 曾出现一次 PyPI read timeout retry，但构建成功，未阻塞。
+- 提交前又收紧 UIA 输入候选：偏右、过高、过宽且不像 prompt/message/input/send 的控件不再被当作 Trae 输入框，降低误点代码编辑区风险；随后 Worker 测试仍通过，并再次重打最终 Worker ZIP。

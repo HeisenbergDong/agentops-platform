@@ -22,6 +22,7 @@ class WorkerSettings(BaseSettings):
     browser_url: str = ""
     poll_interval_seconds: float = 3.0
     auto_launch_trae_on_startup: bool = True
+    keep_trae_foreground: bool = True
 
 
 def default_config_path() -> Path:

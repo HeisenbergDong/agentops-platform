@@ -9,7 +9,7 @@ import {
 } from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
 import { Button, Card, Input, Modal, Space, Tag, Tooltip, Typography, message } from "antd";
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
 
@@ -87,6 +87,7 @@ type PreflightCheck = {
 
 export function DashboardPage() {
   const navigate = useNavigate();
+  const logPanelRef = useRef<HTMLDivElement | null>(null);
   const [directions, setDirections] = useState("AgentOps 自动作业平台");
   const [directionsTouched, setDirectionsTouched] = useState(false);
   const [busy, setBusy] = useState<"start" | "continue" | "stop" | "reopen" | "">("");
@@ -104,6 +105,7 @@ export function DashboardPage() {
   const job = current.data?.job || null;
   const round = current.data?.round || null;
   const logs = current.data?.logs || [];
+  const latestLogId = logs.length ? logs[logs.length - 1].id : "";
   const status = job?.status || current.data?.status || "idle";
   const currentJobDirections = job?.directions?.join("\n") || "";
   const preflightData = preflight.data;
@@ -128,6 +130,14 @@ export function DashboardPage() {
       setDirections(currentJobDirections);
     }
   }, [directionsTouched, currentJobDirections]);
+
+  useEffect(() => {
+    const panel = logPanelRef.current;
+    if (!panel) return;
+    window.requestAnimationFrame(() => {
+      panel.scrollTop = panel.scrollHeight;
+    });
+  }, [latestLogId, logs.length]);
 
   async function runAction(action: "start" | "continue" | "stop" | "reopen") {
     setBusy(action);
@@ -284,7 +294,7 @@ export function DashboardPage() {
       </Card>
 
       <Card className="dashboard-card process-card" title="全过程反馈日志">
-        <div className="process-log-panel">
+        <div ref={logPanelRef} className="process-log-panel">
           {logs.length ? (
             logs.map((item) => (
               <div key={item.id} className={`process-log-line ${item.level}`}>

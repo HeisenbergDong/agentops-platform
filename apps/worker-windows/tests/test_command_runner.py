@@ -304,6 +304,11 @@ def test_browser_acceptance_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_
     workspace.mkdir()
     received = {}
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
+    monkeypatch.setattr(
+        command_runner,
+        "focus_trae",
+        lambda timeout_seconds=1.0: {"status": "focused", "window_title": "Trae CN"},
+    )
 
     def fake_browser_acceptance(project_path: str, url: str, timeout_seconds: float, cancellation_check=None):
         received["project_path"] = project_path
@@ -324,6 +329,7 @@ def test_browser_acceptance_routes_payload(monkeypatch: pytest.MonkeyPatch, tmp_
 
     assert result["status"] == "success"
     assert result["data"]["status"] == "passed"
+    assert result["data"]["trae_foreground"]["status"] == "focused"
     assert received == {
         "project_path": str(workspace),
         "url": "localhost:5173",
@@ -341,6 +347,11 @@ def test_browser_acceptance_uses_configured_url_when_payload_omits_it(
     settings = command_runner.WorkerSettings(
         workspace_root=tmp_path,
         browser_url="http://localhost:5173",
+    )
+    monkeypatch.setattr(
+        command_runner,
+        "focus_trae",
+        lambda timeout_seconds=1.0: {"status": "focused", "window_title": "Trae CN"},
     )
 
     def fake_browser_acceptance(project_path: str, url: str, timeout_seconds: float, cancellation_check=None):
@@ -361,6 +372,7 @@ def test_browser_acceptance_uses_configured_url_when_payload_omits_it(
     )
 
     assert result["status"] == "success"
+    assert result["data"]["trae_foreground"]["status"] == "focused"
     assert received == {
         "project_path": str(workspace),
         "url": "http://localhost:5173",

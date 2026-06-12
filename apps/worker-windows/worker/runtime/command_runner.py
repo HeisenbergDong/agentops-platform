@@ -212,7 +212,7 @@ class CommandRunner:
 
     def _browser_acceptance(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        return run_browser_acceptance(
+        result = run_browser_acceptance(
             str(workspace_path or self.settings.workspace_root),
             url=str(
                 payload.get("url")
@@ -224,6 +224,7 @@ class CommandRunner:
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
             cancellation_check=cancellation.raise_if_cancelled,
         )
+        return self._restore_trae_foreground(result)
 
     def _git_submit(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
@@ -253,6 +254,18 @@ class CommandRunner:
     def _launch_workspace_path(self, workspace_path: Path | None) -> Path | None:
         candidate = workspace_path or self.settings.workspace_root
         return candidate if candidate and candidate.exists() else workspace_path
+
+    def _restore_trae_foreground(self, data: dict) -> dict:
+        if not self.settings.keep_trae_foreground:
+            return data
+        result = dict(data)
+        try:
+            focus_result = focus_trae(timeout_seconds=1.0)
+            self.state.current_window_title = str(focus_result.get("window_title") or self.state.current_window_title)
+            result["trae_foreground"] = focus_result
+        except Exception as exc:
+            result["trae_foreground"] = {"status": "not_restored", "error": str(exc)}
+        return result
 
     def _success(self, command_id: str, data: dict, lease_id: str = "") -> dict:
         return {
