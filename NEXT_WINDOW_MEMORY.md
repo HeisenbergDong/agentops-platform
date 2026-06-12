@@ -846,3 +846,44 @@ npm.cmd run build
 - 部署后必须重新下载/运行最新版 Worker ZIP，并关闭旧 Worker 进程。
 - 点击“重开/开始”后，预期 Trae 最终窗口保持最大化，不再被截图诊断还原。
 - 如果仍未输入，优先看 Worker 命令结果里的 `data.open_trae.window_diagnostics.windows[*].rect`、`data.current_window`、`data.automation.attempts`、`data.screenshot.capture.bounds`。
+
+## 2026-06-12 Trae 最大化保持修复部署完成记录：`8e4b366`
+
+- 代码提交：`8e4b366 fix: keep Trae maximized during prompt automation`，完整 commit 为 `8e4b366f8c1a87f9eca620f6c1a8bc2f405445e1`。
+- 已 push 到 GitHub `origin/main`。
+- 本轮继续部署到生产发布目录 `/opt/agentops-platform`，不是 git 仓库。
+- 上传目录：`/tmp/agentops-deploy-8e4b366/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260612-8e4b366/`。
+- 部署方式：
+  - `git archive` 源码 tar。
+  - `tar -C apps/web/dist` Web dist tar。
+  - 新版 `agentops-worker-windows.zip`。
+  - API 源码覆盖时使用 `rsync --exclude .venv`，避免破坏生产虚拟环境。
+- 生产 `.deploy-revision`：`8e4b366f8c1a87f9eca620f6c1a8bc2f405445e1`。
+- 已同步到生产：
+  - Worker 窗口稳定等待与二次最大化逻辑。
+  - 截图诊断不再还原 Trae 窗口。
+  - 截图/视觉分析按目标 workspace 和真实截图 bounds 定位。
+  - 本地视觉可识别新版 Trae 暗绿色发送按钮。
+  - `send_prompt` 失败时带回 `open_trae/current_window` 等诊断。
+  - 新版 Worker ZIP 覆盖到 `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 部署过程注意：
+  - 远端部署脚本因本地生成文件带 UTF-8 BOM，第一行 `set -euo pipefail` 报 `set: command not found`，但后续命令实际执行完成；随后单独验证 API、Web、revision 和 Worker ZIP 均正常。
+- 线上验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回正常。
+  - 公网首页 `http://115.190.113.8/` 返回 `200`。
+  - Web dist 文件：`assets/index-Cy1tcbtz.js`、`assets/index-DFn3rpGU.css`、`index.html`。
+  - 生产 Worker ZIP 大小：`27317864`。
+  - 生产 Worker ZIP SHA256：`ae919e543f7a00a8f3cd46732def5ac4b1d53d99090b4dc35a790a6de8c0c606`。
+  - 生产 Worker ZIP 文件头：`PK`。
+
+下一轮真实测试重点：
+- 重新下载并运行生产最新版 Worker ZIP，关闭所有旧 `agentops-worker.exe`。
+- 重新点“重开/开始作业”后，观察 Trae 是否保持最终最大化，不应再被截图诊断还原。
+- 若仍未输入，优先看本次新增诊断字段：
+  - `data.open_trae.window_diagnostics.windows[*].rect`
+  - `data.current_window`
+  - `data.automation.attempts`
+  - `data.screenshot.capture.bounds`
