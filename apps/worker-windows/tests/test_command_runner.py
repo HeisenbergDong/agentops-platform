@@ -163,15 +163,39 @@ def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.Monk
         "_find_top_level_windows",
         lambda marker: [(101, "Trae CN - first"), (202, "Trae CN - second")],
     )
+    monkeypatch.setattr(trae_window, "_foreground_window", lambda: 202)
+    monkeypatch.setattr(trae_window, "_window_process_id", lambda hwnd: {101: 1001, 202: 2002}.get(hwnd, 0))
 
     result = trae_window.trae_window_diagnostics(selected_hwnd=202)
 
     assert result["count"] == 2
     assert result["selected_hwnd"] == 202
+    assert result["foreground_hwnd"] == 202
+    assert result["foreground_pid"] == 2002
     assert result["windows"] == [
-        {"hwnd": 101, "title": "Trae CN - first", "selected": False},
-        {"hwnd": 202, "title": "Trae CN - second", "selected": True},
+        {"hwnd": 101, "title": "Trae CN - first", "selected": False, "pid": 1001, "foreground": False},
+        {"hwnd": 202, "title": "Trae CN - second", "selected": True, "pid": 2002, "foreground": True},
     ]
+
+
+def test_focus_window_maximizes_and_verifies_foreground(monkeypatch: pytest.MonkeyPatch):
+    calls: list[tuple[str, int, int | None]] = []
+    window = trae_window.TraeWindow(777)
+    monkeypatch.setattr(trae_window, "_window_title", lambda hwnd: "target-project - Trae CN")
+    monkeypatch.setattr(trae_window, "_set_process_dpi_aware", lambda: calls.append(("dpi", 0, None)))
+    monkeypatch.setattr(trae_window, "_show_window", lambda hwnd, command: calls.append(("show", hwnd, command)))
+    monkeypatch.setattr(trae_window, "_tap_alt_for_foreground_unlock", lambda: calls.append(("alt", 0, None)))
+    monkeypatch.setattr(trae_window, "_set_foreground_window", lambda hwnd, show_window=None: calls.append(("foreground", hwnd, show_window)))
+    monkeypatch.setattr(trae_window, "_window_process_id", lambda hwnd: 4242)
+    monkeypatch.setattr(trae_window, "_foreground_window", lambda: 777)
+    monkeypatch.setattr(trae_window, "_foreground_process_id", lambda: 4242)
+    monkeypatch.setattr(trae_window.time, "sleep", lambda seconds: None)
+
+    title = trae_window._focus_window(window)
+
+    assert title == "target-project - Trae CN"
+    assert ("show", 777, trae_window.SW_MAXIMIZE) in calls
+    assert ("foreground", 777, None) in calls
 
 
 def test_find_trae_window_requires_workspace_match(monkeypatch: pytest.MonkeyPatch):

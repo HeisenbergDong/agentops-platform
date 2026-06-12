@@ -14,7 +14,10 @@ class TraeAutomationError(RuntimeError):
     pass
 
 
+SW_MAXIMIZE = 3
 SW_RESTORE = 9
+VK_MENU = 0x12
+KEYEVENTF_KEYUP = 0x0002
 TREE_SCOPE_DESCENDANTS = 4
 UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 UIA_INVOKE_PATTERN_ID = 10000
@@ -49,6 +52,9 @@ class TraeWindow:
 
     def restore(self) -> None:
         ctypes.windll.user32.ShowWindow(self.hwnd, SW_RESTORE)
+
+    def maximize(self) -> None:
+        _show_window(self.hwnd, SW_MAXIMIZE)
 
     def set_focus(self) -> None:
         _set_foreground_window(self.hwnd)
@@ -227,14 +233,19 @@ def focus_trae(
 def trae_window_diagnostics(selected_hwnd: int | None = None, workspace_path: Path | str | None = None) -> dict:
     windows = _find_top_level_windows("Trae")
     marker = _workspace_title_marker(workspace_path)
+    foreground_hwnd = _foreground_window()
     result = {
         "count": len(windows),
         "selected_hwnd": int(selected_hwnd or 0),
+        "foreground_hwnd": foreground_hwnd,
+        "foreground_pid": _window_process_id(foreground_hwnd) if foreground_hwnd else 0,
         "windows": [
             {
                 "hwnd": hwnd,
                 "title": title,
                 "selected": bool(selected_hwnd and hwnd == selected_hwnd),
+                "pid": _window_process_id(hwnd),
+                "foreground": bool(foreground_hwnd and hwnd == foreground_hwnd),
             }
             for hwnd, title in windows
         ],
@@ -345,8 +356,7 @@ def _try_find_trae_window(
 
 def _focus_window(window: TraeWindow) -> str:
     title = window.window_text()
-    window.restore()
-    window.set_focus()
+    _maximize_and_focus_window(window.hwnd)
     return title
 
 
@@ -377,7 +387,80 @@ def _child_window_text_snapshot(hwnd: int, limit: int = 300) -> str:
     return "\n".join(texts)
 
 
-def _set_foreground_window(hwnd: int) -> None:
+def _maximize_and_focus_window(hwnd: int, attempts: int = 5) -> dict:
+    _set_process_dpi_aware()
+    window_pid = _window_process_id(hwnd)
+    last_foreground_pid = 0
+    last_foreground_hwnd = 0
+    for _attempt in range(max(1, attempts)):
+        _show_window(hwnd, SW_MAXIMIZE)
+        time.sleep(0.25)
+        _tap_alt_for_foreground_unlock()
+        _set_foreground_window(hwnd, show_window=None)
+        time.sleep(0.35)
+        last_foreground_hwnd = _foreground_window()
+        last_foreground_pid = _foreground_process_id()
+        if last_foreground_hwnd == hwnd or (window_pid and last_foreground_pid == window_pid):
+            return {
+                "status": "focused",
+                "hwnd": hwnd,
+                "window_pid": window_pid,
+                "foreground_hwnd": last_foreground_hwnd,
+                "foreground_pid": last_foreground_pid,
+                "maximized": True,
+            }
+    raise TraeAutomationError(
+        "Could not bring Trae window to foreground. "
+        f"hwnd={hwnd} window_pid={window_pid} "
+        f"foreground_hwnd={last_foreground_hwnd} foreground_pid={last_foreground_pid}"
+    )
+
+
+def _set_process_dpi_aware() -> None:
+    try:
+        ctypes.windll.user32.SetProcessDPIAware()
+    except Exception:
+        pass
+
+
+def _show_window(hwnd: int, command: int) -> None:
+    user32 = ctypes.windll.user32
+    try:
+        user32.ShowWindowAsync(hwnd, command)
+    except Exception:
+        user32.ShowWindow(hwnd, command)
+
+
+def _tap_alt_for_foreground_unlock() -> None:
+    user32 = ctypes.windll.user32
+    user32.keybd_event(VK_MENU, 0, 0, 0)
+    user32.keybd_event(VK_MENU, 0, KEYEVENTF_KEYUP, 0)
+
+
+def _window_process_id(hwnd: int) -> int:
+    if not hwnd:
+        return 0
+    user32 = ctypes.windll.user32
+    pid = ctypes.c_ulong(0)
+    user32.GetWindowThreadProcessId(hwnd, ctypes.byref(pid))
+    return int(pid.value)
+
+
+def _foreground_window() -> int:
+    try:
+        return int(ctypes.windll.user32.GetForegroundWindow() or 0)
+    except Exception:
+        return 0
+
+
+def _foreground_process_id() -> int:
+    foreground = _foreground_window()
+    if not foreground:
+        return 0
+    return _window_process_id(int(foreground))
+
+
+def _set_foreground_window(hwnd: int, show_window: int | None = SW_RESTORE) -> None:
     user32 = ctypes.windll.user32
     kernel32 = ctypes.windll.kernel32
     foreground = user32.GetForegroundWindow()
@@ -389,7 +472,8 @@ def _set_foreground_window(hwnd: int) -> None:
     if target_thread:
         user32.AttachThreadInput(current_thread, target_thread, True)
     try:
-        user32.ShowWindow(hwnd, SW_RESTORE)
+        if show_window is not None:
+            _show_window(hwnd, show_window)
         user32.BringWindowToTop(hwnd)
         user32.SetForegroundWindow(hwnd)
         user32.SetFocus(hwnd)

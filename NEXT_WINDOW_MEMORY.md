@@ -583,3 +583,54 @@ npm.cmd run build
 - 先下载/运行最新版 Worker，并确认只保留一个 Worker 进程。
 - 如果当前 Trae 是旧项目窗口，新 Worker 应复用窗口切换到目标工作区；若标题无法匹配，会停在错误而不是把 prompt 发错项目。
 - prompt 发出后必须检测到本轮 Trae 用户消息才继续等待回复；否则应停在 `manual_required`。
+
+## 2026-06-12 按 D:\adbz 移植 Trae 桌面操作能力
+
+用户继续反馈：
+- Worker 可以唤起 Trae，但没有像 `D:\adbz` 那样最大化窗口、自动找到 Trae 左下命令输入区、输入提示词并发送。
+- 用户要求“按照 D 盘的修改先，让 worker 至少具备 D 盘操作 Trae 的能力”。
+
+本轮结论：
+- 之前 Worker 的问题不是只差 workspace 匹配；它的桌面操作路径仍然不是 `D:\adbz` 路径。
+- `D:\adbz\trae_prompt_input.py` 的关键能力是：SetProcessDPIAware、最大化 Trae、Alt 解锁前台、确认前台 PID、按比例点输入区 `x=0.26/y=0.88`、剪贴板粘贴、按比例点发送按钮 `x=0.364/y=0.945`。
+- 旧 Worker 虽然已有左下输入区点击，但仍用 Enter/submit_hotkey 发送，且窗口聚焦仍偏 restore/focus，没有最大化和前台 PID 校验。
+
+已完成代码改动：
+- `apps/worker-windows/worker/trae/window.py`
+  - 新增 `SW_MAXIMIZE`，聚焦 Trae 时改为最大化。
+  - 新增 DPI aware、Alt 前台解锁、前台 hwnd/pid 校验；无法把 Trae 切到前台时直接报错，不再假装已聚焦。
+  - `trae_window_diagnostics()` 增加 `foreground_hwnd`、`foreground_pid`、每个 Trae 窗口的 `pid/foreground`，方便下一轮从命令结果判断是否真切到目标窗口。
+- `apps/worker-windows/worker/trae/prompt.py`
+  - 输入路径改成更贴近 `D:\adbz`：先写剪贴板，再点输入区 `0.26/0.88`，再 `Ctrl+A`、Backspace、`Ctrl+V`。
+  - 提交路径改为点击发送按钮 `0.364/0.945`，方法名返回 `adbz_send_button`；输入方法名返回 `adbz_coordinate_primary`。
+  - `submit=False` 时只填入不点击发送按钮。
+- 测试同步：
+  - 更新 prompt 输入测试，断言输入点 `(312,704)`、发送点 `(436,756)`（1200x800 窗口）。
+  - 增加 submit=false 不误点发送按钮测试。
+  - 增加窗口聚焦会最大化并用前台校验的测试。
+  - 干预“继续”测试同步使用 `adbz_coordinate_primary`。
+
+已验证：
+- Worker 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`79 passed, 2 warnings`
+- API 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`88 passed, 3 warnings`
+- Web 构建：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过；仍只有 Vite chunk size warning。
+- Windows Worker 打包：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功。
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27291367`
+
+下一轮真实测试重点：
+- 先确认本机只运行一个最新版 Worker。
+- 点“重开/开始作业”后，Worker 应最大化 Trae，并在命令结果中看到 `input.method=adbz_coordinate_primary`、`submit.method=adbz_send_button`。
+- 若仍未输入，优先看 `data.open_trae.window_diagnostics.foreground_hwnd/foreground_pid/windows`，判断 Trae 是否真的被切到前台。

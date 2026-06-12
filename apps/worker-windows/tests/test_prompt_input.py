@@ -59,14 +59,16 @@ def test_send_prompt_clicks_solo_input_area_before_paste(monkeypatch):
 
     result = prompt_module.send_prompt("  build it  ")
 
-    assert clicks == [(312, 716)]
+    assert clicks == [(312, 704), (436, 756)]
     assert bottom_input.focused is False
     assert bottom_input.clicked is False
     assert top_editor.clicked is False
     assert clipboard == ["build it"]
-    assert keys == ["^a", "{BACKSPACE}", "^v", "{ENTER}"]
-    assert result["input"]["method"] == "solo_coordinate_primary"
-    assert result["input"]["click_ratio"] == {"x": 0.26, "y": 0.895}
+    assert keys == ["^a", "{BACKSPACE}", "^v"]
+    assert result["input"]["method"] == "adbz_coordinate_primary"
+    assert result["input"]["click_ratio"] == {"x": 0.26, "y": 0.88}
+    assert result["submit"]["method"] == "adbz_send_button"
+    assert result["submit"]["click_ratio"] == {"x": 0.364, "y": 0.945}
 
 
 def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
@@ -99,9 +101,28 @@ def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
         sent_at_epoch=123.0,
     )
 
-    assert keys == ["^a", "{BACKSPACE}", "^v", "{ENTER}"]
+    assert keys == ["^a", "{BACKSPACE}", "^v"]
     assert result["submission"]["status"] == "confirmed"
     assert result["submission"]["probe"]["status"] == "found"
+
+
+def test_send_prompt_does_not_click_send_button_when_submit_false(monkeypatch):
+    fake_window = FakeWindow([])
+    clicks: list[tuple[int, int]] = []
+
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+
+    result = prompt_module.send_prompt("build it", submit=False)
+
+    assert clicks == [(312, 704)]
+    assert result["submitted"] is False
+    assert result["submit"] == {}
 
 
 def test_send_prompt_fails_when_submission_probe_never_sees_turn(monkeypatch):

@@ -9,8 +9,10 @@ from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 PROMPT_INPUT_X_RATIO = 0.26
 PROMPT_INPUT_Y_RATIO = 0.88
-SOLO_INPUT_CENTER_X_RATIO = 0.26
-SOLO_INPUT_CENTER_Y_RATIO = 0.895
+PROMPT_SEND_X_RATIO = 0.364
+PROMPT_SEND_Y_RATIO = 0.945
+SOLO_INPUT_CENTER_X_RATIO = PROMPT_INPUT_X_RATIO
+SOLO_INPUT_CENTER_Y_RATIO = PROMPT_INPUT_Y_RATIO
 SOLO_INPUT_LEFT_MAX_RATIO = 0.40
 SOLO_INPUT_TOP_MIN_RATIO = 0.70
 SOLO_INPUT_BOTTOM_MAX_RATIO = 0.985
@@ -62,16 +64,20 @@ def send_prompt(
     except TraeAutomationError as exc:
         raise PromptSendError(str(exc)) from exc
 
-    input_result = _focus_prompt_input(window)
     try:
         set_clipboard_text(prompt)
     except ClipboardError as exc:
         raise PromptSendError(str(exc)) from exc
+    input_result = _focus_prompt_input(window)
     _send_keys("^a")
     _send_keys("{BACKSPACE}")
     _send_keys("^v")
+    time.sleep(0.7)
+    submit_result = {}
     if submit:
-        _send_keys(submit_hotkey)
+        submit_result = _click_send_button(
+            _window_rect(int(getattr(window, "hwnd", 0) or 0)),
+        )
     submission = {}
     if submit and verify_submission:
         submission = _verify_prompt_submission(
@@ -85,6 +91,8 @@ def send_prompt(
         "chars": len(prompt),
         "submitted": submit,
         "submit_hotkey": submit_hotkey if submit else "",
+        "submit_method": submit_result.get("method", "") if submit else "",
+        "submit": submit_result,
         "window_title": focus_result.get("window_title", ""),
         "workspace_match": focus_result.get("workspace_match", False),
         "input": input_result,
@@ -323,19 +331,19 @@ def _click_legacy_prompt_point(window_rect: tuple[int, int, int, int] | None) ->
 
 def _click_solo_prompt_area(window_rect: tuple[int, int, int, int] | None) -> dict:
     if not window_rect:
-        return {"status": "not_clicked", "method": "solo_coordinate_primary", "reason": "missing_window_rect"}
+        return {"status": "not_clicked", "method": "adbz_coordinate_primary", "reason": "missing_window_rect"}
     left, top, right, bottom = window_rect
     width = right - left
     height = bottom - top
     if width <= 0 or height <= 0:
-        return {"status": "not_clicked", "method": "solo_coordinate_primary", "reason": "invalid_window_rect"}
+        return {"status": "not_clicked", "method": "adbz_coordinate_primary", "reason": "invalid_window_rect"}
     x = int(left + width * SOLO_INPUT_CENTER_X_RATIO)
     y = int(top + height * SOLO_INPUT_CENTER_Y_RATIO)
     _mouse_click(x, y)
     time.sleep(0.2)
     return {
         "status": "clicked",
-        "method": "solo_coordinate_primary",
+        "method": "adbz_coordinate_primary",
         "window_rect": _rect_dict(window_rect),
         "click_x": x,
         "click_y": y,
@@ -345,6 +353,27 @@ def _click_solo_prompt_area(window_rect: tuple[int, int, int, int] | None) -> di
             "top_min_ratio": SOLO_INPUT_TOP_MIN_RATIO,
             "bottom_max_ratio": SOLO_INPUT_BOTTOM_MAX_RATIO,
         },
+    }
+
+
+def _click_send_button(window_rect: tuple[int, int, int, int] | None) -> dict:
+    if not window_rect:
+        raise PromptSendError("Could not click Trae send button: no window bounds")
+    left, top, right, bottom = window_rect
+    width = right - left
+    height = bottom - top
+    if width <= 0 or height <= 0:
+        raise PromptSendError("Could not click Trae send button: invalid Trae window bounds")
+    x = int(left + width * PROMPT_SEND_X_RATIO)
+    y = int(top + height * PROMPT_SEND_Y_RATIO)
+    _mouse_click(x, y)
+    time.sleep(0.2)
+    return {
+        "method": "adbz_send_button",
+        "window_rect": _rect_dict(window_rect),
+        "click_x": x,
+        "click_y": y,
+        "click_ratio": {"x": PROMPT_SEND_X_RATIO, "y": PROMPT_SEND_Y_RATIO},
     }
 
 

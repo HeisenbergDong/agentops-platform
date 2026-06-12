@@ -70,7 +70,7 @@ def test_continue_text_intervention_targets_chat_prompt(monkeypatch: pytest.Monk
 
     monkeypatch.setattr(
         "worker.trae.intervene.send_prompt",
-        lambda text, submit=True: calls.append((text, submit)) or {"input": {"method": "solo_coordinate_primary"}},
+        lambda text, submit=True: calls.append((text, submit)) or {"input": {"method": "adbz_coordinate_primary"}},
     )
 
     result = apply_intervention({"mode": "continue-text", "text": "\u7ee7\u7eed"})
@@ -78,7 +78,7 @@ def test_continue_text_intervention_targets_chat_prompt(monkeypatch: pytest.Monk
     assert calls == [("\u7ee7\u7eed", True)]
     assert result["status"] == "applied"
     assert result["mode"] == "continue-text"
-    assert result["input"]["method"] == "solo_coordinate_primary"
+    assert result["input"]["method"] == "adbz_coordinate_primary"
 
 
 def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch):
