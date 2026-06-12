@@ -11,6 +11,7 @@ from app.db.models.base import now_utc
 from app.db.session import Base
 from app.services.llm.client import LLMError
 from app.services.orchestrator.states import JobState
+from app.services.orchestrator.directions import normalize_job_directions, split_direction_text
 from app.services.orchestrator import prompt_writer
 from app.services.orchestrator.worker_dispatch import dispatch_prompt_to_worker
 from app.services.preflight import REQUIRED_WORKER_CAPABILITIES, build_preflight
@@ -174,6 +175,18 @@ def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch)
     assert fallback_log.level == "warning"
 
 
+def test_job_directions_split_and_expand_to_100_round_target():
+    raw = "1. 订单管理平台：客户、订单、售后\n2. 本地招聘平台：岗位、简历、服务中心"
+
+    split = split_direction_text(raw)
+    normalized = normalize_job_directions([raw])
+
+    assert split == ["订单管理平台：客户、订单、售后", "本地招聘平台：岗位、简历、服务中心"]
+    assert normalized[:2] == split
+    assert len(normalized) == 20
+    assert normalized[2].startswith("订单管理平台")
+
+
 def test_start_job_fallback_prompt_when_llm_prompt_contains_meta_phrase(monkeypatch):
     db = _test_session()
     user = _create_user(db, "user1")
@@ -296,7 +309,8 @@ def test_reopen_job_resets_current_job_rounds_counts_and_runtime(monkeypatch):
     active_after = db.get(WorkerCommand, "active_cmd")
 
     assert result["job"]["id"] == job.id
-    assert job.directions == ["new scope"]
+    assert job.directions[0] == "new scope"
+    assert len(job.directions) == 20
     assert job.submitted_count == 0
     assert job.satisfied_count == 0
     assert len(new_rounds) == 1

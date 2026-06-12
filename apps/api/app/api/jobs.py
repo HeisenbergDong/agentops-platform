@@ -24,6 +24,7 @@ from app.db.repositories.rules import active_rule_version
 from app.db.repositories.workers import create_worker_command, expire_worker_command_leases, get_worker_by_worker_id
 from app.db.session import SessionLocal, get_db
 from app.services.orchestrator.states import JobState
+from app.services.orchestrator.directions import DEFAULT_DAILY_TARGET, normalize_job_directions
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
     generate_round_prompt,
@@ -61,7 +62,8 @@ class StartJobRequest(BaseModel):
 
 @router.post("/start")
 def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
-    directions = [item.strip() for item in payload.directions if item.strip()]
+    raw_directions = [item.strip() for item in payload.directions if item.strip()]
+    directions = normalize_job_directions(raw_directions, daily_target=DEFAULT_DAILY_TARGET)
     if not directions:
         raise HTTPException(status_code=400, detail="At least one direction is required")
     preflight = build_preflight(db, user)
@@ -101,6 +103,20 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
         level=preflight_level,
         extra=preflight,
     )
+    if directions != raw_directions:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="direction_queue",
+            message="Job directions were normalized and expanded for the 100-round target.",
+            extra={
+                "raw_count": len(raw_directions),
+                "normalized_count": len(directions),
+                "daily_target": DEFAULT_DAILY_TARGET,
+                "directions": directions,
+            },
+        )
     add_log(
         db,
         job_id=job.id,
@@ -139,7 +155,8 @@ def reopen_job(
     user: User = Depends(current_user),
     db: Session = Depends(get_db),
 ) -> dict:
-    directions = [item.strip() for item in payload.directions if item.strip()]
+    raw_directions = [item.strip() for item in payload.directions if item.strip()]
+    directions = normalize_job_directions(raw_directions, daily_target=DEFAULT_DAILY_TARGET)
     if not directions:
         raise HTTPException(status_code=400, detail="At least one direction is required")
     preflight = build_preflight(db, user)
@@ -166,8 +183,22 @@ def reopen_job(
         round_id=round_.id,
         stage=JobState.CLEANING_OLD_RUNTIME,
         message="Reopen requested; current job rounds, counters, runtime logs, attachments, errors, and queued commands were reset.",
-        extra=reset,
+        extra={**reset, "raw_directions": raw_directions},
     )
+    if directions != raw_directions:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="direction_queue",
+            message="Reopened job directions were normalized and expanded for the 100-round target.",
+            extra={
+                "raw_count": len(raw_directions),
+                "normalized_count": len(directions),
+                "daily_target": DEFAULT_DAILY_TARGET,
+                "directions": directions,
+            },
+        )
     if reset["cancelled_active_commands"]:
         command = enqueue_stop_worker_command(db, user.id, job.id, None, reason="user_reopen")
         if command:

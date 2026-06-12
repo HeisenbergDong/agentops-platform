@@ -115,10 +115,13 @@ def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
     except Exception:
         pass
     try:
-        window.restore()
-        window.set_focus()
+        window.maximize()
+        focus_trae(timeout_seconds=2.0)
     except Exception:
-        pass
+        try:
+            window.maximize()
+        except Exception:
+            pass
     rect = RECT()
     if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
         return {"status": "not_scrolled", "attempted": True, "method": "win32_reply_area", "error": "GetWindowRect failed"}

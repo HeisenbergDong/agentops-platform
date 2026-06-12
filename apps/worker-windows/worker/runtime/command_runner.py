@@ -190,6 +190,7 @@ class CommandRunner:
         return send_result
 
     def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         return wait_completion(
             timeout_seconds=float(payload.get("timeout_seconds", 900)),
             stable_seconds=float(payload.get("stable_seconds", 15)),
@@ -197,6 +198,10 @@ class CommandRunner:
             intervention_idle_seconds=float(payload.get("intervention_idle_seconds", 60)),
             max_interventions=int(payload.get("max_interventions", 3)),
             cancellation_check=cancellation.raise_if_cancelled,
+            prompt=str(payload.get("prompt") or ""),
+            workspace_path=str(workspace_path or self.settings.workspace_root),
+            sent_at_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
+            sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
 
     def _copy_latest_reply(self, payload: dict[str, Any]) -> dict:

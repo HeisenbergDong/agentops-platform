@@ -92,6 +92,11 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "Trae waiting for confirmation")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+    )
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -137,6 +142,11 @@ def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pyte
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "Trae waiting for run confirmation")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+    )
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -199,3 +209,77 @@ def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.Mon
         )
 
     assert "only window chrome text" in str(exc.value)
+
+
+def test_wait_completion_rejects_restored_window_chrome_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+
+    with pytest.raises(wait_module.TraeAutomationError) as exc:
+        wait_module.wait_completion(
+            timeout_seconds=3,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=100,
+            max_interventions=0,
+        )
+
+    assert "only window chrome text" in str(exc.value)
+
+
+def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        wait_module,
+        "window_text_snapshot",
+        lambda window: "toolName: edit\nstatus: running\nfilePath: app.py\n" * 20,
+    )
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {
+            "status": "missing",
+            "reason": "awaiting_current_continuation",
+            "candidate": {"turn_status": "unknown"},
+        },
+    )
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+
+    with pytest.raises(wait_module.TraeAutomationError) as exc:
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=100,
+            max_interventions=0,
+            prompt="build feature",
+            workspace_path="D:/work/current",
+            sent_at_epoch=123.0,
+        )
+
+    assert "did not become stable" in str(exc.value)

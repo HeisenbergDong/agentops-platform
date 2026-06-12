@@ -81,6 +81,7 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
 
     previous_reason = _previous_dissatisfaction(db, job, round_)
     prompt_kind = "首轮新项目" if round_.round_index <= 1 else "后续迭代"
+    current_direction = _current_direction(job)
     stack = _select_stack(job, round_)
     messages = [
         {
@@ -102,7 +103,8 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
             "role": "user",
             "content": (
                 f"请生成{prompt_kind}提示词。\n"
-                f"用户输入范围：{_directions_text(job.directions)}\n"
+                f"当前项目方向：{current_direction or _directions_text(job.directions)}\n"
+                f"待做项目队列：{_directions_text(job.directions)}\n"
                 f"当前轮次：{round_.round_index}\n"
                 f"首选技术栈：{stack}\n"
                 f"上一轮需要继续处理的问题：{_prompt_problem_summary(previous_reason) or '无'}\n"
@@ -165,7 +167,7 @@ def build_fallback_prompt(
     rules: dict[str, str] | None = None,
     fallback_reason: str = "",
 ) -> str:
-    directions = [str(item).strip() for item in (job.directions or []) if str(item).strip()]
+    directions = [_current_direction(job)] if _current_direction(job) else []
     direction_text = "\n".join(f"{index}. {item}" for index, item in enumerate(directions, start=1))
     if not direction_text:
         direction_text = "1. 做一个方便后续继续迭代的业务系统。"
@@ -189,7 +191,7 @@ def build_fallback_prompt(
 
 
 def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason: str = "") -> str:
-    directions = [str(item).strip() for item in (job.directions or []) if str(item).strip()]
+    directions = [_current_direction(job)] if _current_direction(job) else []
     direction_text = "；".join(directions) or "当前项目"
     reason = _prompt_problem_summary(previous_reason) or "上一轮复查时发现核心业务入口、运行验证和异常反馈还没有收口清楚"
     return (
@@ -301,7 +303,7 @@ def _store_prompt(
 
 
 def _select_stack(job: Job, round_: TaskRound) -> str:
-    text = " ".join(str(item) for item in (job.directions or []))
+    text = _current_direction(job) or " ".join(str(item) for item in (job.directions or []))
     lower = text.lower()
     explicit = (
         ("Vue", ("vue", "前端", "页面", "vite", "react")),
@@ -335,6 +337,16 @@ def _directions_text(directions: object) -> str:
     if not isinstance(directions, list) or not directions:
         return "做一个方便后续迭代的业务系统"
     return "；".join(str(item).strip() for item in directions if str(item).strip())
+
+
+def _current_direction(job: Job) -> str:
+    if not isinstance(job.directions, list):
+        return ""
+    for item in job.directions:
+        text = str(item).strip()
+        if text:
+            return text
+    return ""
 
 
 def _prompt_preview(prompt: str, limit: int = 220) -> str:

@@ -4,6 +4,7 @@ from typing import Callable
 
 from worker.trae.diagnose import detect_terminal_prompt, diagnose_ui
 from worker.trae.intervene import apply_intervention
+from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.trace_copy import probe_trace
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
@@ -15,10 +16,37 @@ BUSY_MARKERS = (
     "Generating",
     "Running",
     "Thinking",
+    "\u8fdb\u884c\u4e2d",
+    "\u6267\u884c\u4e2d",
+    "\u5904\u7406\u4e2d",
+    "\u601d\u8003\u4e2d",
 )
 RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
 WINDOW_CHROME_TEXTS = {"最小化", "最大化", "关闭", "Minimize", "Maximize", "Close"}
 MIN_COMPLETION_TEXT_CHARS = 80
+RECOVERABLE_TURN_REASONS = {
+    "awaiting_current_continuation",
+    "no_completed_turn_after_prompt_send",
+    "current_turn_missing",
+}
+WINDOW_CHROME_TEXTS = WINDOW_CHROME_TEXTS | {
+    "\u6700\u5c0f\u5316",
+    "\u6700\u5927\u5316",
+    "\u6062\u590d",
+    "\u8fd8\u539f",
+    "\u5173\u95ed",
+    "Restore",
+}
+PENDING_INTERVENTION_MARKERS = (
+    "\u53d8\u66f4\u5df2\u5b8c\u6210",
+    "\u8bf7\u786e\u8ba4\u662f\u5426",
+    "\u4fdd\u7559",
+    "\u4fdd\u7559\u53d8\u66f4",
+    "\u4fdd\u5b58",
+    "Keep",
+    "Keep Changes",
+    "Save",
+)
 
 
 def wait_completion(
@@ -28,6 +56,10 @@ def wait_completion(
     intervention_idle_seconds: float = 60.0,
     max_interventions: int = 3,
     cancellation_check: Callable[[], None] | None = None,
+    prompt: str = "",
+    workspace_path: str = "",
+    sent_at_epoch: float | None = None,
+    sent_at: str = "",
 ) -> dict:
     focus_trae(timeout_seconds=min(10.0, timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
@@ -89,12 +121,33 @@ def wait_completion(
                     raise TraeAutomationError(
                         "Trae output did not contain assistant content; only window chrome text was detected"
                     )
+                turn_probe = probe_latest_trae_turn(
+                    prompt=prompt,
+                    workspace_path=workspace_path,
+                    sent_after_epoch=sent_at_epoch,
+                    sent_after=sent_at,
+                )
+                gate = _completion_gate(turn_probe, output_probe, latest_text)
+                if not gate["passed"]:
+                    if gate.get("recoverable") and len(interventions) < max_interventions:
+                        intervention = _try_completion_gate_intervention(
+                            gate,
+                            timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+                        )
+                        if intervention:
+                            interventions.append(intervention)
+                    stable_since = None
+                    last_change_at = time.monotonic()
+                    _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
+                    continue
                 return {
                     "status": "completed",
                     "stable_seconds": stable_seconds,
                     "text_chars": len(latest_text),
                     "text_sample": latest_text[-1000:],
                     "output_probe": output_probe,
+                    "trae_turn": turn_probe,
+                    "completion_gate": gate,
                     "interventions": interventions,
                 }
         else:
@@ -124,6 +177,41 @@ def _looks_like_window_chrome_only(text: str) -> bool:
     if len("\n".join(lines)) < MIN_COMPLETION_TEXT_CHARS and all(line in WINDOW_CHROME_TEXTS for line in lines):
         return True
     return False
+
+
+def _completion_gate(turn_probe: object, output_probe: object, latest_text: str) -> dict:
+    if _has_pending_intervention_text(latest_text):
+        return {"passed": False, "reason": "pending_intervention_visible", "recoverable": True}
+    if not isinstance(turn_probe, dict):
+        return {"passed": False, "reason": "turn_probe_unavailable", "recoverable": False}
+    if turn_probe.get("status") != "found":
+        reason = str(turn_probe.get("reason") or "current_turn_missing")
+        return {
+            "passed": False,
+            "reason": reason,
+            "recoverable": reason in RECOVERABLE_TURN_REASONS,
+            "candidate": turn_probe.get("candidate") if isinstance(turn_probe.get("candidate"), dict) else None,
+        }
+    turn_status = str(turn_probe.get("turn_status") or "")
+    if turn_status != "completed":
+        return {
+            "passed": False,
+            "reason": f"trae_turn_not_completed:{turn_status or 'unknown'}",
+            "recoverable": True,
+            "session_id": str(turn_probe.get("session_id") or ""),
+            "user_message_id": str(turn_probe.get("user_message_id") or ""),
+        }
+    return {
+        "passed": True,
+        "reason": "ok",
+        "session_id": str(turn_probe.get("session_id") or ""),
+        "user_message_id": str(turn_probe.get("user_message_id") or ""),
+    }
+
+
+def _has_pending_intervention_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in PENDING_INTERVENTION_MARKERS)
 
 
 def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], None] | None) -> None:
@@ -173,6 +261,13 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
         "result": result,
         "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
     }
+
+
+def _try_completion_gate_intervention(gate: dict, timeout_seconds: float) -> dict:
+    reason = str(gate.get("reason") or "completion_gate_waiting")
+    if reason in {"pending_intervention_visible", "awaiting_current_continuation"}:
+        return _try_auto_intervention(reason=reason, timeout_seconds=timeout_seconds)
+    return {}
 
 
 def _diagnose_suggested_intervention(timeout_seconds: float) -> dict:

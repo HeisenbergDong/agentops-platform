@@ -310,6 +310,10 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         intervention_idle_seconds: float,
         max_interventions: int,
         cancellation_check=None,
+        prompt: str = "",
+        workspace_path: str = "",
+        sent_at_epoch: float | None = None,
+        sent_at: str = "",
     ):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
@@ -317,9 +321,14 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         received["intervention_idle_seconds"] = intervention_idle_seconds
         received["max_interventions"] = max_interventions
         received["cancellable"] = callable(cancellation_check)
+        received["prompt"] = prompt
+        received["workspace_path"] = workspace_path
+        received["sent_at_epoch"] = sent_at_epoch
+        received["sent_at"] = sent_at
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
+    monkeypatch.setattr(command_runner.settings, "workspace_root", Path("D:/work"))
 
     result = CommandRunner(worker_id="worker-test").run(
         {
@@ -331,6 +340,10 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
                 "poll_interval_seconds": 1,
                 "intervention_idle_seconds": 11,
                 "max_interventions": 5,
+                "prompt": "build feature",
+                "workspace_path": "current",
+                "sent_at_epoch": 123.5,
+                "sent_at": "2026-06-13T00:00:00Z",
             },
         }
     )
@@ -343,6 +356,10 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "intervention_idle_seconds": 11.0,
         "max_interventions": 5,
         "cancellable": True,
+        "prompt": "build feature",
+        "workspace_path": str(Path("D:/work/current")),
+        "sent_at_epoch": 123.5,
+        "sent_at": "2026-06-13T00:00:00Z",
     }
 
 
@@ -354,6 +371,7 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
         intervention_idle_seconds: float,
         max_interventions: int,
         cancellation_check=None,
+        **_kwargs,
     ):
         assert cancellation_check is not None
         cancellation_check()

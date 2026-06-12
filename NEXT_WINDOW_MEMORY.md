@@ -888,3 +888,39 @@ npm.cmd run build
   - `data.current_window`
   - `data.automation.attempts`
   - `data.screenshot.capture.bounds`
+## 2026-06-13 Trae 完成误判、窗口还原和 100 轮方向队列修复记录（待部署）
+
+用户真实自测反馈：
+- Trae 仍在回复/执行中，Dashboard 已显示 `Trae CN 回复已稳定，Worker 开始获取对话内容和执行轨迹`，随后开始下一步。
+- 执行过程中 Trae 窗口突然不再全屏。
+- 提示词调度未对齐 `D:\adbz`：多个项目范围应拆成多个项目、多轮分配，并尽量覆盖最终 100 轮。
+
+定位结果：
+- 生产最近一次 `wait_completion` 结果里 `text_sample` 只有 `最小化\n恢复\n关闭`，`output_probe.reason=missing_tool_trace_markers`，说明窗口标题栏文本被误当成稳定回复。
+- `wait_completion` 只看 UI 文本稳定，没有把当前 prompt/workspace/sent_at 对应的 Trae 本地 turn completed 作为硬闸门。
+- `trace_copy._scroll_window_reply_area()` 仍调用 `window.restore()`，复制/滚动回复区时会把最大化窗口还原。
+- 后端没有兜底拆分/扩展作业范围，且 prompt writer 会把整个 direction 队列塞进本轮 prompt，而不是只取队首项目。
+
+已完成代码改动：
+- Worker `wait_completion()` 新增 `prompt/workspace_path/sent_at_epoch/sent_at` 参数，并调用 `probe_latest_trae_turn()`；只有当前 Trae turn `turn_status=completed` 才返回 completed。
+- `awaiting_current_continuation`、`no_completed_turn_after_prompt_send`、`trae_turn_not_completed:*` 会继续等待/尝试干预，不再推进到复制回复。
+- `最小化/恢复/关闭/Restore` 等窗口 chrome 文本会被拒绝；新增 `进行中/执行中/处理中/思考中` busy marker，新增 `变更已完成/请确认是否/保留/保存/Keep/Save` pending marker。
+- `trace_copy._scroll_window_reply_area()` 删除 `window.restore()`，改为 `window.maximize()` + `focus_trae()`，复制回复时不再主动还原窗口。
+- `CommandRunner._wait_completion()` 把 payload 里的 prompt、workspace、sent_at 上下文传给等待逻辑。
+- 新增 `apps/api/app/services/orchestrator/directions.py`：拆分多行/编号/分号范围，并按 `daily_target=100`、每项目最多 5 轮扩展成约 20 个项目方向。
+- `/jobs/start`、`/jobs/reopen` 接入方向规范化，并写入 `direction_queue` 日志。
+- `prompt_writer` 改为本轮只围绕队首方向生成 prompt；项目完成后仍由现有 `_advance_to_next_direction()` 推进下一个方向。
+
+已验证：
+- Worker targeted：`42 passed`
+- API targeted：`19 passed`
+- Worker 全量：`84 passed, 2 warnings`
+- API 全量：`93 passed, 3 warnings`
+- Web build：通过，仅 Vite chunk size warning。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`，大小 `27320216`。
+
+待完成：
+- `git diff --check`
+- commit/push GitHub
+- 部署生产：API 源码、Web dist、新 Worker ZIP。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
