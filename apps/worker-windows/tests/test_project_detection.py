@@ -4,7 +4,8 @@ import pytest
 
 from worker.project import browser_acceptance
 from worker.project.browser_acceptance import run_browser_acceptance
-from worker.project.git_submit import _push_args
+from worker.project.diagnostics import summarize_command_result
+from worker.project.git_submit import _classify_push_failure, _push_args
 from worker.project.scanner import scan_project
 
 
@@ -54,6 +55,9 @@ function save() {}
 
     review = result["product_review"]
     assert review["ok"] is False
+    assert review["blocking_issue_count"] >= 1
+    assert any(item["code"] == "empty_event_handler" for item in review["file_findings"])
+    assert any(item["code"] == "empty_function" for item in review["file_findings"])
     assert any("事件绑定为空" in item for item in review["issues"])
     assert any("函数体为空" in item for item in review["issues"])
 
@@ -111,6 +115,9 @@ def test_browser_acceptance_html_inspection_keeps_interaction_evidence():
     assert result["issues"] == []
     assert result["title"] == "Demo"
     assert result["interactive_count"] == 2
+    assert result["interaction"]["buttons"] == 1
+    assert result["interaction"]["inputs"] == 1
+    assert result["interaction"]["button_labels"] == ["保存"]
 
 
 def test_git_push_args_set_upstream_when_missing(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -131,3 +138,26 @@ def test_git_push_args_set_upstream_when_missing(monkeypatch: pytest.MonkeyPatch
 
     assert calls == [["rev-parse", "--abbrev-ref", "--symbolic-full-name", "@{u}"]]
     assert args == ["push", "--set-upstream", "origin", "main"]
+
+
+def test_git_push_failure_classifies_credentials():
+    assert _classify_push_failure("Permission denied (publickey). fatal: Could not read from remote repository.") == (
+        "ssh_key_or_deploy_key_failed"
+    )
+    assert _classify_push_failure("fatal: Authentication failed for 'https://github.com/acme/repo.git'") == (
+        "https_token_or_credential_failed"
+    )
+
+
+def test_command_diagnostics_classify_build_error_with_source_location():
+    result = summarize_command_result(
+        ["npm", "run", "build"],
+        1,
+        stdout="",
+        stderr="src/App.tsx:12:5: error TS2339: Property 'name' does not exist",
+    )
+
+    assert result["passed"] is False
+    assert result["error_type"] == "type_error"
+    assert result["primary_location"] == {"path": "src/App.tsx", "line": 12, "column": 5}
+    assert "npm run build" in result["summary"]

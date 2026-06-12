@@ -32,6 +32,7 @@ FEISHU_ATTACHMENT_FIELD = "截图（userprompt附件/产物/运行结果/对话�
 LOG_TRACE_FIELD_SOFT_LIMIT = 45000
 LOG_TRACE_OVERFLOW_TEXT = "因日志超长已经保存txt文档，放在截图列。"
 MAX_ROUNDS_PER_PROJECT = 5
+MAX_SATISFIED_RATIO = 0.20
 TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
 TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
 IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
@@ -889,10 +890,10 @@ def _write_feishu_record(
     try:
         write_result = write_feishu_record(feishu_config, fields)
     except FeishuWriteError as exc:
-        _mark_feishu_failed(db, job, round_, str(exc), {"fields": fields})
+        _mark_feishu_failed(db, job, round_, str(exc), {"field_names": list(fields.keys()), "field_count": len(fields)})
         return
     except Exception as exc:
-        _mark_feishu_failed(db, job, round_, f"Feishu write failed: {exc}", {"fields": fields})
+        _mark_feishu_failed(db, job, round_, f"Feishu write failed: {exc}", {"field_names": list(fields.keys()), "field_count": len(fields)})
         return
 
     token_cache = write_result.pop("token_cache", None)
@@ -901,10 +902,12 @@ def _write_feishu_record(
         save_user_settings(db, job.user_id, {"feishu": feishu_config}, allow_internal=True)
 
     satisfaction = _feishu_satisfaction(db, job.id, round_.id)
-    if satisfaction["satisfied"]:
-        job.satisfied_count += 1
+    satisfied = bool(satisfaction["satisfied"])
     round_.feishu_status = str(write_result.get("status") or "written")
     round_.status = JobState.ROUND_COMPLETED
+    decision = _next_round_decision(job, round_, satisfied)
+    if satisfied and decision.get("accepted_satisfied"):
+        job.satisfied_count += 1
     add_log(
         db,
         job_id=job.id,
@@ -913,7 +916,7 @@ def _write_feishu_record(
         message="Feishu business record written.",
         extra=write_result,
     )
-    _advance_after_feishu_success(db, job, round_, bool(satisfaction["satisfied"]))
+    _advance_after_feishu_success(db, job, round_, satisfied, decision)
 
 
 def _mark_feishu_failed(
@@ -944,8 +947,9 @@ def _advance_after_feishu_success(
     job: Job,
     round_: TaskRound,
     satisfied: bool,
+    decision: dict[str, object] | None = None,
 ) -> None:
-    decision = _next_round_decision(job, round_, satisfied)
+    decision = decision or _next_round_decision(job, round_, satisfied)
     if decision["action"] == "continue_project":
         next_round = TaskRound(
             job_id=job.id,
@@ -961,7 +965,7 @@ def _advance_after_feishu_success(
             job_id=job.id,
             round_id=round_.id,
             stage=JobState.ROUND_COMPLETED,
-            message="Round completed; next project round prepared because the result is still dissatisfied.",
+            message=_continue_project_message(decision),
             extra={**decision, "next_round_id": next_round.id, "next_round_index": next_round.round_index},
         )
         add_log(
@@ -973,6 +977,9 @@ def _advance_after_feishu_success(
             extra={"previous_round_id": round_.id, "round_index": next_round.round_index},
         )
         _auto_dispatch_next_round(db, job, next_round)
+        return
+
+    if not str(decision.get("reason") or "").startswith("daily_target_reached") and _advance_to_next_direction(db, job, round_, decision):
         return
 
     job.status = JobState.PROJECT_COMPLETED
@@ -993,13 +1000,105 @@ def _advance_after_feishu_success(
 
 
 def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[str, object]:
-    if job.daily_target and job.submitted_count >= job.daily_target:
-        return {"action": "complete_project", "reason": "daily_target_reached"}
+    daily_target_reached = bool(job.daily_target and job.submitted_count >= job.daily_target)
     if satisfied:
-        return {"action": "complete_project", "reason": "satisfied"}
+        if int(job.submitted_count or 0) <= 0:
+            return {"action": "complete_project", "reason": "satisfied_without_submission", "accepted_satisfied": False}
+        if _would_exceed_satisfied_ratio(job):
+            if daily_target_reached:
+                return {
+                    "action": "complete_project",
+                    "reason": "daily_target_reached_after_satisfied_ratio_cap",
+                    "accepted_satisfied": False,
+                    "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
+                }
+            if round_.round_index >= MAX_ROUNDS_PER_PROJECT:
+                return {
+                    "action": "complete_project",
+                    "reason": "max_round_reached_after_satisfied_ratio_cap",
+                    "accepted_satisfied": False,
+                    "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
+                }
+            return {
+                "action": "continue_project",
+                "reason": "satisfied_ratio_cap",
+                "accepted_satisfied": False,
+                "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
+            }
+        if daily_target_reached:
+            return {"action": "complete_project", "reason": "daily_target_reached", "accepted_satisfied": True}
+        return {"action": "complete_project", "reason": "satisfied", "accepted_satisfied": True}
+    if daily_target_reached:
+        return {"action": "complete_project", "reason": "daily_target_reached"}
     if round_.round_index >= MAX_ROUNDS_PER_PROJECT:
         return {"action": "complete_project", "reason": "max_round_reached"}
     return {"action": "continue_project", "reason": "dissatisfied_followup"}
+
+
+def _would_exceed_satisfied_ratio(job: Job) -> bool:
+    submitted = int(job.submitted_count or 0)
+    if submitted <= 0:
+        return False
+    next_satisfied = int(job.satisfied_count or 0) + 1
+    return (next_satisfied / submitted) > MAX_SATISFIED_RATIO
+
+
+def _continue_project_message(decision: dict[str, object]) -> str:
+    if decision.get("reason") == "satisfied_ratio_cap":
+        return "Round completed; next project round prepared because the satisfied ratio cap would be exceeded."
+    return "Round completed; next project round prepared because the result is still dissatisfied."
+
+
+def _advance_to_next_direction(db: Session, job: Job, round_: TaskRound, decision: dict[str, object]) -> bool:
+    directions = _direction_queue(job)
+    if len(directions) <= 1:
+        return False
+
+    completed_direction = directions[0]
+    remaining_directions = directions[1:]
+    project = db.get(Project, round_.project_id) if round_.project_id else None
+    if project:
+        project.status = "completed"
+
+    job.directions = remaining_directions
+    next_round = TaskRound(
+        job_id=job.id,
+        round_index=1,
+        status=JobState.GENERATING_PROMPT,
+    )
+    db.add(next_round)
+    db.flush()
+    job.status = JobState.GENERATING_PROMPT
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.ROUND_COMPLETED,
+        message="Project direction completed; next queued direction prepared.",
+        extra={
+            **decision,
+            "completed_direction": completed_direction,
+            "next_direction": remaining_directions[0],
+            "remaining_directions": remaining_directions,
+            "next_round_id": next_round.id,
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=next_round.id,
+        stage=JobState.GENERATING_PROMPT,
+        message="Next queued direction is ready for prompt generation.",
+        extra={"previous_round_id": round_.id, "direction": remaining_directions[0]},
+    )
+    _auto_dispatch_next_round(db, job, next_round)
+    return True
+
+
+def _direction_queue(job: Job) -> list[str]:
+    if not isinstance(job.directions, list):
+        return []
+    return [str(item).strip() for item in job.directions if str(item).strip()]
 
 
 def _discard_first_round_satisfied(db: Session, job: Job, round_: TaskRound, extra: dict) -> None:

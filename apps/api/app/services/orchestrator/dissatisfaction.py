@@ -122,6 +122,38 @@ def _evidence_summary(evidence: DissatisfactionEvidence) -> dict[str, Any]:
 def _key_lines(evidence: DissatisfactionEvidence) -> list[str]:
     values: list[str] = []
     data = evidence.data if isinstance(evidence.data, dict) else {}
+    diagnostics = data.get("diagnostics")
+    if isinstance(diagnostics, dict):
+        summary = str(diagnostics.get("summary") or "").strip()
+        if summary:
+            values.append(summary)
+        location = diagnostics.get("primary_location")
+        if isinstance(location, dict) and location.get("path"):
+            line = f":{location.get('line')}" if location.get("line") else ""
+            values.append(f"{diagnostics.get('error_type') or 'command_failed'} at {location.get('path')}{line}")
+    runtime_diagnostics = data.get("runtime_diagnostics")
+    if isinstance(runtime_diagnostics, dict):
+        for item in runtime_diagnostics.get("blocking_issues") or []:
+            values.append(str(item))
+        interaction = runtime_diagnostics.get("interaction")
+        if isinstance(interaction, dict):
+            values.append(
+                "browser interaction summary: "
+                f"buttons={interaction.get('buttons', 0)}, "
+                f"inputs={interaction.get('inputs', 0)}, "
+                f"links={interaction.get('links', 0)}"
+            )
+    push_diagnostics = data.get("push_diagnostics")
+    if isinstance(push_diagnostics, dict):
+        reason = str(push_diagnostics.get("reason") or "").strip()
+        message = str(push_diagnostics.get("message") or "").strip()
+        hint = str(push_diagnostics.get("credential_hint") or "").strip()
+        if reason:
+            values.append(f"git push failure: {reason}")
+        if message:
+            values.append(message)
+        if hint:
+            values.append(hint)
     for key in ("stderr", "stdout", "message", "error"):
         raw = data.get(key)
         if isinstance(raw, str) and raw.strip():
@@ -131,6 +163,12 @@ def _key_lines(evidence: DissatisfactionEvidence) -> list[str]:
             values.append(f"{key}: {data[key]}")
     review = data.get("product_review")
     if isinstance(review, dict):
+        raw_findings = review.get("file_findings")
+        if isinstance(raw_findings, list):
+            for finding in raw_findings[:4]:
+                if isinstance(finding, dict):
+                    line = f":{finding.get('line')}" if finding.get("line") else ""
+                    values.append(f"{finding.get('code')} at {finding.get('path')}{line}: {finding.get('snippet')}")
         for key in ("issues", "warnings", "evidence"):
             raw_items = review.get(key)
             if isinstance(raw_items, list):

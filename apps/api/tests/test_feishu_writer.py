@@ -1,4 +1,5 @@
 from app.services.feishu import writer
+import pytest
 
 
 def test_write_feishu_record_updates_explicit_uid_with_allowed_overwrite(monkeypatch):
@@ -89,6 +90,43 @@ def test_write_feishu_record_skips_duplicate_by_prompt_round(monkeypatch):
     assert result["status"] == "skipped_duplicate"
     assert result["record_id"] == "rec-1"
     assert result["duplicate_existing_uid"] == "1"
+
+
+def test_write_feishu_record_fails_when_required_payload_field_is_missing_from_table(monkeypatch):
+    _patch_feishu_dependencies(
+        monkeypatch,
+        records=[{"record_id": "rec-2", "fields": {"UID": "2", writer.SESSION_FIELD: ""}}],
+    )
+    monkeypatch.setattr(
+        writer,
+        "_list_fields",
+        lambda _token, _app, _table: [
+            {"field_name": writer.SESSION_FIELD},
+            {"field_name": "User Prompt"},
+        ],
+    )
+
+    with pytest.raises(writer.FeishuWriteError, match="missing required writable fields"):
+        writer.write_feishu_record(
+            {
+                "app_token": "app-token",
+                "table_id": "table-id",
+                "token_cache": {"tenant_access_token": "cached-token", "expires_at": 4102444800},
+            },
+            {
+                writer.SESSION_FIELD: "new-session",
+                "User Prompt": "prompt",
+                "github地址": "https://github.com/acme/repo.git",
+            },
+        )
+
+
+def test_feishu_error_message_identifies_permission_and_field_mapping():
+    permission = writer._format_feishu_error(403, {"code": 99991663, "msg": "Forbidden"}, "")
+    field_error = writer._format_feishu_error(200, {"code": 1254007, "msg": "field_name is invalid"}, "")
+
+    assert "permission denied" in permission
+    assert "field mapping failed" in field_error
 
 
 def test_prepare_attachment_field_uploads_local_paths(monkeypatch, tmp_path):

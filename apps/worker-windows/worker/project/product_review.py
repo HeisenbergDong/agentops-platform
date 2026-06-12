@@ -41,6 +41,7 @@ def review_project_static(root: Path, prompt: str = "", changed_files=None) -> d
 
     code_scope = focused_by_rel or by_rel
     code_issues, code_warnings = code_specific_findings(code_scope)
+    file_findings = structured_file_findings(code_scope)
     issues.extend(code_issues)
     warnings.extend(code_warnings)
     evidence.append(f"审查了 {len(files)} 个项目文件，其中主要代码文件 {len(code_files)} 个。")
@@ -57,6 +58,10 @@ def review_project_static(root: Path, prompt: str = "", changed_files=None) -> d
         "issues": issues[:12],
         "warnings": warnings[:8],
         "evidence": evidence[:12],
+        "summary": product_review_summary(issues, warnings, evidence, file_findings),
+        "blocking_issue_count": len(issues),
+        "warning_count": len(warnings),
+        "file_findings": file_findings[:20],
         "stack": detect_stack(root, files),
         "file_count": len(files),
         "changed_files": sorted(changed_rel),
@@ -241,6 +246,80 @@ def code_specific_findings(by_rel: dict[str, str]) -> tuple[list[str], list[str]
     issues = [summarize_group(items) for items in issue_groups.values() if items]
     warnings = [summarize_group(items) for items in warning_groups.values() if items]
     return issues[:10], warnings[:8]
+
+
+def structured_file_findings(by_rel: dict[str, str]) -> list[dict[str, object]]:
+    findings: list[dict[str, object]] = []
+    unfinished_re = re.compile(r"(?<![-_\w])(TODO|FIXME)(?![-_\w])|待实现|暂未实现|占位", re.IGNORECASE)
+    for rel, text in by_rel.items():
+        suffix = Path(rel).suffix.lower()
+        if suffix not in SOURCE_EXTS:
+            continue
+        for index, line in enumerate(str(text or "").splitlines(), start=1):
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if unfinished_re.search(stripped):
+                findings.append(_file_finding(rel, index, "placeholder", "blocking", stripped))
+            if re.search(r"(@click|onclick|@submit(?:\.prevent)?|onClick)\s*=\s*['\"]\s*['\"]", stripped):
+                findings.append(_file_finding(rel, index, "empty_event_handler", "blocking", stripped))
+            if re.search(r"\bcatch\s*\([^)]*\)\s*\{\s*\}", stripped):
+                findings.append(_file_finding(rel, index, "empty_catch", "blocking", stripped))
+            if suffix in {".vue", ".js", ".ts", ".tsx", ".jsx"} and re.search(
+                r"(function\s+\w+\s*\([^)]*\)|(?:const|let|var)\s+\w+\s*=\s*(?:\([^)]*\)|\w+)\s*=>)\s*\{\s*\}",
+                stripped,
+            ):
+                findings.append(_file_finding(rel, index, "empty_function", "blocking", stripped))
+            if re.search(r"href\s*=\s*['\"]#['\"]", stripped):
+                findings.append(_file_finding(rel, index, "placeholder_link", "warning", stripped))
+            if re.search(r"\b(alert|confirm|prompt)\s*\(", stripped):
+                findings.append(_file_finding(rel, index, "browser_dialog", "warning", stripped))
+            if re.search(r"\bconsole\.(log|debug)\s*\(", stripped):
+                findings.append(_file_finding(rel, index, "debug_output", "warning", stripped))
+        if suffix in {".vue", ".html"}:
+            for match in re.finditer(r"<button\b([\s\S]*?)</button>", str(text or ""), re.IGNORECASE):
+                raw_button = match.group(0) or ""
+                opener = opening_tag_text(raw_button)
+                attrs_match = re.match(r"<button\b([\s\S]*)>$", opener, re.IGNORECASE)
+                attrs = attrs_match.group(1) if attrs_match else ""
+                if any(token in attrs for token in ("@click", "onclick", 'type=\"submit\"', "type='submit'")):
+                    continue
+                findings.append(
+                    _file_finding(rel, line_no(str(text or ""), match.start()), "button_without_handler", "warning", raw_button)
+                )
+    return findings[:80]
+
+
+def _file_finding(rel: str, line: int, code: str, severity: str, snippet: str) -> dict[str, object]:
+    return {
+        "path": rel,
+        "line": line,
+        "code": code,
+        "severity": severity,
+        "snippet": short_text(str(snippet or "").strip(), 220),
+    }
+
+
+def product_review_summary(
+    issues: list[str],
+    warnings: list[str],
+    evidence: list[str],
+    file_findings: list[dict[str, object]],
+) -> dict[str, object]:
+    categories: dict[str, int] = {}
+    for finding in file_findings:
+        code = str(finding.get("code") or "unknown")
+        categories[code] = categories.get(code, 0) + 1
+    return {
+        "passed": not issues,
+        "blocking_issue_count": len(issues),
+        "warning_count": len(warnings),
+        "file_finding_count": len(file_findings),
+        "categories": categories,
+        "top_issue": issues[0] if issues else "",
+        "top_warning": warnings[0] if warnings else "",
+        "evidence_count": len(evidence),
+    }
 
 
 def opening_tag_text(html: str) -> str:

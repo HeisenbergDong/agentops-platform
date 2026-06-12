@@ -14,7 +14,14 @@ def ensure_github_repository(github_config: dict, project_name: str = "") -> dic
     if not token:
         remote_url = build_project_remote_url(github_config, project_name, owner="")
         owner, repo = github_owner_repo(remote_url)
-        return {"ok": False, "reason": "missing_github_token", "remote_url": remote_url, "owner": owner, "repo": repo}
+        return {
+            "ok": False,
+            "reason": "missing_github_token",
+            "remote_url": remote_url,
+            "owner": owner,
+            "repo": repo,
+            "credential_preflight": github_credential_preflight(github_config, remote_url),
+        }
 
     headers = {
         "Accept": "application/vnd.github+json",
@@ -33,14 +40,15 @@ def ensure_github_repository(github_config: dict, project_name: str = "") -> dic
 
             remote_url = build_project_remote_url(github_config, project_name, owner=login)
             owner, repo = github_owner_repo(remote_url)
+            credential_preflight = github_credential_preflight(github_config, remote_url)
             if not owner or not repo:
-                return {"ok": False, "reason": "not_github_remote", "remote_url": remote_url}
+                return {"ok": False, "reason": "not_github_remote", "remote_url": remote_url, "credential_preflight": credential_preflight}
 
             repo_response = client.get(f"{GITHUB_API}/repos/{owner}/{repo}")
             if repo_response.status_code == 200:
                 return _with_deploy_key(
                     client,
-                    {"ok": True, "existed": True, "owner": owner, "repo": repo, "remote_url": remote_url},
+                    {"ok": True, "existed": True, "owner": owner, "repo": repo, "remote_url": remote_url, "credential_preflight": credential_preflight},
                     github_config,
                 )
             if repo_response.status_code != 404:
@@ -54,13 +62,13 @@ def ensure_github_repository(github_config: dict, project_name: str = "") -> dic
             if create_response.status_code in {200, 201}:
                 return _with_deploy_key(
                     client,
-                    {"ok": True, "created": True, "owner": owner, "repo": repo, "remote_url": remote_url},
+                    {"ok": True, "created": True, "owner": owner, "repo": repo, "remote_url": remote_url, "credential_preflight": credential_preflight},
                     github_config,
                 )
             if create_response.status_code == 422:
                 return _with_deploy_key(
                     client,
-                    {"ok": True, "existed": True, "owner": owner, "repo": repo, "remote_url": remote_url},
+                    {"ok": True, "existed": True, "owner": owner, "repo": repo, "remote_url": remote_url, "credential_preflight": credential_preflight},
                     github_config,
                 )
             return _github_error("github_repo_create_failed", create_response, remote_url, owner, repo)
@@ -100,6 +108,36 @@ def build_project_remote_url(github_config: dict, project_name: str = "", owner:
     if protocol == "https":
         return f"https://github.com/{base_owner}/{repo_name}.git"
     return f"git@github.com:{base_owner}/{repo_name}.git"
+
+
+def github_credential_preflight(github_config: dict, remote_url: str = "") -> dict:
+    url = str(remote_url or build_project_remote_url(github_config)).strip()
+    protocol = "ssh" if url.startswith(("git@github.com:", "ssh://git@github.com/")) else "https" if url.startswith("https://") else "unknown"
+    has_token = bool(_open_token(github_config.get("token")))
+    has_pubkey = bool(str(github_config.get("pubkey") or github_config.get("deploy_key") or "").strip())
+    if protocol == "ssh":
+        return {
+            "protocol": "ssh",
+            "has_api_token": has_token,
+            "has_deploy_key": has_pubkey,
+            "ok": has_token and has_pubkey,
+            "warning": "" if has_pubkey else "SSH remote selected but no deploy public key is configured.",
+        }
+    if protocol == "https":
+        return {
+            "protocol": "https",
+            "has_api_token": has_token,
+            "has_deploy_key": has_pubkey,
+            "ok": has_token,
+            "warning": "" if has_token else "HTTPS remote selected but no GitHub token is configured.",
+        }
+    return {
+        "protocol": protocol,
+        "has_api_token": has_token,
+        "has_deploy_key": has_pubkey,
+        "ok": False,
+        "warning": "Remote URL is not a supported GitHub SSH or HTTPS remote.",
+    }
 
 
 def github_owner_repo(remote_url: str) -> tuple[str, str]:

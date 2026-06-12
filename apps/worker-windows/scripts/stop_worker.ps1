@@ -1,9 +1,35 @@
+param(
+    [string]$ServiceName = "AgentOpsWorker",
+    [string]$ScheduledTaskName = "AgentOpsWorker",
+    [switch]$SkipService,
+    [switch]$SkipScheduledTask,
+    [switch]$ProcessOnly
+)
+
 $ErrorActionPreference = "Stop"
+
+if (-not $ProcessOnly -and -not $SkipScheduledTask) {
+    $task = Get-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
+    if ($task) {
+        Write-Host "Stopping scheduled task $ScheduledTaskName."
+        Stop-ScheduledTask -TaskName $ScheduledTaskName -ErrorAction SilentlyContinue
+    }
+}
+
+if (-not $ProcessOnly -and -not $SkipService) {
+    $service = Get-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    if ($service -and $service.Status -ne "Stopped") {
+        Write-Host "Stopping Windows service $ServiceName."
+        Stop-Service -Name $ServiceName -ErrorAction SilentlyContinue
+    }
+}
 
 $currentPid = $PID
 $patterns = @(
     "agentops-worker.exe",
     "worker.main",
+    "service-run",
+    "supervise",
     "apps\worker-windows",
     "AgentOps\worker.json"
 )

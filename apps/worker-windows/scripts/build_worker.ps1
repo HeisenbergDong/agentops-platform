@@ -65,6 +65,7 @@ Ensure-WorkerVenv
 New-Item -ItemType Directory -Force -Path $PackageDir | Out-Null
 Copy-Item -LiteralPath (Join-Path $DistDir "agentops-worker.exe") -Destination $PackageDir -Force
 Copy-Item -LiteralPath (Join-Path $ProjectRoot "README.md") -Destination $PackageDir -Force
+Copy-Item -LiteralPath (Join-Path $ProjectRoot "scripts") -Destination (Join-Path $PackageDir "scripts") -Recurse -Force
 
 if (Test-Path $ZipPath) {
     Remove-Item -LiteralPath $ZipPath -Force
@@ -76,3 +77,5 @@ Write-Host "Worker ZIP: $ZipPath"
 Write-Host "Start:"
 Write-Host "Double-click agentops-worker.exe, or run .\agentops-worker.exe"
 Write-Host "First run will ask for server URL and worker registration code."
+Write-Host "Autostart:"
+Write-Host ".\scripts\install_worker_autostart.ps1 -RunNow"

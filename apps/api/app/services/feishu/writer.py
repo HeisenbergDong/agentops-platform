@@ -79,6 +79,12 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
         raise FeishuWriteError("Explicit Feishu target row was not found.")
     target_record = explicit_target or _find_empty_session_record(records)
     target_record_id = _record_id(target_record)
+    field_report = _field_mapping_report(fields, available_fields)
+    if field_report["missing_required_fields"]:
+        raise FeishuWriteError(
+            "Feishu table is missing required writable fields: "
+            + ", ".join(field_report["missing_required_fields"])
+        )
     mapped = _filter_allowed_fields(fields, available_fields)
     mapped = _prepare_attachment_field(access_token, app_token, mapped, available_fields)
     duplicate = _find_duplicate_record(records, target_record_id, mapped)
@@ -93,6 +99,7 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
             "view_id": view_id,
             "token_cache": refreshed_cache,
             "auth_mode": auth_mode,
+            "field_report": field_report,
             "response": {},
         }
 
@@ -110,6 +117,7 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
             "view_id": view_id,
             "token_cache": refreshed_cache,
             "auth_mode": auth_mode,
+            "field_report": field_report,
             "response": {},
         }
 
@@ -142,6 +150,7 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
         "view_id": view_id,
         "token_cache": refreshed_cache,
         "auth_mode": auth_mode,
+        "field_report": field_report,
         "response": data,
     }
 
@@ -227,6 +236,18 @@ def _filter_allowed_fields(fields: dict[str, Any], available_fields: set[str]) -
         name: value
         for name, value in fields.items()
         if name in REQUIRED_WRITABLE_FIELDS and name in available_fields
+    }
+
+
+def _field_mapping_report(fields: dict[str, Any], available_fields: set[str]) -> dict[str, list[str]]:
+    requested = {name for name in fields if name in REQUIRED_WRITABLE_FIELDS}
+    missing_required = sorted(name for name in requested if name not in available_fields)
+    ignored = sorted(name for name in fields if name not in REQUIRED_WRITABLE_FIELDS or name not in available_fields)
+    return {
+        "requested_fields": sorted(requested),
+        "available_writable_fields": sorted(name for name in available_fields if name in REQUIRED_WRITABLE_FIELDS),
+        "missing_required_fields": missing_required,
+        "ignored_fields": ignored,
     }
 
 
@@ -367,11 +388,22 @@ def _request_json(
         raise FeishuWriteError(f"Feishu returned non-JSON response: HTTP {response.status_code}") from exc
     if response.status_code >= 400:
         raise FeishuWriteError(
-            f"HTTP {response.status_code}: code={data.get('code')}, msg={data.get('msg') or response.text[:200]}"
+            _format_feishu_error(response.status_code, data, response.text)
         )
     if data.get("code") != 0:
-        raise FeishuWriteError(str(data.get("msg") or "Feishu request failed."))
+        raise FeishuWriteError(_format_feishu_error(response.status_code, data, response.text))
     return data
+
+
+def _format_feishu_error(status_code: int, data: dict[str, Any], response_text: str = "") -> str:
+    code = data.get("code")
+    msg = str(data.get("msg") or response_text[:200] or "Feishu request failed.")
+    prefix = f"HTTP {status_code}: " if status_code >= 400 else ""
+    if status_code == 403 or str(code) == "99991663":
+        return f"{prefix}Feishu permission denied: code={code}, msg={msg}"
+    if "field" in msg.lower() or "字段" in msg:
+        return f"{prefix}Feishu field mapping failed: code={code}, msg={msg}"
+    return f"{prefix}code={code}, msg={msg}"
 
 
 def _prepare_attachment_field(

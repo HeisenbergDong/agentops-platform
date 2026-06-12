@@ -4,6 +4,7 @@ from pathlib import Path
 from typing import Callable
 
 from worker.project.dev_env import command_environment, resolve_tool
+from worker.project.diagnostics import summarize_command_result
 from worker.safety.command_guard import assert_allowed_command
 from worker.safety.path_guard import assert_within_root
 
@@ -33,10 +34,13 @@ def run_project_command(
     except Exception:
         _terminate_process(process)
         raise
+    stdout = stdout or ""
+    stderr = stderr or ""
     return {
         "returncode": process.returncode,
-        "stdout": (stdout or "")[-8000:],
-        "stderr": (stderr or "")[-8000:],
+        "stdout": stdout[-8000:],
+        "stderr": stderr[-8000:],
+        "diagnostics": summarize_command_result(command, process.returncode, stdout, stderr),
     }
 
 

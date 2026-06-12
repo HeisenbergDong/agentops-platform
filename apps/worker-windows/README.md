@@ -36,6 +36,73 @@ For a single heartbeat and command poll:
 .\agentops-worker.exe --once
 ```
 
+## Run As A Managed Worker
+
+For normal Trae CN automation, use interactive logon autostart. This runs the worker in the signed-in desktop session, so it can control Trae CN and other GUI apps.
+
+From the worker directory:
+
+```powershell
+.\scripts\install_worker_autostart.ps1 -RunNow
+```
+
+This creates a Scheduled Task named `AgentOpsWorker` that starts at user logon and runs:
+
+```powershell
+.\scripts\start_worker.ps1 -Supervise
+```
+
+The task runs as the current interactive user by default. If Trae CN was installed or started elevated and you really need matching permissions, add `-RunElevated` when installing the task.
+
+The supervisor keeps the worker online, restarts it after crashes, and writes rotating logs to:
+
+```text
+%LOCALAPPDATA%\AgentOps\Worker\logs\agentops-worker.log
+```
+
+Defaults:
+
+- Restart delay: 5 seconds
+- Log rotation: 10 MiB per file
+- Retained rotated logs: 5
+
+Useful commands:
+
+```powershell
+.\scripts\status_worker.ps1
+.\scripts\stop_worker.ps1
+.\scripts\uninstall_worker_autostart.ps1
+```
+
+Tune supervision when installing:
+
+```powershell
+.\scripts\install_worker_autostart.ps1 `
+  -RestartDelaySeconds 10 `
+  -LogMaxMB 20 `
+  -LogBackups 10 `
+  -RunNow
+```
+
+## Windows Service Mode
+
+A real Windows Service entry is also available for environments that need SCM-managed startup:
+
+```powershell
+# Run in elevated PowerShell
+.\scripts\install_worker_service.ps1 -Start
+```
+
+Windows services run in Session 0 and normally cannot control the interactive Trae CN desktop. For the main GUI automation path, prefer `install_worker_autostart.ps1`. Use service mode only for diagnostics or non-GUI worker commands.
+
+Service operations:
+
+```powershell
+.\scripts\status_worker.ps1
+.\scripts\stop_worker.ps1
+.\scripts\uninstall_worker_service.ps1
+```
+
 ## Optional Paths
 
 If Trae CN or the workspace root is not in the default location, pass them during registration:

@@ -95,6 +95,15 @@ def _fetch_url(
     body = response.text or ""
     inspection = _inspect_html(body, response.headers.get("content-type", ""))
     passed = 200 <= response.status_code < 400 and len(content) > 0 and not inspection["issues"]
+    runtime_diagnostics = {
+        "passed": passed,
+        "http_ok": 200 <= response.status_code < 400,
+        "page_has_content": len(content) > 0,
+        "blocking_issues": inspection["issues"],
+        "warnings": inspection["warnings"],
+        "error_markers": inspection.get("error_markers", []),
+        "interaction": inspection.get("interaction", {}),
+    }
     return {
         "status": "passed" if passed else "failed",
         "project_path": project_path,
@@ -105,6 +114,7 @@ def _fetch_url(
         "content_length": len(content),
         "title": inspection["title"],
         "inspection": inspection,
+        "runtime_diagnostics": runtime_diagnostics,
         "message": "Browser acceptance URL responded with usable content." if passed else _acceptance_failure_message(response.status_code, inspection),
     }
 
@@ -252,6 +262,7 @@ def _inspect_html(body: str, content_type: str = "") -> dict:
     title = _extract_title(text)
     interactive_count = _interactive_count(text)
     error_markers = _error_markers(text)
+    interaction = _interaction_summary(text)
 
     if not text.strip():
         issues.append("页面返回内容为空。")
@@ -268,6 +279,8 @@ def _inspect_html(body: str, content_type: str = "") -> dict:
         "text_length": len(visible_text),
         "text_sample": visible_text[:300],
         "interactive_count": interactive_count,
+        "interaction": interaction,
+        "error_markers": error_markers,
         "issues": issues,
         "warnings": warnings,
     }
@@ -291,6 +304,33 @@ def _interactive_count(body: str) -> int:
         r"\bonclick\s*=",
     ]
     return sum(len(re.findall(pattern, body, flags=re.IGNORECASE)) for pattern in patterns)
+
+
+def _interaction_summary(body: str) -> dict:
+    tags = {
+        "buttons": len(re.findall(r"<button\b", body, flags=re.IGNORECASE)),
+        "inputs": len(re.findall(r"<input\b", body, flags=re.IGNORECASE)),
+        "selects": len(re.findall(r"<select\b", body, flags=re.IGNORECASE)),
+        "textareas": len(re.findall(r"<textarea\b", body, flags=re.IGNORECASE)),
+        "links": len(re.findall(r"<a\b[^>]*\bhref\s*=", body, flags=re.IGNORECASE)),
+        "click_handlers": len(re.findall(r"(@click|onclick|onClick)\s*=", body, flags=re.IGNORECASE)),
+    }
+    return {
+        **tags,
+        "total": sum(tags.values()),
+        "button_labels": _button_labels(body)[:12],
+        "has_form_control": bool(tags["inputs"] or tags["selects"] or tags["textareas"]),
+        "has_click_path": bool(tags["buttons"] or tags["links"] or tags["click_handlers"]),
+    }
+
+
+def _button_labels(body: str) -> list[str]:
+    labels: list[str] = []
+    for match in re.finditer(r"<button\b[^>]*>([\s\S]*?)</button>", body, flags=re.IGNORECASE):
+        label = _visible_text(match.group(1))
+        if label:
+            labels.append(label[:80])
+    return labels
 
 
 def _error_markers(body: str) -> list[str]:

@@ -4,7 +4,7 @@ import tempfile
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
-from app.db.models import Attachment, Job, RuntimeLog, TaskRound, UserConfig, WorkerCommand
+from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, UserConfig, WorkerCommand
 from app.db.session import Base
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator import worker_results
@@ -43,6 +43,8 @@ def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tm
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
     round_.round_index = 2
+    job.submitted_count = 4
+    job.satisfied_count = 0
     command.payload = {
         "prompt": "demo",
         "browser_url": "http://localhost:5173",
@@ -160,6 +162,36 @@ def test_full_worker_result_failure_path_generates_reason_after_trace_gate(tmp_p
     assert "src/app.ts:10 build failed" in reason.extra["reason"]
     assert reason.extra["evidence_summary"]["trace_chars"] > 0
     assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value)) is not None
+
+
+def test_run_command_failure_reason_includes_structured_diagnostics(tmp_path):
+    db = _test_session()
+    job, round_, command = _create_run_command_rows(db)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trace evidence")
+
+    _finish(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "returncode": 1,
+                "stderr": "build failed",
+                "diagnostics": {
+                    "summary": "Command failed (type_error) at src/App.tsx:12: npm run build",
+                    "error_type": "type_error",
+                    "primary_location": {"path": "src/App.tsx", "line": 12, "column": 5},
+                },
+            },
+        ),
+    )
+
+    reason = _latest_dissatisfaction_reason(db)
+    assert reason is not None
+    assert "src/App.tsx:12" in reason.extra["reason"]
+    assert "type_error" in reason.extra["reason"]
 
 
 def test_wait_completion_success_queues_trace_copy():
@@ -737,6 +769,8 @@ def test_git_submit_success_advances_to_feishu_preparing():
 def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)
+    job.submitted_count = 4
+    job.satisfied_count = 0
     _create_feishu_config(db, job.user_id)
     _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
     written = {}
@@ -764,6 +798,8 @@ def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
     assert job.status == JobState.PROJECT_COMPLETED
     assert round_.status == JobState.ROUND_COMPLETED
     assert round_.feishu_status == "written"
+    assert job.submitted_count == 5
+    assert job.satisfied_count == 1
     assert written["fields"]["Trae Session ID"] == VALID_TRAE_SESSION_ID
     assert written["fields"]["日志轨迹"] == "full trae trace"
     assert written["fields"]["github地址"] == "https://github.com/acme/repo.git"
@@ -810,6 +846,167 @@ def test_git_submit_unsatisfied_feishu_success_prepares_next_round(monkeypatch, 
     assert round_.feishu_status == "written"
     assert next_round is not None
     assert next_round.status == JobState.GENERATING_PROMPT
+
+
+def test_satisfied_ratio_cap_prepares_followup_round(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    round_.round_index = 2
+    job.submitted_count = 1
+    job.satisfied_count = 0
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.round_index == 3)
+        .limit(1)
+    )
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.status == JobState.GENERATING_PROMPT
+    assert round_.status == JobState.ROUND_COMPLETED
+    assert job.submitted_count == 2
+    assert job.satisfied_count == 0
+    assert next_round is not None
+
+
+def test_daily_target_stops_after_feishu_success(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    round_.round_index = 2
+    job.daily_target = 2
+    job.submitted_count = 1
+    job.satisfied_count = 0
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id)
+        .limit(1)
+    )
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.status == JobState.PROJECT_COMPLETED
+    assert round_.status == JobState.ROUND_COMPLETED
+    assert job.submitted_count == 2
+    assert job.satisfied_count == 0
+    assert next_round is None
+
+
+def test_max_round_stops_when_result_remains_unsatisfied(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    round_.round_index = 5
+    job.submitted_count = 4
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage="dissatisfaction_reason",
+            message="Dissatisfaction reason generated.",
+            level="warning",
+            extra={"reason": "still not shippable"},
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id)
+        .limit(1)
+    )
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.status == JobState.PROJECT_COMPLETED
+    assert round_.status == JobState.ROUND_COMPLETED
+    assert next_round is None
+
+
+def test_completed_project_advances_to_next_direction(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    job.directions = ["first direction", "second direction"]
+    job.submitted_count = 4
+    job.satisfied_count = 0
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="first-project",
+        direction="first direction",
+        workspace_path="D:/work/first-project",
+        status="active",
+    )
+    round_.project_id = project.id
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    db.add(project)
+    db.commit()
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id, TaskRound.round_index == 1)
+        .limit(1)
+    )
+    db.refresh(job)
+    db.refresh(round_)
+    db.refresh(project)
+    assert job.status == JobState.GENERATING_PROMPT
+    assert job.directions == ["second direction"]
+    assert project.status == "completed"
+    assert next_round is not None
+    assert next_round.project_id is None
 
 
 def test_git_submit_feishu_payload_uses_trace_overflow_attachment(monkeypatch, tmp_path):
@@ -949,7 +1146,15 @@ def test_git_submit_failure_marks_github_failed_abort():
             command_id=command.id,
             worker_id=command.worker_id,
             status="success",
-            data={"status": "push_failed", "stderr": "auth failed"},
+            data={
+                "status": "push_failed",
+                "stderr": "auth failed",
+                "push_diagnostics": {
+                    "reason": "https_token_or_credential_failed",
+                    "message": "fatal: Authentication failed",
+                    "credential_hint": "Verify the HTTPS remote uses a valid GitHub token or configured credential helper.",
+                },
+            },
         ),
     )
 
@@ -963,6 +1168,7 @@ def test_git_submit_failure_marks_github_failed_abort():
     reason = _latest_dissatisfaction_reason(db)
     assert reason is not None
     assert "auth failed" in reason.extra["reason"]
+    assert "https_token_or_credential_failed" in reason.extra["reason"]
 
 
 def test_capture_screenshot_failure_marks_manual_required():

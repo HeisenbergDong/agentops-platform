@@ -160,6 +160,7 @@ def run_git_submit(
             **base,
             "status": "push_failed",
             "push": _run_result(push_result),
+            "push_diagnostics": _push_diagnostics(push_result),
             "message": "Git commit was created but push failed.",
         }
     return {
@@ -351,6 +352,7 @@ def _push_existing_head(
             **base,
             "status": "push_failed",
             "push": _run_result(push_result),
+            "push_diagnostics": _push_diagnostics(push_result),
             "message": "Git work tree had no new staged changes, but pushing the existing HEAD failed.",
         }
     return {
@@ -360,6 +362,52 @@ def _push_existing_head(
         "push": _run_result(push_result),
         "message": "Git work tree had no new staged changes; existing HEAD was pushed.",
     }
+
+
+def _push_diagnostics(result: subprocess.CompletedProcess[str]) -> dict:
+    output = "\n".join(part for part in [result.stderr, result.stdout] if part)
+    reason = _classify_push_failure(output)
+    return {
+        "reason": reason,
+        "returncode": result.returncode,
+        "message": _first_push_error_line(output),
+        "credential_hint": _credential_hint(reason),
+    }
+
+
+def _classify_push_failure(output: str) -> str:
+    text = str(output or "").lower()
+    if any(token in text for token in ("permission denied (publickey)", "publickey", "could not read from remote repository")):
+        return "ssh_key_or_deploy_key_failed"
+    if any(token in text for token in ("authentication failed", "could not read username", "terminal prompts disabled", "repository not found")):
+        return "https_token_or_credential_failed"
+    if any(token in text for token in ("403", "write access", "permission denied", "protected branch")):
+        return "remote_permission_denied"
+    if any(token in text for token in ("failed to connect", "could not resolve host", "connection timed out", "network is unreachable")):
+        return "network_failed"
+    if any(token in text for token in ("non-fast-forward", "fetch first", "rejected")):
+        return "non_fast_forward_rejected"
+    return "push_failed"
+
+
+def _first_push_error_line(output: str) -> str:
+    for line in str(output or "").splitlines():
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if re.search(r"(fatal|error|denied|failed|rejected|403|permission|authentication)", stripped, re.IGNORECASE):
+            return stripped[:240]
+    return ""
+
+
+def _credential_hint(reason: str) -> str:
+    if reason == "ssh_key_or_deploy_key_failed":
+        return "Verify the worker SSH key is loaded and the repository deploy key has write access."
+    if reason == "https_token_or_credential_failed":
+        return "Verify the HTTPS remote uses a valid GitHub token or configured credential helper."
+    if reason == "remote_permission_denied":
+        return "Verify GitHub token scopes, deploy key write access, and branch protection."
+    return ""
 
 
 def _failed(failure_status: str, project_path: Path, message: str, **runs: Any) -> dict:

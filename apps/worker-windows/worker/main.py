@@ -16,6 +16,8 @@ from worker.config import WorkerSettings, apply_assigned_config, default_config_
 from worker.connection.client import WorkerClient
 from worker.connection.uploader import AttachmentUploader
 from worker.registration import RegistrationOptions, is_registered, machine_fingerprint, register_worker
+from worker.runtime.supervisor import SupervisorOptions, run_supervisor
+from worker.runtime.windows_service import run_windows_service
 from worker.system.console import disable_quick_edit_mode
 
 ACTIVE_COMMAND_STATUSES = {"queued", "claimed", "running"}
@@ -138,12 +140,41 @@ def _main() -> None:
     args = parser.parse_args()
 
     config_path = Path(args.config).expanduser() if getattr(args, "config", None) else default_config_path()
-    print_banner(config_path)
+    if args.command not in {"supervise", "service-run"}:
+        print_banner(config_path)
     if args.command == "register":
         worker_settings = register_from_args(args, config_path)
         if args.start:
             run_forever(worker_settings)
         return
+    if args.command == "supervise":
+        code = run_supervisor(
+            SupervisorOptions(
+                config_path=config_path,
+                log_dir=args.log_dir,
+                restart_delay_seconds=args.restart_delay_seconds,
+                max_restart_attempts=args.max_restart_attempts,
+                log_max_bytes=int(args.log_max_mb * 1024 * 1024),
+                log_backups=args.log_backups,
+                pid_file=args.pid_file,
+            )
+        )
+        raise SystemExit(code)
+    if args.command == "service-run":
+        code = run_windows_service(
+            args.service_name,
+            SupervisorOptions(
+                config_path=config_path,
+                log_dir=args.log_dir,
+                restart_delay_seconds=args.restart_delay_seconds,
+                max_restart_attempts=args.max_restart_attempts,
+                log_max_bytes=int(args.log_max_mb * 1024 * 1024),
+                log_backups=args.log_backups,
+                pid_file=args.pid_file,
+            ),
+            console_fallback=args.console_fallback,
+        )
+        raise SystemExit(code)
 
     worker_settings = load_worker_settings(config_path)
     if not is_registered(worker_settings):
@@ -182,6 +213,40 @@ def build_parser() -> argparse.ArgumentParser:
     run_parser = subparsers.add_parser("run", help="Run the registered worker")
     run_parser.add_argument("--config", help="Path to worker JSON config file")
     run_parser.add_argument("--once", action="store_true", help="Run one heartbeat/poll cycle")
+
+    supervise_parser = subparsers.add_parser("supervise", help="Run the worker under a local restart supervisor")
+    supervise_parser.add_argument("--config", help="Path to worker JSON config file")
+    supervise_parser.add_argument("--log-dir", type=Path, help="Directory for supervised worker logs")
+    supervise_parser.add_argument("--restart-delay-seconds", type=float, default=5.0, help="Delay before restarting after a crash")
+    supervise_parser.add_argument(
+        "--max-restart-attempts",
+        type=int,
+        default=0,
+        help="Maximum crash restarts before exiting; 0 means unlimited",
+    )
+    supervise_parser.add_argument("--log-max-mb", type=float, default=10.0, help="Rotate worker log after this many MiB")
+    supervise_parser.add_argument("--log-backups", type=int, default=5, help="Number of rotated worker logs to keep")
+    supervise_parser.add_argument("--pid-file", type=Path, help="Path to the supervisor pid file")
+
+    service_parser = subparsers.add_parser("service-run", help="Internal entrypoint used by Windows Service")
+    service_parser.add_argument("--config", help="Path to worker JSON config file")
+    service_parser.add_argument("--service-name", default="AgentOpsWorker", help="Windows service name")
+    service_parser.add_argument("--log-dir", type=Path, help="Directory for supervised worker logs")
+    service_parser.add_argument("--restart-delay-seconds", type=float, default=5.0, help="Delay before restarting after a crash")
+    service_parser.add_argument(
+        "--max-restart-attempts",
+        type=int,
+        default=0,
+        help="Maximum crash restarts before exiting; 0 means unlimited",
+    )
+    service_parser.add_argument("--log-max-mb", type=float, default=10.0, help="Rotate worker log after this many MiB")
+    service_parser.add_argument("--log-backups", type=int, default=5, help="Number of rotated worker logs to keep")
+    service_parser.add_argument("--pid-file", type=Path, help="Path to the supervisor pid file")
+    service_parser.add_argument(
+        "--console-fallback",
+        action="store_true",
+        help="Run as a console supervisor if not launched by Service Control Manager",
+    )
     return parser
 
 
@@ -395,7 +460,8 @@ def print_registered_status(worker_settings: WorkerSettings) -> None:
 def print_runtime_summary(worker_settings: WorkerSettings) -> None:
     log("Starting worker runtime.")
     log(f"Polling {worker_settings.server_url} every {worker_settings.poll_interval_seconds:g}s.")
-    log("Keep this window open while the worker should stay online.")
+    if sys.stdin.isatty():
+        log("Keep this window open while the worker should stay online.")
 
 
 def log(message: str) -> None:
