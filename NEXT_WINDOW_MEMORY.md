@@ -743,3 +743,33 @@ npm.cmd run build
   - `automation_errors.details`
   - `manual_required_notification` 日志
   - 飞书 webhook 机器人是否收到消息。
+
+## 2026-06-12 Worker Trae UI 视觉校准部署完成记录：`0a68ac9`
+
+- 代码提交：`0a68ac9 fix: add adaptive Trae UI vision control`，完整 commit 为 `0a68ac9d58d1816ed21d544cd0a0b37c2fac8d4a`。
+- 已通过 GitHub SSH 443 push 到 `origin/main`。
+- 生产仍使用发布目录 `/opt/agentops-platform`，不是 git 仓库；本轮用 `git archive` 源码 tar + Web dist tar + Worker ZIP 上传部署。
+- 上传目录：`/tmp/agentops-deploy-0a68ac9/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260612-0a68ac9/`。
+- 部署时特意使用 `rsync --exclude .venv` 覆盖 API 源码，避免破坏生产虚拟环境。
+- 生产 `.deploy-revision`：`0a68ac9d58d1816ed21d544cd0a0b37c2fac8d4a`。
+- 已同步到生产：
+  - API 视觉模型接口 `POST /api/workers/{worker_id}/trae-ui/analyze`。
+  - `complete_with_image()` 图片输入封装。
+  - Trae UI Analyst 角色。
+  - `manual_required_notification` webhook 机器人通知。
+  - 新版 Worker ZIP，包含自适应坐标、缓存、AI 视觉校准和按钮视觉点击逻辑。
+- 线上验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - `curl http://115.190.113.8/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产 Worker ZIP 大小：`27315131`。
+  - 生产 Worker ZIP SHA256：`bc55700fb66af5301a123c8202bdaf04878c590942d7893ce13928980ee7a759`。
+  - API 源码 grep 已确认包含 `trae-ui/analyze`、`complete_with_image`、`Trae UI Analyst`、`manual_required_notification`。
+
+下一轮用户真实验证提醒：
+- 一定要重新下载并运行生产最新 Worker ZIP；旧 worker 不具备本轮能力。
+- 如果 Trae 布局变了，预期链路是：先用缓存；缓存无效用 `adbz` 比例点；失败后截图，本地粗定位；再失败或需高置信时交给 Trae UI Analyst 视觉模型。
+- AI 视觉成功后会缓存坐标，下次同类操作应优先命中缓存。
+- 如果最终仍失败，命令会停在 `manual_required`，同时写 `automation_errors` 并通过 `webhook.url` 发飞书机器人通知。
