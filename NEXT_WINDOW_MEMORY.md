@@ -557,3 +557,29 @@ npm.cmd run build
   - `data.open_trae.window_diagnostics.workspace_marker/matching_count/windows`
   - `data.submission.probe`
   - 若失败则看 `error` 中的 `submission_probe`
+## 2026-06-12 Worker 提交校验修复部署完成记录（`d9d12db`）
+
+- 代码提交：`d9d12db fix: verify Trae prompt submission`，已通过 GitHub SSH 443 push 到 `origin/main`。
+- 生产环境仍是发布目录；本轮继续使用 source tar + Web dist tar + Worker ZIP 上传部署。
+- 上传目录：`/tmp/agentops-deploy-d9d12db/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260612-d9d12db/`。
+- 生产 `.deploy-revision`：`d9d12db5121e64148ea87ba97ddd439b0fe36f0a`。
+- 已同步到生产：
+  - API `send_prompt` payload 显式包含 `verify_submission=true` 和 `submission_timeout_seconds=20`。
+  - Worker 目标工作区窗口匹配、`--reuse-window`、提交后 Trae turn 校验、空壳窗口文本拦截均已上线。
+  - 新版 Worker ZIP 已覆盖到 `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 部署过程注意：
+  - 第一次远端部署命令被 PowerShell 展开 `$变量` 影响，在 `mkdir` 阶段失败，未覆盖生产。
+  - 第二次部署复制源码时删除了生产 `apps/api/.venv`，导致 `agentops-api` 一度 `203/EXEC`；已从 `/opt/agentops-deploy-backups/20260612-d9d12db/api/.venv` 恢复 `.venv` 并重启成功。
+  - `.deploy-revision` 曾因远端命令换行写入末尾 `n`，已用 `echo` 修正。
+- 线上验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产源码确认包含 `verify_submission`、`submission_probe`、`--reuse-window`、`only window chrome text`。
+  - 生产 Worker ZIP 大小：`27289192`，文件头：`PK`。
+
+下一轮真实测试重点：
+- 先下载/运行最新版 Worker，并确认只保留一个 Worker 进程。
+- 如果当前 Trae 是旧项目窗口，新 Worker 应复用窗口切换到目标工作区；若标题无法匹配，会停在错误而不是把 prompt 发错项目。
+- prompt 发出后必须检测到本轮 Trae 用户消息才继续等待回复；否则应停在 `manual_required`。
