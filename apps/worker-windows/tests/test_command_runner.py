@@ -9,6 +9,7 @@ from worker.runtime.command_runner import CommandRunner
 from worker.project.git_submit import run_git_submit
 from worker.trae.diagnose import detect_terminal_prompt
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
+from worker.trae import window as trae_window
 from worker.trae.window import TraeAutomationError
 
 
@@ -22,7 +23,7 @@ def test_runner_uses_configured_worker_id():
     assert result["data"] == {"stopped": True}
 
 
-def test_send_prompt_opens_workspace_and_sends(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     workspace = tmp_path / "project"
     workspace.mkdir()
     ensured = []
@@ -64,7 +65,7 @@ def test_send_prompt_opens_workspace_and_sends(monkeypatch: pytest.MonkeyPatch, 
     assert result["data"]["status"] == "sent"
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
     assert result["data"]["open_trae"]["status"] == "launched"
-    assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, True)]
+    assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
 
 
 def test_send_prompt_auto_starts_trae_without_workspace_payload(
@@ -146,6 +147,23 @@ def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyP
     assert result["status"] == "success"
     assert result["data"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
+
+
+def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.MonkeyPatch):
+    monkeypatch.setattr(
+        trae_window,
+        "_find_top_level_windows",
+        lambda marker: [(101, "Trae CN - first"), (202, "Trae CN - second")],
+    )
+
+    result = trae_window.trae_window_diagnostics(selected_hwnd=202)
+
+    assert result["count"] == 2
+    assert result["selected_hwnd"] == 202
+    assert result["windows"] == [
+        {"hwnd": 101, "title": "Trae CN - first", "selected": False},
+        {"hwnd": 202, "title": "Trae CN - second", "selected": True},
+    ]
 
 
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

@@ -71,7 +71,6 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
                 "github_remote_url": project_context.get("github_remote_url", ""),
                 "github_repo_name": project_context["project_name"],
                 "github_branch": str(worker_settings.get("github_branch") or "main"),
-                "force_open_workspace": True,
             },
         ),
     )

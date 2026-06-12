@@ -154,6 +154,7 @@ def ensure_trae_running(
             "status": "already_running",
             "window_title": title,
             "workspace_path": str(workspace_path) if workspace_path else "",
+            "window_diagnostics": trae_window_diagnostics(selected_hwnd=existing.hwnd),
         }
 
     launch_result = open_trae(trae_exe_path, workspace_path)
@@ -164,6 +165,7 @@ def ensure_trae_running(
     return {
         **launch_result,
         "window_title": title,
+        "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd),
     }
 
 
@@ -180,7 +182,23 @@ def find_trae_window(timeout_seconds: float = 10.0) -> TraeWindow:
 def focus_trae(timeout_seconds: float = 10.0) -> dict:
     window = find_trae_window(timeout_seconds)
     title = _focus_window(window)
-    return {"status": "focused", "window_title": title}
+    return {"status": "focused", "window_title": title, "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd)}
+
+
+def trae_window_diagnostics(selected_hwnd: int | None = None) -> dict:
+    windows = _find_top_level_windows("Trae")
+    return {
+        "count": len(windows),
+        "selected_hwnd": int(selected_hwnd or 0),
+        "windows": [
+            {
+                "hwnd": hwnd,
+                "title": title,
+                "selected": bool(selected_hwnd and hwnd == selected_hwnd),
+            }
+            for hwnd, title in windows
+        ],
+    }
 
 
 def window_text_snapshot(window: Any, limit: int = 300) -> str:
@@ -204,8 +222,13 @@ def window_text_snapshot(window: Any, limit: int = 300) -> str:
 
 
 def _find_top_level_window(title_marker: str) -> int:
+    windows = _find_top_level_windows(title_marker)
+    return windows[0][0] if windows else 0
+
+
+def _find_top_level_windows(title_marker: str) -> list[tuple[int, str]]:
     user32 = ctypes.windll.user32
-    found = ctypes.c_void_p(0)
+    found: list[tuple[int, str]] = []
 
     @ctypes.WINFUNCTYPE(ctypes.c_bool, ctypes.c_void_p, ctypes.c_void_p)
     def enum_proc(hwnd: int, _lparam: int) -> bool:
@@ -213,12 +236,11 @@ def _find_top_level_window(title_marker: str) -> int:
             return True
         title = _window_title(hwnd)
         if title_marker.lower() in title.lower():
-            found.value = int(hwnd)
-            return False
+            found.append((int(hwnd), title))
         return True
 
     user32.EnumWindows(enum_proc, 0)
-    return int(found.value or 0)
+    return found
 
 
 def _try_find_trae_window() -> TraeWindow | None:

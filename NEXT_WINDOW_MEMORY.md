@@ -403,3 +403,60 @@ npm.cmd run build
 - 点击开始/重开后，Worker 才应打开/聚焦 Trae，并优先点击截图左下 SOLO Agent 输入区。
 - 如果输入仍失败，优先查看 Dashboard 当前 worker command 的 `result.data.input` 字段。
 - 重开按钮应快速返回，随后日志显示后台 prompt 生成和 Worker 派发。
+
+## 2026-06-12 重开打开两个 Trae 窗口修复记录
+
+用户继续反馈：
+
+- 打开 Worker 后点“重开”会打开两个 Trae 窗口。
+- 提示词仍没有输出到 Trae。
+
+定位结果：
+
+- 这次不是 Worker 启动自开 Trae，而是重开后台生成 prompt 后派发 `send_prompt`。
+- 服务端 `dispatch_prompt_to_worker()` 的 payload 里显式带了 `force_open_workspace: True`。
+- Worker `_send_prompt()` 之前在有 `workspace_path` 时也会默认 `force_open_workspace=True`。
+- 因此只要已有 Trae 窗口或旧命令/重复命令存在，就可能再次执行 `Trae CN.exe <workspace_path>`，造成双窗口；双窗口后 `find_trae_window()` 只拿第一个标题包含 Trae 的窗口，容易聚焦错窗口，提示词自然没有进正确的 SOLO Agent 输入框。
+- 本地重打 Worker 时发现有两个旧 `agentops-worker.exe` 进程占用 dist 里的 EXE，已手动结束后成功打包。这说明用户测试时也可能同时启动了两个 Worker 进程，后续测试前应确保只保留一个 Worker。
+
+已完成代码改动：
+
+- `apps/api/app/services/orchestrator/worker_dispatch.py`
+  - 删除 `send_prompt` payload 里的 `force_open_workspace: True`。
+- `apps/worker-windows/worker/runtime/command_runner.py`
+  - `_send_prompt()` 默认不再因为 `workspace_path` 强制打开新的 Trae 窗口；只有 payload 明确给 `force_open_workspace=true` 才会强制。
+- `apps/worker-windows/worker/trae/window.py`
+  - 新增 `trae_window_diagnostics()`，返回当前找到的 Trae 顶层窗口数量、标题、hwnd 和选中的窗口。
+  - `ensure_trae_running()` 与 `focus_trae()` 返回中附带 `window_diagnostics`，方便从 Worker 命令结果直接看是否存在多个 Trae 窗口、选中了哪个窗口。
+- 测试补充：
+  - `send_prompt` 带 workspace 时不会默认强制新开 Trae。
+  - 服务端派发 `send_prompt` 不再包含 `force_open_workspace`。
+  - 多 Trae 窗口诊断字段能正确标记选中窗口。
+
+已验证：
+
+- Worker 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\worker-windows`
+  - `.\.venv\Scripts\python -m pytest tests`
+  - 结果：`72 passed, 2 warnings`
+- API 全量测试：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\api`
+  - `..\worker-windows\.venv\Scripts\python -m pytest tests`
+  - 结果：`88 passed, 3 warnings`
+- Web 构建：
+  - `cd D:\code-space\auto-tool\agentops-platform\apps\web`
+  - `npm.cmd run build`
+  - 结果：通过；仍有 Vite chunk size warning。
+- Windows Worker 打包：
+  - 第一次失败：旧 `agentops-worker.exe` 被本地两个 `agentops-worker` 进程占用。
+  - 已结束本地两个旧 Worker 进程后重跑：
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+  - 结果：成功。
+  - 新 ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27284782`
+
+下一轮测试重点：
+
+- 测试前先确认本机只运行一个 `agentops-worker.exe`。
+- 打开 Worker 后点重开，应只打开/聚焦一个 Trae 窗口，不应连续打开两个。
+- 如果仍有两个 Trae 窗口，优先看 Worker 命令返回里的 `data.open_trae.window_diagnostics.count/windows/selected_hwnd`。

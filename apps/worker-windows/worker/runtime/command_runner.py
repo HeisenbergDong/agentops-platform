@@ -149,7 +149,7 @@ class CommandRunner:
         open_result = self.ensure_trae_ready(
             workspace_path,
             launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
-            force_open_workspace=bool(payload.get("force_open_workspace", bool(workspace_path))),
+            force_open_workspace=bool(payload.get("force_open_workspace", False)),
         )
         sent_at_epoch = time.time()
         send_result = send_prompt(

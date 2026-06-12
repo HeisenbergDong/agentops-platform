@@ -496,6 +496,7 @@ def test_worker_dispatch_uses_current_user_worker_settings_only():
     assert command.payload["workspace_root"] == "D:/mr-d"
     assert command.payload["project_name"].startswith("demo-")
     assert command.payload["trae_workspace_path"].replace("\\", "/").startswith("D:/mr-d/demo-")
+    assert "force_open_workspace" not in command.payload
 
 
 def test_worker_dispatch_names_project_from_chinese_core_feature():
