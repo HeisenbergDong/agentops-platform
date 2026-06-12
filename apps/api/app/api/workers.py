@@ -375,10 +375,16 @@ def _unique_path(path: Path) -> Path:
 def _worker_package_path() -> Path | None:
     candidates: list[Path] = []
     if settings.worker_package_path:
-        candidates.append(Path(settings.worker_package_path))
+        configured = Path(settings.worker_package_path)
+        candidates.append(configured)
+        if not configured.is_absolute():
+            candidates.append(settings.repo_root / configured)
+    attachment_root = Path(settings.attachment_root)
     candidates.extend(
         [
-            settings.attachment_root / "worker-packages" / "agentops-worker-windows.zip",
+            attachment_root / "worker-packages" / "agentops-worker-windows.zip",
+            settings.repo_root / attachment_root / "worker-packages" / "agentops-worker-windows.zip",
+            settings.repo_root / "storage" / "worker-packages" / "agentops-worker-windows.zip",
             settings.repo_root / "apps" / "worker-windows" / "dist" / "agentops-worker-windows.zip",
             settings.repo_root / "apps" / "worker-windows" / "dist" / "agentops-worker-windows" / "agentops-worker-windows.zip",
         ]

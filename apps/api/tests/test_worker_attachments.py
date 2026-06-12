@@ -67,6 +67,17 @@ def test_download_worker_package_reports_missing(monkeypatch):
         raise AssertionError("Expected missing worker package to return 404")
 
 
+def test_worker_package_path_checks_repo_storage_for_relative_attachment_root(monkeypatch, tmp_path: Path):
+    package = tmp_path / "storage" / "worker-packages" / "agentops-worker-windows.zip"
+    package.parent.mkdir(parents=True)
+    package.write_bytes(b"zip")
+    monkeypatch.setattr(workers.settings, "worker_package_path", None)
+    monkeypatch.setattr(workers.settings, "attachment_root", Path("storage"))
+    monkeypatch.setattr(workers.settings, "repo_root", tmp_path)
+
+    assert workers._worker_package_path() == package.resolve()
+
+
 def _test_session():
     engine = create_engine("sqlite+pysqlite:///:memory:")
     Base.metadata.create_all(engine)
