@@ -1114,6 +1114,45 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+
+## 2026-06-13 Trae 本地回合完成优先与首轮慢等待修复部署完成记录
+
+本记录覆盖前文同名“待部署”记录。
+
+- 代码提交：`3691b90 fix: trust Trae turn completion before UI intervention`，完整 commit 为 `3691b90cdeafe7bf21ae697498b3b09f4d590bd1`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-3691b90/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-194027-3691b90`。
+- 已同步到生产：
+  - API 源码：`apps/api/app/services/orchestrator/worker_results.py` 等当前 commit 源码，覆盖时排除生产 `.venv`。
+  - Worker 源码与测试：`worker/trae/wait.py`、`test_trae_intervention.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 部署过程注意：
+  - 首次用 zip 解 Web dist 时，Linux 上出现 `assets\index-...` 这种反斜杠文件名；已在生产手动整理为 `dist/assets/index-...`，两个静态资源均验证 `200`。
+  - 后续部署 Web dist 建议优先用 tar 或在 Linux 解压后规范化路径，避免 Windows zip 路径分隔符问题复现。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200`。
+  - Web 静态资源 `/assets/index-Cy1tcbtz.js` 和 `/assets/index-DFn3rpGU.css` 返回 `200`。
+  - 生产 Worker ZIP 大小：`27325312`。
+  - 生产 Worker ZIP SHA256：`121aaaafd442cb281a1f3b267dab61bc81310e57ecad03cbb374056d922a1a3a`。
+  - 生产 Worker ZIP 文件头：`PK`。
+- 本地验证：
+  - Worker targeted：`15 passed`。
+  - API targeted：`44 passed`。
+  - Worker 全量：`92 passed, 2 warnings`。
+  - API 全量：`94 passed, 3 warnings`。
+  - Web build：通过，仅 Vite chunk size warning。
+  - `git diff --check`：通过。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP，关闭旧 `agentops-worker.exe`。
+- 预期行为：Trae 左侧/本地日志已经确认当前 turn `completed` 时，即使右侧还有 `变更已完成/保留 Ctrl+Enter` 操作条，Worker 也应直接进入复制 trace，不再反复移动鼠标诊断。
+- 首轮默认 300 秒无变化才做空闲 UI 干预；明确的 3003、继续、确认执行等可恢复状态仍会及时处理。
 ## 2026-06-13 Trae 本地回合完成优先与首轮慢等待修复记录（待部署）
 
 用户真实自测反馈：
