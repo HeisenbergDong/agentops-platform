@@ -10,6 +10,7 @@ class FakeClient:
         self.ack_response = ack_response
         self.heartbeat_response = heartbeat_response or {"status": "ok"}
         self.results = []
+        self.logs = []
 
     def heartbeat(self, payload):
         return self.heartbeat_response
@@ -22,6 +23,10 @@ class FakeClient:
 
     def post_result(self, worker_id, payload):
         self.results.append(payload)
+        return {"status": "received"}
+
+    def post_log(self, worker_id, payload):
+        self.logs.append(payload)
         return {"status": "received"}
 
     def upload_attachment(self, worker_id, path, *, kind, job_id=None, round_id=None, content_type="application/octet-stream"):
@@ -73,6 +78,46 @@ def test_run_once_skips_command_cancelled_after_ack(tmp_path: Path):
     assert processed == 1
     assert runner.ran is False
     assert client.results[0]["status"] == "cancelled"
+
+
+def test_wait_completion_recovery_event_is_info_and_carries_result(tmp_path: Path):
+    command = {
+        "command_id": "cmd1",
+        "job_id": "job1",
+        "round_id": "round1",
+        "type": "wait_completion",
+        "lease_id": "claim-1",
+        "payload": {},
+    }
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
+
+    class WaitingRunner(FakeRunner):
+        def run(self, command):
+            self.ran = True
+            return {
+                "command_id": command["command_id"],
+                "worker_id": "worker-test",
+                "status": "failed",
+                "message": "Command failed",
+                "data": {"output_probe": {"reason": "trace_too_short"}},
+                "error": "not complete",
+            }
+
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=WaitingRunner(), worker_settings=settings)
+
+    assert processed == 1
+    finished = client.logs[-1]
+    assert finished["stage"] == "worker_command_finished"
+    assert finished["level"] == "info"
+    assert finished["extra"]["result_status"] == "failed"
+    assert finished["extra"]["result"]["output_probe"]["reason"] == "trace_too_short"
 
 
 def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):

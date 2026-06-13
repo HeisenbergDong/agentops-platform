@@ -8,6 +8,7 @@ from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog,
 from app.db.session import Base
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator import worker_results
+from app.services.orchestrator.events import build_display_message
 from app.services.orchestrator.worker_results import handle_worker_result
 from app.services import webhook_notifier
 from app.worker_gateway.contracts import WorkerCommandType, WorkerResult
@@ -1207,6 +1208,17 @@ def test_copy_latest_reply_incomplete_trace_queues_continue_recovery():
     assert next_command is not None
     assert next_command.status == "queued"
     assert next_command.payload["continue_attempts"] == 1
+    assert next_command.payload["recovery_reason"] == "trace_too_short"
+    recovery_log = db.scalar(
+        select(RuntimeLog)
+        .where(RuntimeLog.stage == JobState.AWAITING_CONTINUE)
+        .order_by(RuntimeLog.created_at)
+        .limit(1)
+    )
+    assert recovery_log is not None
+    assert recovery_log.level == "info"
+    assert "复制到的轨迹太短" in recovery_log.display_message
+    assert "人工处理" not in recovery_log.display_message
 
 
 def test_click_continue_success_queues_wait_completion_again():
@@ -1226,6 +1238,25 @@ def test_click_continue_success_queues_wait_completion_again():
     assert round_.status == JobState.WAITING_TRAE
     assert next_command is not None
     assert next_command.payload["continue_attempts"] == 1
+
+
+def test_click_continue_typed_continue_event_message_is_precise():
+    message = build_display_message(
+        "worker_command_finished",
+        "click_continue worker_command_finished",
+        extra={
+            "command_type": WorkerCommandType.CLICK_CONTINUE.value,
+            "result_status": "success",
+            "result": {
+                "status": "clicked",
+                "action_taken": "typed_continue",
+                "intervention": {"mode": "continue-text", "text": "继续"},
+            },
+        },
+    )
+
+    assert "输入“继续”" in message
+    assert "点击 Trae CN 的继续按钮" not in message
 
 
 def test_incomplete_trace_stops_after_max_continue_attempts():

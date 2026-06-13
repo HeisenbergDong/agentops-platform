@@ -951,3 +951,46 @@ npm.cmd run build
 - 如果 Trae 仍在执行中，Dashboard 不应再出现提前进入复制回复的日志；应继续等待或进入继续/保留干预。
 - 过程中 Trae 不应再被复制回复滚动步骤还原成非全屏。
 - 多项目范围可以粘贴成多行或编号列表；后端会拆分并扩展为约 20 个项目方向，按每项目最多 5 轮去覆盖 100 轮目标。
+
+## 2026-06-13 Trae 续写恢复流程日志准确性修复记录（待部署）
+
+用户真实自测反馈：
+- Dashboard 反复显示 `Worker 命令执行失败或需要人工处理`，但实际只是恢复流程在尝试确认 Trae 是否收口。
+- Trae 没有出现继续按钮，Dashboard 却显示 `Worker 正在点击 Trae CN 的继续按钮`。
+- 用户要求参考 `D:\adbz`：流程日志要像 D 盘那样准确说明当前在做什么、卡在哪、实际采取了什么动作。
+
+定位结果：
+- Worker 主循环每个命令结束都会发 `worker_command_finished`，旧文案只按 status 兜底，`wait_completion/copy_latest_reply` 的可恢复失败也显示成“失败或需要人工处理”。
+- `click_continue` 是恢复命令名，但实际可能是点击真实按钮、视觉点击、输入“继续”或 fallback；旧文案固定写“点击继续按钮”，导致用户误以为 Worker 看到了按钮。
+- `_queue_continue_recovery()` 把恢复日志标成 warning 且话术像异常，和 D 盘“未收口则继续观察/续写恢复，真正阻塞才人工处理”的口径不一致。
+
+已完成代码改动：
+- `events.py`：
+  - `awaiting_continue` 改成“当前回复还没有确认收口，Worker 正在尝试续写恢复”，并显示恢复原因与第几次尝试。
+  - `click_continue` started 文案改为“尝试让 Trae CN 当前回复继续收口”，不再假定正在点击按钮。
+  - `wait_completion/copy_latest_reply` 非成功文案改成“暂时未确认完成/未拿到完整轨迹，调度器会继续恢复”，不再显示通用人工处理。
+  - `click_continue` finished 文案会按实际动作区分：点击按钮、输入“继续”、视觉点击、fallback。
+- `worker_results.py`：
+  - 续写恢复日志从 warning 改为 info。
+  - 结构化写入 `recovery_reason`、`continue_attempts`、`max_continue_attempts`，显示如“复制到的轨迹太短”“Trae 当前回合仍未完成”“服务中断”等中文原因。
+  - `click_continue` 成功后显示实际恢复动作，再重新等待 Trae 收口。
+- `worker/main.py`：
+  - Worker 结束事件携带 `result.data`，API 可根据真实结果生成准确日志。
+  - `wait_completion/copy_latest_reply` 的可恢复非成功结束事件降为 info；真正人工接管仍保留 warning/error。
+- `worker/trae/intervene.py`：
+  - `click_continue()` 返回 `action_taken`，区分 `typed_continue`、`clicked_button`、`clicked_visual_target`、`clicked_primary_fallback`。
+
+已验证：
+- Worker targeted：`20 passed`、`10 passed`。
+- API targeted：`50 passed`。
+- Worker 全量：`86 passed, 2 warnings`。
+- API 全量：`94 passed, 3 warnings`。
+- Web build：通过，仅 Vite chunk size warning。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`。
+- Worker ZIP 大小：`27321417`。
+- Worker ZIP SHA256：`90b42794ecdf5531942f9a2051f227fcb065e9b13c1a6b6c57e5f2f56f4b689c`。
+
+待完成：
+- commit/push GitHub。
+- 部署生产：API 源码、Web dist、新 Worker ZIP。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。

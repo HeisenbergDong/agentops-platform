@@ -55,8 +55,10 @@ def click_continue(
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
     if isinstance(suggested, dict) and suggested:
         result = apply_intervention(suggested, timeout_seconds=timeout_seconds)
+        action_taken = _action_taken_from_result(result)
         return {
             "status": "clicked" if result.get("status") == "applied" else result.get("status", "attempted"),
+            "action_taken": action_taken,
             "intervention": result,
             "diagnosis": _compact_diagnosis(diagnosis),
         }
@@ -66,7 +68,12 @@ def click_continue(
     if candidates:
         button_text, button = candidates[0]
         button.click_input()
-        return {"status": "clicked", "button_text": button_text, "diagnosis": _compact_diagnosis(diagnosis)}
+        return {
+            "status": "clicked",
+            "action_taken": "clicked_button",
+            "button_text": button_text,
+            "diagnosis": _compact_diagnosis(diagnosis),
+        }
 
     visual = click_visual_intervention(
         action=_action_from_diagnosis(diagnosis),
@@ -74,11 +81,21 @@ def click_continue(
         ui_analyst=ui_analyst,
     )
     if visual.get("status") == "clicked":
-        return {"status": "clicked", "intervention": visual, "diagnosis": _compact_diagnosis(diagnosis)}
+        return {
+            "status": "clicked",
+            "action_taken": "clicked_visual_target",
+            "intervention": visual,
+            "diagnosis": _compact_diagnosis(diagnosis),
+        }
 
     fallback = click_primary_fallback()
     if fallback.get("status") == "clicked":
-        return {"status": "clicked", "intervention": fallback, "diagnosis": _compact_diagnosis(diagnosis)}
+        return {
+            "status": "clicked",
+            "action_taken": "clicked_primary_fallback",
+            "intervention": fallback,
+            "diagnosis": _compact_diagnosis(diagnosis),
+        }
     raise TraeAutomationError("No safe Trae intervention target was found")
 
 
@@ -104,6 +121,21 @@ def apply_intervention(intervention: dict[str, Any], timeout_seconds: float = 10
     if mode == "primary-fallback":
         return click_primary_fallback()
     raise TraeAutomationError(f"Unsupported Trae intervention mode: {mode}")
+
+
+def _action_taken_from_result(result: dict[str, Any]) -> str:
+    mode = str(result.get("mode") or "")
+    if mode == "continue-text":
+        return "typed_continue"
+    if mode == "terminal-input":
+        return "typed_terminal_input"
+    if mode == "click-point":
+        return "clicked_button"
+    if mode == "primary-fallback":
+        return "clicked_primary_fallback"
+    if "visual-intervention" in mode:
+        return "clicked_visual_target"
+    return mode or "attempted"
 
 
 def send_text_to_trae(text: str, submit: bool = True) -> dict:

@@ -2,7 +2,7 @@ import pytest
 
 from worker.trae import wait as wait_module
 from worker.trae.diagnose import diagnose_ui
-from worker.trae.intervene import apply_intervention
+from worker.trae.intervene import apply_intervention, click_continue
 
 
 def test_diagnose_ui_classifies_safe_action_button(monkeypatch: pytest.MonkeyPatch):
@@ -79,6 +79,32 @@ def test_continue_text_intervention_targets_chat_prompt(monkeypatch: pytest.Monk
     assert result["status"] == "applied"
     assert result["mode"] == "continue-text"
     assert result["input"]["method"] == "adbz_coordinate_primary"
+
+
+def test_click_continue_reports_typed_continue_when_no_button(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(
+        "worker.trae.intervene.diagnose_ui",
+        lambda timeout_seconds, scroll_bottom: {
+            "state": "awaiting_continue",
+            "suggested_intervention": {"mode": "continue-text", "text": "\u7ee7\u7eed"},
+        },
+    )
+    monkeypatch.setattr(
+        "worker.trae.intervene.send_prompt",
+        lambda text, submit=True: {"input": {"method": "adbz_coordinate_primary"}},
+    )
+    monkeypatch.setattr("worker.trae.intervene.find_trae_window", lambda timeout_seconds: FakeWindow())
+
+    result = click_continue()
+
+    assert result["status"] == "clicked"
+    assert result["action_taken"] == "typed_continue"
+    assert result["intervention"]["mode"] == "continue-text"
 
 
 def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch):

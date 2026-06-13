@@ -192,7 +192,7 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         command,
         job,
         round_,
-        "Worker could not confirm Trae completion; asking Trae to continue before collecting trace again.",
+        "Worker has not confirmed the current Trae reply is complete; recovery will continue before trace collection.",
         extra,
     )
 
@@ -209,7 +209,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             command,
             job,
             round_,
-            "Worker could not copy a complete Trae assistant trace; asking Trae to continue before retrying.",
+            "Worker did not copy a complete Trae assistant trace; recovery will continue before retrying collection.",
             extra,
         )
         return
@@ -225,7 +225,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             command,
             job,
             round_,
-            f"Trae copied reply still needs recovery ({probe_reason}); continuing Trae before retrying trace collection.",
+            f"Trae copied reply still needs recovery ({probe_reason}); retrying recovery before trace collection.",
             {**extra, "trace_probe": worker_probe, "trace_chars": len(raw_trace)},
         )
         return
@@ -245,7 +245,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             command,
             job,
             round_,
-            f"Trae trace is not complete yet ({validation['reason']}); continuing Trae before retrying trace collection.",
+            f"Trae trace is not complete yet ({validation['reason']}); retrying recovery before trace collection.",
             trace_extra,
         )
         return
@@ -262,7 +262,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
                     command,
                     job,
                     round_,
-                    f"Current Trae turn is not complete yet ({gate['reason']}); continuing Trae before retrying trace collection.",
+                    f"Current Trae turn is not complete yet ({gate['reason']}); retrying recovery before trace collection.",
                     trace_extra,
                 )
                 return
@@ -411,8 +411,8 @@ def _handle_click_continue_result(db: Session, command: WorkerCommand, result: W
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.AWAITING_CONTINUE,
-        message="Worker clicked Trae continue; waiting for the assistant reply to finish.",
-        extra=extra,
+        message="Worker completed a Trae recovery action; waiting for the assistant reply to finish.",
+        extra={**extra, "display_message": _continue_action_display_message(result.data)},
     )
     wait_command = _enqueue_worker_command(
         db,
@@ -432,7 +432,11 @@ def _handle_click_continue_result(db: Session, command: WorkerCommand, result: W
         round_id=round_.id if round_ else None,
         stage=JobState.WAITING_TRAE,
         message="wait_completion worker command queued after continuing Trae.",
-        extra={"worker_id": wait_command.worker_id, "command_id": wait_command.id},
+        extra={
+            "worker_id": wait_command.worker_id,
+            "command_id": wait_command.id,
+            "display_message": "续写恢复动作已完成，Worker 重新观察 Trae CN 回复是否收口。",
+        },
     )
 
 
@@ -1337,14 +1341,21 @@ def _queue_continue_recovery(
     job.status = JobState.AWAITING_CONTINUE
     if round_:
         round_.status = JobState.AWAITING_CONTINUE
-    recovery_extra = {**extra, "continue_attempts": continue_attempts, "max_continue_attempts": max_continue_attempts}
+    recovery_reason = _recovery_reason(extra)
+    recovery_extra = {
+        **extra,
+        "continue_attempts": continue_attempts,
+        "max_continue_attempts": max_continue_attempts,
+        "recovery_reason": recovery_reason,
+        "display_message": _recovery_display_message(recovery_reason, continue_attempts, max_continue_attempts),
+    }
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.AWAITING_CONTINUE,
         message=message,
-        level="warning",
+        level="info",
         extra=recovery_extra,
     )
     continue_command = _enqueue_worker_command(
@@ -1355,6 +1366,7 @@ def _queue_continue_recovery(
             "timeout_seconds": source_command.payload.get("continue_timeout_seconds", 10),
             "continue_attempts": continue_attempts,
             "max_continue_attempts": max_continue_attempts,
+            "recovery_reason": recovery_reason,
         },
     )
     add_log(
@@ -1362,9 +1374,87 @@ def _queue_continue_recovery(
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.AWAITING_CONTINUE,
-        message="click_continue worker command queued for incomplete Trae reply recovery.",
-        extra={"worker_id": continue_command.worker_id, "command_id": continue_command.id},
+        message="Trae recovery worker command queued for incomplete reply recovery.",
+        extra={
+            "worker_id": continue_command.worker_id,
+            "command_id": continue_command.id,
+            "recovery_reason": recovery_reason,
+            "continue_attempts": continue_attempts,
+            "max_continue_attempts": max_continue_attempts,
+            "display_message": "已安排 Worker 进行一次续写恢复，完成后会重新等待 Trae CN 回复收口。",
+        },
     )
+
+
+def _recovery_reason(extra: dict) -> str:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    for source in (
+        extra.get("current_turn_gate"),
+        data.get("current_turn_gate"),
+        extra.get("validation"),
+        data.get("validation"),
+        extra.get("trace_probe"),
+        data.get("trace_probe"),
+        extra.get("output_probe"),
+        data.get("output_probe"),
+    ):
+        if isinstance(source, dict) and str(source.get("reason") or "").strip():
+            return str(source.get("reason")).strip()
+    error = str(extra.get("error") or "").strip()
+    if "did not become stable" in error:
+        return "wait_completion_timeout"
+    if error:
+        return "worker_command_error"
+    return "incomplete_trae_reply"
+
+
+def _recovery_display_message(reason: str, attempts: int, max_attempts: int) -> str:
+    reason_text = _recovery_reason_text(reason)
+    if max_attempts > 0:
+        suffix = f"（第 {attempts}/{max_attempts} 次）"
+    else:
+        suffix = f"（第 {attempts} 次）"
+    return f"当前回复还没有确认收口（{reason_text}），Worker 正在尝试续写恢复{suffix}。"
+
+
+def _recovery_reason_text(reason: str) -> str:
+    if reason.startswith("trae_turn_not_completed"):
+        return "Trae 当前回合仍未完成"
+    labels = {
+        "awaiting_continuation": "回复提示需要继续",
+        "awaiting_current_continuation": "当前回合需要继续",
+        "service_interrupted": "Trae 回复出现中断信号",
+        "no_completed_turn_after_prompt_send": "还没有找到本次提示词后的完成回合",
+        "trace_too_short": "复制到的轨迹太短",
+        "empty_trace": "没有复制到回复轨迹",
+        "missing_tool_trace_markers": "回复轨迹缺少工具执行记录",
+        "final_summary_only": "只复制到总结，没有完整执行过程",
+        "partial_code_copy": "复制到的是局部代码片段",
+        "pending_intervention_visible": "界面仍显示待确认操作",
+        "turn_probe_unavailable": "无法读取 Trae 本地回合状态",
+        "wait_completion_timeout": "等待完成超时",
+        "worker_command_error": "Worker 命令返回异常",
+        "incomplete_trae_reply": "回复或轨迹不完整",
+    }
+    return labels.get(reason, reason.replace("_", " ") if reason else "回复或轨迹不完整")
+
+
+def _continue_action_display_message(data: dict) -> str:
+    action_taken = str(data.get("action_taken") or "").strip()
+    intervention = data.get("intervention") if isinstance(data.get("intervention"), dict) else {}
+    mode = str(intervention.get("mode") or data.get("mode") or "")
+    button_text = str(data.get("button_text") or "").strip()
+    if button_text:
+        return f"Worker 已点击 Trae CN 的「{button_text}」按钮，接下来重新等待回复收口。"
+    if action_taken == "typed_continue" or mode == "continue-text":
+        return "Worker 没有确认到可点击的继续按钮，已向 Trae CN 输入“继续”，接下来重新等待回复收口。"
+    if action_taken == "clicked_button" or mode == "click-point":
+        return "Worker 已点击诊断到的继续/确认操作，接下来重新等待回复收口。"
+    if action_taken == "clicked_visual_target" or "visual-intervention" in mode:
+        return "Worker 已按界面诊断结果点击可恢复操作，接下来重新等待回复收口。"
+    if action_taken == "clicked_primary_fallback" or mode == "primary-fallback":
+        return "Worker 未识别到明确按钮，已尝试安全的主操作位置，接下来重新观察 Trae CN。"
+    return "Worker 已完成一次续写恢复尝试，接下来重新等待 Trae CN 回复收口。"
 
 
 def _ensure_trace_gate(

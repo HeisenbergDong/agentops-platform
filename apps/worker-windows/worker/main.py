@@ -83,10 +83,11 @@ def run_once(
             worker_settings.worker_id,
             command,
             "worker_command_finished",
-            level="info" if result.get("status") in {"ok", "success", "completed"} else "warning",
+            level=worker_command_finished_level(str(command.get("type") or ""), str(result.get("status") or "")),
             extra={
                 "result_status": result.get("status"),
                 "error": result.get("error") or "",
+                "result": result.get("data") if isinstance(result.get("data"), dict) else {},
             },
         )
         client.post_result(worker_settings.worker_id, result)
@@ -438,6 +439,14 @@ def post_worker_event(
         )
     except Exception as exc:
         log(f"Could not post worker event {stage}: {exc}")
+
+
+def worker_command_finished_level(command_type: str, status: str) -> str:
+    if status in {"ok", "success", "completed"}:
+        return "info"
+    if command_type in {"wait_completion", "copy_latest_reply"}:
+        return "info"
+    return "warning"
 
 
 def print_banner(config_path: Path) -> None:
