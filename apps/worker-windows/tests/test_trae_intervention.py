@@ -234,7 +234,11 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         wait_module,
         "probe_latest_trae_turn",
-        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+        lambda **kwargs: (
+            {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"}
+            if interventions
+            else {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}
+        ),
     )
 
     def fake_sleep(seconds, cancellation_check):
@@ -269,7 +273,7 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
     assert result["interventions"]
 
 
-def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pytest.MonkeyPatch):
+def test_wait_completion_intervenes_on_pending_ui_before_local_turn_completes(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
 
@@ -279,12 +283,16 @@ def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pyte
 
     monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
-    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "Trae waiting for run confirmation")
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
     monkeypatch.setattr(
         wait_module,
         "probe_latest_trae_turn",
-        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+        lambda **kwargs: (
+            {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"}
+            if interventions
+            else {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}
+        ),
     )
 
     def fake_sleep(seconds, cancellation_check):
@@ -321,6 +329,51 @@ def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pyte
     assert interventions == [{"mode": "click-point", "x": 1, "y": 2}]
 
 
+def test_wait_completion_accepts_completed_turn_with_pending_keep_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    diagnosis_calls = {"count": 0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        wait_module,
+        "window_text_snapshot",
+        lambda window: "\u4efb\u52a1\u5b8c\u6210\n\u53d8\u66f4\u5df2\u5b8c\u6210\uff0c\u8bf7\u786e\u8ba4\u662f\u5426\u91c7\u7eb3\u3002\n\u4fdd\u7559 Ctrl+Enter",
+    )
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+    )
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom):
+        diagnosis_calls["count"] += 1
+        return {"state": "awaiting_keep", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    result = wait_module.wait_completion(
+        timeout_seconds=3,
+        stable_seconds=0.5,
+        poll_interval_seconds=0.5,
+        intervention_idle_seconds=0.5,
+        max_interventions=1,
+    )
+
+    assert result["status"] == "completed"
+    assert result["completion_gate"]["pending_intervention_visible"] is True
+    assert diagnosis_calls["count"] == 0
+    assert result["interventions"] == []
+
+
 def test_wait_completion_prioritizes_service_interruption_before_visible_buttons(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
@@ -337,6 +390,7 @@ def test_wait_completion_prioritizes_service_interruption_before_visible_buttons
         lambda window: "模型请求失败，请稍后重试。(3003)\n保留 Ctrl+Enter",
     )
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module, "probe_latest_trae_turn", lambda **kwargs: {"status": "missing", "reason": "current_turn_missing"})
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)

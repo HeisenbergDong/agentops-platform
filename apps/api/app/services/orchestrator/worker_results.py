@@ -43,6 +43,8 @@ RECOVERABLE_COPY_GATE_REASONS = {
     "service_interrupted",
     "no_completed_turn_after_prompt_send",
 }
+FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 300
+FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 90
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -122,13 +124,14 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
             db,
             command,
             WorkerCommandType.WAIT_COMPLETION,
-            {
-                "timeout_seconds": command.payload.get("wait_timeout_seconds", 900),
-                "stable_seconds": command.payload.get("stable_seconds", 15),
-                "poll_interval_seconds": command.payload.get("poll_interval_seconds", 2),
-                "sent_at_epoch": result.data.get("sent_at_epoch"),
-                "sent_at": result.data.get("sent_at"),
-            },
+            _wait_completion_payload(
+                command,
+                round_,
+                {
+                    "sent_at_epoch": result.data.get("sent_at_epoch"),
+                    "sent_at": result.data.get("sent_at"),
+                },
+            ),
         )
         add_log(
             db,
@@ -418,13 +421,14 @@ def _handle_click_continue_result(db: Session, command: WorkerCommand, result: W
         db,
         command,
         WorkerCommandType.WAIT_COMPLETION,
-        {
-            "timeout_seconds": command.payload.get("wait_timeout_seconds", 900),
-            "stable_seconds": command.payload.get("stable_seconds", 15),
-            "poll_interval_seconds": command.payload.get("poll_interval_seconds", 2),
-            "continue_attempts": command.payload.get("continue_attempts", 0),
-            "max_continue_attempts": command.payload.get("max_continue_attempts", 20),
-        },
+        _wait_completion_payload(
+            command,
+            round_,
+            {
+                "continue_attempts": command.payload.get("continue_attempts", 0),
+                "max_continue_attempts": command.payload.get("max_continue_attempts", 20),
+            },
+        ),
     )
     add_log(
         db,
@@ -1384,6 +1388,28 @@ def _queue_continue_recovery(
             "display_message": "已安排 Worker 进行一次续写恢复，完成后会重新等待 Trae CN 回复收口。",
         },
     )
+
+
+def _wait_completion_payload(source_command: WorkerCommand, round_: TaskRound | None, extra: dict | None = None) -> dict:
+    payload = {
+        "timeout_seconds": source_command.payload.get("wait_timeout_seconds", 900),
+        "stable_seconds": source_command.payload.get("stable_seconds", 15),
+        "poll_interval_seconds": source_command.payload.get("poll_interval_seconds", 2),
+        "intervention_idle_seconds": source_command.payload.get(
+            "intervention_idle_seconds",
+            _default_wait_intervention_idle_seconds(round_),
+        ),
+        "max_interventions": source_command.payload.get("max_interventions", 3),
+    }
+    if extra:
+        payload.update(extra)
+    return payload
+
+
+def _default_wait_intervention_idle_seconds(round_: TaskRound | None) -> int:
+    if round_ and int(round_.round_index or 0) == 1:
+        return FIRST_ROUND_INTERVENTION_IDLE_SECONDS
+    return FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS
 
 
 def _recovery_reason(extra: dict) -> str:

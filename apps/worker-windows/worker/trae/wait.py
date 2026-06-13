@@ -43,9 +43,15 @@ PENDING_INTERVENTION_MARKERS = (
     "\u4fdd\u7559",
     "\u4fdd\u7559\u53d8\u66f4",
     "\u4fdd\u5b58",
+    "\u786e\u8ba4\u6267\u884c",
+    "\u7ee7\u7eed\u6267\u884c",
+    "\u4ecd\u8981\u8fd0\u884c",
+    "\u662f\u5426\u7ee7\u7eed",
     "Keep",
     "Keep Changes",
     "Save",
+    "Run anyway",
+    "Ok to proceed",
 )
 
 
@@ -84,7 +90,31 @@ def wait_completion(
             stable_since = stable_since or time.monotonic()
             if time.monotonic() - stable_since >= stable_seconds:
                 output_probe = probe_trace(latest_text)
+                turn_probe = probe_latest_trae_turn(
+                    prompt=prompt,
+                    workspace_path=workspace_path,
+                    sent_after_epoch=sent_at_epoch,
+                    sent_after=sent_at,
+                )
+                gate = _completion_gate(turn_probe, output_probe, latest_text)
+                if gate["passed"]:
+                    if _looks_like_window_chrome_only(latest_text):
+                        raise TraeAutomationError(
+                            "Trae output did not contain assistant content; only window chrome text was detected"
+                        )
+                    return _completed_result(
+                        stable_seconds=stable_seconds,
+                        latest_text=latest_text,
+                        output_probe=output_probe,
+                        turn_probe=turn_probe,
+                        gate=gate,
+                        interventions=interventions,
+                    )
                 if output_probe.get("reason") in RECOVERABLE_OUTPUT_REASONS:
+                    if len(interventions) >= max_interventions:
+                        raise TraeAutomationError(
+                            f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention limit reached"
+                        )
                     intervention = _try_auto_intervention(
                         reason=str(output_probe.get("reason") or "output_recoverable"),
                         timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
@@ -98,17 +128,10 @@ def wait_completion(
                     raise TraeAutomationError(
                         f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention failed"
                     )
-                intervention_reason = ""
                 terminal_prompt = detect_terminal_prompt(latest_text)
-                if terminal_prompt:
-                    intervention_reason = "terminal_prompt"
-                elif len(interventions) < max_interventions:
-                    quick_intervention = _diagnose_suggested_intervention(timeout_seconds=min(10.0, max(2.0, timeout_seconds)))
-                    if quick_intervention:
-                        intervention_reason = "stable_waiting_for_intervention"
-                if intervention_reason and len(interventions) < max_interventions:
+                if terminal_prompt and len(interventions) < max_interventions:
                     intervention = _try_auto_intervention(
-                        reason=intervention_reason,
+                        reason="terminal_prompt",
                         timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
                     )
                     interventions.append(intervention)
@@ -121,35 +144,38 @@ def wait_completion(
                     raise TraeAutomationError(
                         "Trae output did not contain assistant content; only window chrome text was detected"
                     )
-                turn_probe = probe_latest_trae_turn(
-                    prompt=prompt,
-                    workspace_path=workspace_path,
-                    sent_after_epoch=sent_at_epoch,
-                    sent_after=sent_at,
-                )
-                gate = _completion_gate(turn_probe, output_probe, latest_text)
-                if not gate["passed"]:
-                    if gate.get("recoverable") and len(interventions) < max_interventions:
-                        intervention = _try_completion_gate_intervention(
-                            gate,
-                            timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                        )
-                        if intervention:
-                            interventions.append(intervention)
+                if gate.get("recoverable") and len(interventions) < max_interventions:
+                    intervention = _try_completion_gate_intervention(
+                        gate,
+                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+                    )
+                    if intervention:
+                        interventions.append(intervention)
+                        if intervention.get("status") == "applied":
+                            stable_since = None
+                            last_change_at = time.monotonic()
+                            _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
+                            continue
+                if (
+                    gate.get("recoverable")
+                    and intervention_idle_seconds > 0
+                    and time.monotonic() - last_change_at >= intervention_idle_seconds
+                    and len(interventions) < max_interventions
+                ):
+                    intervention = _try_auto_intervention(
+                        reason=f"completion_gate:{gate.get('reason') or 'waiting'}",
+                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+                    )
+                    interventions.append(intervention)
                     stable_since = None
                     last_change_at = time.monotonic()
                     _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
                     continue
-                return {
-                    "status": "completed",
-                    "stable_seconds": stable_seconds,
-                    "text_chars": len(latest_text),
-                    "text_sample": latest_text[-1000:],
-                    "output_probe": output_probe,
-                    "trae_turn": turn_probe,
-                    "completion_gate": gate,
-                    "interventions": interventions,
-                }
+                stable_since = None
+                if not gate.get("recoverable"):
+                    last_change_at = time.monotonic()
+                _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
+                continue
         else:
             stable_since = None
             last_signature = signature
@@ -161,13 +187,58 @@ def wait_completion(
             and time.monotonic() - last_change_at >= intervention_idle_seconds
             and len(interventions) < max_interventions
         ):
-            intervention = _try_auto_intervention(reason="idle_no_output_change", timeout_seconds=min(10.0, max(2.0, timeout_seconds)))
+            output_probe = probe_trace(latest_text)
+            turn_probe = probe_latest_trae_turn(
+                prompt=prompt,
+                workspace_path=workspace_path,
+                sent_after_epoch=sent_at_epoch,
+                sent_after=sent_at,
+            )
+            gate = _completion_gate(turn_probe, output_probe, latest_text)
+            if gate["passed"]:
+                if _looks_like_window_chrome_only(latest_text):
+                    raise TraeAutomationError(
+                        "Trae output did not contain assistant content; only window chrome text was detected"
+                    )
+                return _completed_result(
+                    stable_seconds=stable_seconds,
+                    latest_text=latest_text,
+                    output_probe=output_probe,
+                    turn_probe=turn_probe,
+                    gate=gate,
+                    interventions=interventions,
+                )
+            reason = str(output_probe.get("reason") or "idle_no_output_change")
+            if reason not in RECOVERABLE_OUTPUT_REASONS:
+                reason = "idle_no_output_change"
+            intervention = _try_auto_intervention(reason=reason, timeout_seconds=min(10.0, max(2.0, timeout_seconds)))
             interventions.append(intervention)
             last_change_at = time.monotonic()
             stable_since = None
         _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
 
     raise TraeAutomationError("Trae output did not become stable before wait_completion timeout")
+
+
+def _completed_result(
+    *,
+    stable_seconds: float,
+    latest_text: str,
+    output_probe: object,
+    turn_probe: object,
+    gate: dict,
+    interventions: list[dict],
+) -> dict:
+    return {
+        "status": "completed",
+        "stable_seconds": stable_seconds,
+        "text_chars": len(latest_text),
+        "text_sample": latest_text[-1000:],
+        "output_probe": output_probe,
+        "trae_turn": turn_probe,
+        "completion_gate": gate,
+        "interventions": interventions,
+    }
 
 
 def _looks_like_window_chrome_only(text: str) -> bool:
@@ -180,7 +251,18 @@ def _looks_like_window_chrome_only(text: str) -> bool:
 
 
 def _completion_gate(turn_probe: object, output_probe: object, latest_text: str) -> dict:
-    if _has_pending_intervention_text(latest_text):
+    pending_intervention_visible = _has_pending_intervention_text(latest_text)
+    if isinstance(turn_probe, dict) and turn_probe.get("status") == "found":
+        turn_status = str(turn_probe.get("turn_status") or "")
+        if turn_status == "completed":
+            return {
+                "passed": True,
+                "reason": "ok",
+                "session_id": str(turn_probe.get("session_id") or ""),
+                "user_message_id": str(turn_probe.get("user_message_id") or ""),
+                "pending_intervention_visible": pending_intervention_visible,
+            }
+    if pending_intervention_visible:
         return {"passed": False, "reason": "pending_intervention_visible", "recoverable": True}
     if not isinstance(turn_probe, dict):
         return {"passed": False, "reason": "turn_probe_unavailable", "recoverable": False}

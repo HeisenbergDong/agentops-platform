@@ -37,6 +37,8 @@ def test_send_prompt_success_advances_job_to_waiting_trae():
     assert round_.status == JobState.WAITING_TRAE
     assert next_command is not None
     assert next_command.status == "queued"
+    assert next_command.payload["intervention_idle_seconds"] == worker_results.FIRST_ROUND_INTERVENTION_IDLE_SECONDS
+    assert next_command.payload["max_interventions"] == 3
     assert [item.stage for item in logs] == [JobState.PROMPT_SENT, JobState.WAITING_TRAE, JobState.WAITING_TRAE]
     assert logs[0].display_message == "Worker 已把提示词输入 Trae CN 并发送。"
 
@@ -62,6 +64,7 @@ def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tm
         WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"chars": 10}),
     )
     wait = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+    assert wait.payload["intervention_idle_seconds"] == worker_results.FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS
     _finish(db, wait, WorkerResult(command_id=wait.id, worker_id=wait.worker_id, status="success", data={"text_chars": 1000}))
     copy = _latest_command(db, WorkerCommandType.COPY_LATEST_REPLY)
     _finish(
@@ -1238,6 +1241,7 @@ def test_click_continue_success_queues_wait_completion_again():
     assert round_.status == JobState.WAITING_TRAE
     assert next_command is not None
     assert next_command.payload["continue_attempts"] == 1
+    assert next_command.payload["intervention_idle_seconds"] == worker_results.FIRST_ROUND_INTERVENTION_IDLE_SECONDS
 
 
 def test_click_continue_typed_continue_event_message_is_precise():

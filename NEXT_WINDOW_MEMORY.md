@@ -1114,6 +1114,52 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+## 2026-06-13 Trae 本地回合完成优先与首轮慢等待修复记录（待部署）
+
+用户真实自测反馈：
+- Trae 左侧已经显示 `任务完成`，右侧编辑器仍有 `变更已完成，请确认是否采纳 / 保留 Ctrl+Enter` 操作条，但 Worker 没有判断完成，仍在 Trae 界面反复移动鼠标/诊断。
+- 询问之前是否通过分析 Trae 回复结果文件判断，以及当前程序和 `D:\adbz` 原程序是否不一致。
+- 指出首轮 Trae 通常较慢，频繁 UI 判断不准，应该更高效。
+
+定位结论：
+- 当前程序已经有 `session_probe.py`，会读取 Trae CN 本地 `workspaceStorage/state.vscdb` 和 `logs/ai-agent_*_stdout.log`，根据 `main_routine completed` / `chat_turn_finish completed` / `normal path task exiting` 判断当前 Trae turn 是否完成；这就是和 `D:\adbz` 类似的“本地日志/结果文件”路径。
+- 问题在 `wait_completion()` 的判断顺序：它先把画面里的 `保留/保存/变更已完成` 等 pending 文本当作可恢复干预，导致即使本地 Trae turn 已经 `completed`，也会被右侧操作条挡住，继续进入 UI 诊断。
+- 另一个问题是空闲干预太急：首轮 60 秒无变化就可能开始 UI 诊断，和 `D:\adbz` 里首轮长等待、少干预的策略不一致。
+- 架构说明：服务端调度器负责排 `send_prompt / wait_completion / copy_latest_reply` 等 Worker 命令；真正控制 Trae 窗口的是 Windows Worker，不是提示词角色直接控制 Trae。
+
+已完成代码改动：
+- `apps/worker-windows/worker/trae/wait.py`
+  - `wait_completion()` 改成优先调用 `probe_latest_trae_turn()`，只要当前 prompt/workspace/sent_at 对应的 Trae turn 已经 `turn_status=completed`，即使 UI 仍显示 `变更已完成/保留`，也直接返回 completed，进入复制 trace。
+  - `_completion_gate()` 改为“本地 completed 优先”，并在结果里记录 `pending_intervention_visible` 供日志诊断。
+  - 只有本地 turn 尚未完成时，才把 `确认执行/继续执行/仍要运行/保留/保存/Run anyway/Ok to proceed` 等 UI 文本当作 pending intervention 去处理。
+  - 3003/服务中断仍保持优先恢复：本地未完成且 `probe_trace()` 判断为 `service_interrupted` 时，继续走输入“继续”的恢复逻辑。
+  - 空闲 UI 干预前再次检查本地 turn 是否已 completed，避免 `stable_seconds` 到达前先乱点 UI。
+  - 保留窗口 chrome-only 护栏：如果只读到 `最小化/恢复/关闭`，不会因为历史日志 completed 而误收口。
+- `apps/api/app/services/orchestrator/worker_results.py`
+  - 新增 `_wait_completion_payload()` 统一下发等待参数。
+  - 首轮默认 `intervention_idle_seconds=300`，后续轮次默认 `90`；仍允许 payload 覆盖。
+  - `max_interventions` 显式下发为默认 `3`，方便 Worker 和日志一致。
+- 测试：
+  - 新增 `test_wait_completion_accepts_completed_turn_with_pending_keep_text`，覆盖“Trae 已完成但 UI 还有保留条”的截图场景，确认不触发 `diagnose_ui()`。
+  - 调整 pending UI 测试，确认只有本地 turn 未完成时才点确认/执行类按钮。
+  - API 测试增加首轮/后续轮次 `intervention_idle_seconds` 下发断言。
+
+已验证：
+- Worker targeted：`apps/worker-windows` 中 `.\.venv\Scripts\python -m pytest tests/test_trae_intervention.py -q`，结果 `15 passed`。
+- API targeted：`apps/api` 中 `..\worker-windows\.venv\Scripts\python -m pytest tests/test_worker_results.py -q`，结果 `44 passed`。
+- Worker 全量：`92 passed, 2 warnings`。
+- API 全量：`94 passed, 3 warnings`。
+- Web build：通过，仅 Vite chunk size warning。
+- `git diff --check`：通过。
+- Worker 打包成功：
+  - ZIP：`D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP 大小：`27325312`
+  - ZIP SHA256：`121aaaafd442cb281a1f3b267dab61bc81310e57ecad03cbb374056d922a1a3a`
+
+待完成：
+- commit/push GitHub。
+- 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
 
 ## 2026-06-13 Trae 3003 优先级与窗口还原修复部署完成记录
 
