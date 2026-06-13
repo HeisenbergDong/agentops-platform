@@ -1055,3 +1055,25 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产新版 Worker ZIP；本次主要是 Worker 行为修复，API 源码无变化。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+
+## 2026-06-13 Trae 3003 模型请求失败输入继续修复部署完成记录
+
+- 代码提交：`eae5af1 fix: continue Trae after model request errors`，完整 commit 为 `eae5af16f7a428a9de818755a2bb287c964cfe08`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-eae5af1/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-162900-eae5af1`。
+- 已同步到生产：
+  - API 源码和 Web dist 按当前 commit 覆盖。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision`：`eae5af16f7a428a9de818755a2bb287c964cfe08`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 首页 `http://115.190.113.8/` 返回 `200`。
+  - 生产 Worker ZIP 大小：`27321651`。
+  - 生产 Worker ZIP SHA256：`cd99d41069299f33a7de8a63f443709ffb3e4a945df4f88f2fa0453312368f21`。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP；旧 Worker 遇到 `模型请求失败，请稍后重试。(3003)` 仍可能走主按钮 fallback。
+- 预期行为：遇到 3003/模型请求失败时，应识别为 `service_interrupted`，恢复命令在没有明确继续按钮时会直接向 Trae 输入“继续”，然后重新等待当前回合收口。
