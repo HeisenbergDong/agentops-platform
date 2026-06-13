@@ -1115,6 +1115,34 @@ npm.cmd run build
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
 
+## 2026-06-13 Trae 3003 优先级与窗口还原修复部署完成记录
+
+- 代码提交：`60733f1 fix: prioritize Trae 3003 recovery`，完整 commit 为 `60733f1fb7ba79af309f0fdb880c2cfd8c003085`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-60733f1/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-184738-60733f1`。
+- 已同步到生产：
+  - Worker 源码：`wait.py`、`diagnose.py`、`window.py`。
+  - Worker 测试：`test_trae_intervention.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision`：`60733f1fb7ba79af309f0fdb880c2cfd8c003085`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产 Worker ZIP 大小：`27322028`。
+  - 生产 Worker ZIP SHA256：`1433a7989e20bba037a57773a5a7ab4ffc7eb3ee3889f11672fa75bbcab9489c`。
+  - 生产 Worker ZIP 文件头：`PK`。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP，关闭旧 `agentops-worker.exe`。
+- 预期行为：当 Trae 画面里出现 `模型请求失败，请稍后重试。(3003)` 时，即使同时有 `保留/确认/执行` 等按钮，Worker 也会优先把它判定为 `service_interrupted`，向 Trae 输入“继续”，然后重新等待当前回合收口。
+- 预期窗口行为：Worker 聚焦/滚动/诊断 Trae 时不应再因为 `set_focus()` 把最大化窗口还原。
+- 如果仍然异常，优先看 Worker 返回里的 `output_probe.reason`、`diagnosis.suggested_intervention`、`interventions[*].suggested_intervention` 和 `window_diagnostics.windows[*].rect`。
+
 ## 2026-06-13 Trae 左侧回复区滚底与执行按钮识别修复部署完成记录
 
 - 代码提交：`4335e0b fix: scroll Trae reply pane before action detection`，完整 commit 为 `4335e0b22cf6422fa752864dbc13e328ac5159d3`。
