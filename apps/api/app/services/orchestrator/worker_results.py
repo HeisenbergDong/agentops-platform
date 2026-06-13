@@ -43,6 +43,15 @@ RECOVERABLE_COPY_GATE_REASONS = {
     "service_interrupted",
     "no_completed_turn_after_prompt_send",
 }
+TRACE_COPY_RETRY_REASONS = {
+    "empty_trace",
+    "trace_too_short",
+    "missing_tool_trace_markers",
+    "partial_code_copy",
+    "final_summary_only",
+    "copy_command_failed",
+}
+DEFAULT_MAX_TRACE_COPY_ATTEMPTS = 5
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 300
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 90
 
@@ -179,6 +188,8 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
             {
                 "timeout_seconds": command.payload.get("copy_timeout_seconds", 10),
                 "prompt": round_.prompt if round_ and round_.prompt else command.payload.get("prompt", ""),
+                "trace_copy_attempts": command.payload.get("trace_copy_attempts", 0),
+                "max_trace_copy_attempts": command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
             },
         )
         add_log(
@@ -208,6 +219,15 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
 
     extra = _result_extra(command, result)
     if result.status not in {"ok", "success", "completed"}:
+        if _queue_trace_copy_retry(
+            db,
+            command,
+            job,
+            round_,
+            "Worker did not copy a complete Trae assistant trace; retrying trace copy before recovery.",
+            {**extra, "validation": {"valid": False, "reason": "copy_command_failed"}},
+        ):
+            return
         _queue_continue_recovery(
             db,
             command,
@@ -244,6 +264,15 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
         round_.trace_status = "valid" if validation["valid"] else validation["reason"]
 
     if not validation["valid"] and is_recoverable_trace_reason(validation["reason"]):
+        if validation["reason"] in TRACE_COPY_RETRY_REASONS and _queue_trace_copy_retry(
+            db,
+            command,
+            job,
+            round_,
+            f"Trae copied reply is not a complete raw tool trace yet ({validation['reason']}); retrying trace copy.",
+            trace_extra,
+        ):
+            return
         _queue_continue_recovery(
             db,
             command,
@@ -1391,6 +1420,67 @@ def _queue_continue_recovery(
     )
 
 
+def _queue_trace_copy_retry(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    trace_copy_attempts = int(source_command.payload.get("trace_copy_attempts") or 0) + 1
+    max_trace_copy_attempts = int(source_command.payload.get("max_trace_copy_attempts") or DEFAULT_MAX_TRACE_COPY_ATTEMPTS)
+    if trace_copy_attempts > max_trace_copy_attempts:
+        return False
+
+    job.status = JobState.COLLECTING_TRACE
+    if round_:
+        round_.status = JobState.COLLECTING_TRACE
+    retry_reason = _trace_copy_retry_reason(extra)
+    retry_extra = {
+        **extra,
+        "trace_copy_attempts": trace_copy_attempts,
+        "max_trace_copy_attempts": max_trace_copy_attempts,
+        "trace_copy_retry_reason": retry_reason,
+        "display_message": _trace_copy_retry_display_message(retry_reason, trace_copy_attempts, max_trace_copy_attempts),
+    }
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.COLLECTING_TRACE,
+        message=message,
+        level="info",
+        extra=retry_extra,
+    )
+    copy_command = _enqueue_worker_command(
+        db,
+        source_command,
+        WorkerCommandType.COPY_LATEST_REPLY,
+        {
+            "timeout_seconds": source_command.payload.get("copy_timeout_seconds", source_command.payload.get("timeout_seconds", 10)),
+            "trace_copy_attempts": trace_copy_attempts,
+            "max_trace_copy_attempts": max_trace_copy_attempts,
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.COLLECTING_TRACE,
+        message="copy_latest_reply worker command requeued for trace collection retry.",
+        extra={
+            "worker_id": copy_command.worker_id,
+            "command_id": copy_command.id,
+            "trace_copy_attempts": trace_copy_attempts,
+            "max_trace_copy_attempts": max_trace_copy_attempts,
+            "trace_copy_retry_reason": retry_reason,
+            "display_message": "已重新安排 Worker 复制 Trae CN 最新回复，先重试采集完整执行轨迹。",
+        },
+    )
+    return True
+
+
 def _wait_completion_payload(source_command: WorkerCommand, round_: TaskRound | None, extra: dict | None = None) -> dict:
     payload = {
         "timeout_seconds": source_command.payload.get("wait_timeout_seconds", 900),
@@ -1463,6 +1553,30 @@ def _recovery_reason(extra: dict) -> str:
     if error:
         return "worker_command_error"
     return "incomplete_trae_reply"
+
+
+def _trace_copy_retry_reason(extra: dict) -> str:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    for source in (
+        extra.get("validation"),
+        data.get("validation"),
+        extra.get("trace_probe"),
+        data.get("trace_probe"),
+    ):
+        if isinstance(source, dict) and str(source.get("reason") or "").strip():
+            return str(source.get("reason")).strip()
+    if str(extra.get("error") or "").strip():
+        return "copy_command_failed"
+    return "incomplete_trae_reply"
+
+
+def _trace_copy_retry_display_message(reason: str, attempts: int, max_attempts: int) -> str:
+    reason_text = _recovery_reason_text(reason)
+    if max_attempts > 0:
+        suffix = f"（第 {attempts}/{max_attempts} 次）"
+    else:
+        suffix = f"（第 {attempts} 次）"
+    return f"复制到的 Trae CN 执行轨迹还不完整（{reason_text}），Worker 先重试滚底和复制{suffix}。"
 
 
 def _recovery_display_message(reason: str, attempts: int, max_attempts: int) -> str:

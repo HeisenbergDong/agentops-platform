@@ -67,6 +67,10 @@ def build_display_message(
             return f"当前回复还没有确认收口（{reason}），Worker 正在尝试续写恢复{attempts}。"
         return f"当前回复还没有确认收口，Worker 正在尝试续写恢复{attempts}。"
     if stage_key == "collecting_trace":
+        retry_reason = str(data.get("trace_copy_retry_reason") or "").strip()
+        if retry_reason:
+            attempts = _trace_copy_attempt_text(data)
+            return f"Trae CN 回复已结束，但执行轨迹复制还不完整，Worker 正在重试采集{attempts}。"
         return "Trae CN 回复已稳定，Worker 开始获取对话内容和执行轨迹。"
     if stage_key == "trace_validating":
         if level == "error":
@@ -198,6 +202,24 @@ def _join_short(items: list[Any], limit: int = 3) -> str:
 def _continue_attempt_text(data: dict[str, Any]) -> str:
     attempts = data.get("continue_attempts")
     max_attempts = data.get("max_continue_attempts")
+    try:
+        attempt_value = int(attempts)
+    except (TypeError, ValueError):
+        return ""
+    if attempt_value <= 0:
+        return ""
+    try:
+        max_value = int(max_attempts)
+    except (TypeError, ValueError):
+        max_value = 0
+    if max_value > 0:
+        return f"（第 {attempt_value}/{max_value} 次）"
+    return f"（第 {attempt_value} 次）"
+
+
+def _trace_copy_attempt_text(data: dict[str, Any]) -> str:
+    attempts = data.get("trace_copy_attempts")
+    max_attempts = data.get("max_trace_copy_attempts")
     try:
         attempt_value = int(attempts)
     except (TypeError, ValueError):

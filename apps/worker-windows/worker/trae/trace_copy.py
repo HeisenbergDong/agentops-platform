@@ -1,5 +1,6 @@
 import ctypes
 import time
+from typing import Callable
 
 from worker.system.clipboard import ClipboardError, get_clipboard_text, set_clipboard_text
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
@@ -45,14 +46,18 @@ SERVICE_INTERRUPTION_MARKERS = (
 SCROLL_CONTROL_TYPES = ("Document", "Pane", "List", "Group", "Custom")
 
 
-def copy_latest_reply(timeout_seconds: float = 10.0) -> dict:
+def copy_latest_reply(timeout_seconds: float = 10.0, cancellation_check: Callable[[], None] | None = None) -> dict:
+    _raise_if_cancelled(cancellation_check)
     focus_trae(timeout_seconds=timeout_seconds)
+    _raise_if_cancelled(cancellation_check)
     window = find_trae_window(timeout_seconds=timeout_seconds)
     scroll_result = scroll_assistant_to_bottom(window)
     sentinel = f"agentops-copy-sentinel-{time.time_ns()}"
     buttons = _copy_buttons(window)
     failures: list[dict] = []
+    candidates: list[dict] = []
     for button_text, button in buttons:
+        _raise_if_cancelled(cancellation_check)
         try:
             before = sentinel if _set_clipboard_text(sentinel) else _read_clipboard_text()
             button.click_input()
@@ -61,7 +66,16 @@ def copy_latest_reply(timeout_seconds: float = 10.0) -> dict:
         except Exception as exc:
             failures.append({"button_text": button_text, "error": str(exc)})
             continue
-        if raw_text.strip():
+        if not raw_text.strip():
+            continue
+        candidate = {
+            "raw_text": raw_text,
+            "chars": len(raw_text),
+            "button_text": button_text,
+            "trace_probe": probe,
+        }
+        candidates.append(candidate)
+        if _is_preferred_trace(probe):
             return {
                 "status": "copied",
                 "raw_text": raw_text,
@@ -70,7 +84,21 @@ def copy_latest_reply(timeout_seconds: float = 10.0) -> dict:
                 "button_text": button_text,
                 "trace_probe": probe,
                 "scroll": scroll_result,
+                "copy_candidates": _candidate_summaries(candidates),
             }
+
+    if candidates:
+        best = _best_copy_candidate(candidates)
+        return {
+            "status": "copied",
+            "raw_text": best["raw_text"],
+            "chars": best["chars"],
+            "copy_method": "assistant_bottom_toolbar_best_effort",
+            "button_text": best["button_text"],
+            "trace_probe": best["trace_probe"],
+            "scroll": scroll_result,
+            "copy_candidates": _candidate_summaries(candidates),
+        }
 
     raise TraeAutomationError(f"No Trae assistant reply copy button produced clipboard text. failures={failures[-3:]}")
 
@@ -360,3 +388,41 @@ def _first_marker(text: str, markers: tuple[str, ...]) -> str:
         if marker.lower() in normalized:
             return marker
     return ""
+
+
+def _is_preferred_trace(probe: dict) -> bool:
+    return bool(probe.get("complete_like")) and str(probe.get("reason") or "") == "ok"
+
+
+def _best_copy_candidate(candidates: list[dict]) -> dict:
+    def score(candidate: dict) -> tuple[int, int, int]:
+        probe = candidate.get("trace_probe") if isinstance(candidate.get("trace_probe"), dict) else {}
+        reason = str(probe.get("reason") or "")
+        preferred = 1 if _is_preferred_trace(probe) else 0
+        marker_count = int(probe.get("marker_count") or 0)
+        if reason in {"awaiting_continuation", "service_interrupted"}:
+            marker_count += 10
+        return (preferred, marker_count, int(candidate.get("chars") or 0))
+
+    return sorted(candidates, key=score, reverse=True)[0]
+
+
+def _candidate_summaries(candidates: list[dict]) -> list[dict]:
+    result = []
+    for candidate in candidates[:12]:
+        probe = candidate.get("trace_probe") if isinstance(candidate.get("trace_probe"), dict) else {}
+        result.append(
+            {
+                "button_text": str(candidate.get("button_text") or ""),
+                "chars": int(candidate.get("chars") or 0),
+                "reason": str(probe.get("reason") or ""),
+                "complete_like": bool(probe.get("complete_like")),
+                "marker_count": int(probe.get("marker_count") or 0),
+            }
+        )
+    return result
+
+
+def _raise_if_cancelled(cancellation_check: Callable[[], None] | None) -> None:
+    if cancellation_check:
+        cancellation_check()

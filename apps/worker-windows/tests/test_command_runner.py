@@ -9,6 +9,7 @@ from worker.runtime.command_runner import _current_turn_gate
 from worker.runtime.command_runner import CommandRunner
 from worker.project.git_submit import run_git_submit
 from worker.trae.diagnose import detect_terminal_prompt
+from worker.trae import trace_copy
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae import window as trae_window
 from worker.trae.window import TraeAutomationError
@@ -420,7 +421,12 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     monkeypatch.setattr(
         command_runner,
         "copy_latest_reply",
-        lambda timeout_seconds: {"status": "copied", "raw_text": "trace", "timeout_seconds": timeout_seconds},
+        lambda timeout_seconds, cancellation_check=None: {
+            "status": "copied",
+            "raw_text": "trace",
+            "timeout_seconds": timeout_seconds,
+            "cancellable": callable(cancellation_check),
+        },
     )
     monkeypatch.setattr(
         command_runner,
@@ -435,6 +441,7 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     assert result["status"] == "success"
     assert result["data"]["raw_text"] == "trace"
     assert result["data"]["timeout_seconds"] == 7.0
+    assert result["data"]["cancellable"] is True
     assert result["data"]["current_turn_gate"]["passed"] is True
     assert result["data"]["supervisor_decision"]["action"] == "collect_trace_candidate"
 
@@ -689,6 +696,40 @@ def test_probe_trace_reports_full_trace_shape():
 
     assert result["complete_like"] is True
     assert result["reason"] == "ok"
+
+
+def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.MonkeyPatch):
+    class FakeButton:
+        def __init__(self, text):
+            self.text = text
+
+        def click_input(self):
+            return None
+
+    class FakeWindow:
+        pass
+
+    values = iter(
+        [
+            "构建完成，测试通过。" * 80,
+            "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: pytest\nTodos updated: done\n"
+            + ("trace detail line\n" * 80),
+        ]
+    )
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton("summary")), ("trace copy", FakeButton("trace"))])
+    monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
+    monkeypatch.setattr(trace_copy, "_wait_for_clipboard_change", lambda before, timeout_seconds: next(values))
+
+    result = trace_copy.copy_latest_reply(timeout_seconds=1)
+
+    assert result["button_text"] == "trace copy"
+    assert result["trace_probe"]["reason"] == "ok"
+    assert result["copy_candidates"][0]["reason"] == "missing_tool_trace_markers"
+    assert result["copy_candidates"][1]["reason"] == "ok"
 
 
 def test_probe_trace_reports_awaiting_continuation():

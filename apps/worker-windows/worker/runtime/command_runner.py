@@ -77,7 +77,7 @@ class CommandRunner:
             elif command_type == "click_confirm":
                 data = click_confirm()
             elif command_type == "copy_latest_reply":
-                data = self._copy_latest_reply(payload)
+                data = self._copy_latest_reply(payload, cancellation)
             elif command_type == "scan_project":
                 data = self._scan_project(payload)
             elif command_type == "run_command":
@@ -204,8 +204,11 @@ class CommandRunner:
             sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
 
-    def _copy_latest_reply(self, payload: dict[str, Any]) -> dict:
-        result = copy_latest_reply(timeout_seconds=float(payload.get("timeout_seconds", 10)))
+    def _copy_latest_reply(self, payload: dict[str, Any], cancellation: CancellationToken | None = None) -> dict:
+        result = copy_latest_reply(
+            timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            cancellation_check=cancellation.raise_if_cancelled if cancellation else None,
+        )
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         result["trae_turn"] = probe_latest_trae_turn(
             prompt=str(payload.get("prompt") or ""),

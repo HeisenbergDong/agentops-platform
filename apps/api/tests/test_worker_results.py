@@ -1262,7 +1262,7 @@ def test_capture_screenshot_failure_marks_manual_required():
     assert round_.status == JobState.MANUAL_REQUIRED
 
 
-def test_copy_latest_reply_incomplete_trace_queues_continue_recovery():
+def test_copy_latest_reply_incomplete_trace_retries_copy_before_recovery():
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
 
@@ -1274,23 +1274,23 @@ def test_copy_latest_reply_incomplete_trace_queues_continue_recovery():
 
     db.refresh(job)
     db.refresh(round_)
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
-    assert job.status == JobState.AWAITING_CONTINUE
-    assert round_.status == JobState.AWAITING_CONTINUE
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value).where(WorkerCommand.id != command.id))
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
     assert round_.trace_status == "trace_too_short"
     assert next_command is not None
     assert next_command.status == "queued"
-    assert next_command.payload["continue_attempts"] == 1
-    assert next_command.payload["recovery_reason"] == "trace_too_short"
+    assert next_command.payload["trace_copy_attempts"] == 1
+    assert next_command.payload["max_trace_copy_attempts"] == worker_results.DEFAULT_MAX_TRACE_COPY_ATTEMPTS
     recovery_log = db.scalar(
         select(RuntimeLog)
-        .where(RuntimeLog.stage == JobState.AWAITING_CONTINUE)
+        .where(RuntimeLog.stage == JobState.COLLECTING_TRACE)
         .order_by(RuntimeLog.created_at)
         .limit(1)
     )
     assert recovery_log is not None
     assert recovery_log.level == "info"
-    assert "复制到的轨迹太短" in recovery_log.display_message
+    assert "先重试滚底和复制" in recovery_log.display_message
     assert "人工处理" not in recovery_log.display_message
 
 
@@ -1333,10 +1333,37 @@ def test_click_continue_typed_continue_event_message_is_precise():
     assert "点击 Trae CN 的继续按钮" not in message
 
 
-def test_incomplete_trace_stops_after_max_continue_attempts():
+def test_incomplete_trace_falls_back_to_recovery_after_max_copy_attempts():
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
-    command.payload = {"continue_attempts": 2, "max_continue_attempts": 2}
+    command.payload = {"trace_copy_attempts": 5, "max_trace_copy_attempts": 5}
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"raw_text": "short"}),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert next_command is not None
+    assert next_command.payload["recovery_reason"] == "trace_too_short"
+    assert _latest_dissatisfaction_reason(db) is None
+
+
+def test_incomplete_trace_stops_after_copy_and_continue_limits():
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    command.payload = {
+        "trace_copy_attempts": 5,
+        "max_trace_copy_attempts": 5,
+        "continue_attempts": 2,
+        "max_continue_attempts": 2,
+    }
     db.commit()
 
     handle_worker_result(
