@@ -42,7 +42,7 @@ SERVICE_INTERRUPTION_MARKERS = (
     "interrupted",
     "something went wrong",
 )
-SCROLL_CONTROL_TYPES = ("Document", "Pane", "List", "Group")
+SCROLL_CONTROL_TYPES = ("Document", "Pane", "List", "Group", "Custom")
 
 
 def copy_latest_reply(timeout_seconds: float = 10.0) -> dict:
@@ -75,13 +75,22 @@ def copy_latest_reply(timeout_seconds: float = 10.0) -> dict:
     raise TraeAutomationError(f"No Trae assistant reply copy button produced clipboard text. failures={failures[-3:]}")
 
 
-def scroll_assistant_to_bottom(window, wheel_steps: int = 8) -> dict:
+def scroll_assistant_to_bottom(window, wheel_steps: int = 14) -> dict:
     """Best-effort scroll of Trae's assistant reply pane before copying."""
-    result = {"status": "not_scrolled", "attempted": True, "wheel_steps": wheel_steps, "method": "", "errors": []}
+    result = {
+        "status": "not_scrolled",
+        "attempted": True,
+        "wheel_steps": wheel_steps,
+        "method": "multi_strategy_reply_bottom",
+        "methods": [],
+        "errors": [],
+    }
     coordinate_result = _scroll_window_reply_area(window, wheel_steps)
-    if coordinate_result["status"] == "scrolled":
-        return coordinate_result
-    result["errors"].append(str(coordinate_result.get("error") or "coordinate_scroll_failed"))
+    result["methods"].append(coordinate_result)
+    if coordinate_result["status"] != "scrolled":
+        result["errors"].append(str(coordinate_result.get("error") or "coordinate_scroll_failed"))
+
+    scrolled_controls = []
     for control in _scroll_candidates(window):
         try:
             control.set_focus()
@@ -91,11 +100,15 @@ def scroll_assistant_to_bottom(window, wheel_steps: int = 8) -> dict:
             for _ in range(max(1, int(wheel_steps))):
                 control.wheel_mouse_input(wheel_dist=-5)
                 time.sleep(0.03)
-            result["status"] = "scrolled"
-            result["method"] = _control_summary(control)
-            return result
+            scrolled_controls.append(_control_summary(control))
+            if len(scrolled_controls) >= 3:
+                break
         except Exception as exc:
             result["errors"].append(f"wheel:{type(exc).__name__}:{exc}")
+    if scrolled_controls:
+        result["methods"].append({"status": "scrolled", "method": "uia_scrollable_controls", "controls": scrolled_controls})
+    if any(item.get("status") == "scrolled" for item in result["methods"] if isinstance(item, dict)):
+        result["status"] = "scrolled"
     return result
 
 
@@ -131,19 +144,33 @@ def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
 
     width = max(1, int(rect.right - rect.left))
     height = max(1, int(rect.bottom - rect.top))
-    # Same target as the legacy D:\adbz automation: left conversation pane, above the prompt input.
-    x = int(rect.left + width * 0.265)
-    y = int(rect.top + height * 0.735)
+    # Same target family as the legacy D:\adbz automation: left conversation pane,
+    # above the prompt input. Multiple hover points handle Trae layouts where the
+    # actual scroll container is narrower than the visible assistant pane.
+    points = [
+        (0.32, 0.72),
+        (0.265, 0.735),
+        (0.38, 0.72),
+        (0.22, 0.68),
+    ]
+    clicked_points = []
     try:
-        user32.SetCursorPos(x, y)
-        time.sleep(0.06)
-        user32.mouse_event(0x0002, 0, 0, 0, 0)
-        time.sleep(0.04)
-        user32.mouse_event(0x0004, 0, 0, 0, 0)
-        time.sleep(0.08)
-        for _ in range(max(1, int(wheel_steps))):
-            user32.mouse_event(0x0800, 0, 0, ctypes.c_uint((-120 * 5) & 0xFFFFFFFF).value, 0)
+        for ratio_x, ratio_y in points:
+            x = int(rect.left + width * ratio_x)
+            y = int(rect.top + height * ratio_y)
+            clicked_points.append({"x": x, "y": y, "ratio_x": ratio_x, "ratio_y": ratio_y})
+            user32.SetCursorPos(x, y)
+            time.sleep(0.06)
+            user32.mouse_event(0x0002, 0, 0, 0, 0)
             time.sleep(0.04)
+            user32.mouse_event(0x0004, 0, 0, 0, 0)
+            time.sleep(0.08)
+            for _ in range(max(1, int(wheel_steps))):
+                user32.mouse_event(0x0800, 0, 0, ctypes.c_uint((-120 * 5) & 0xFFFFFFFF).value, 0)
+                time.sleep(0.03)
+            _press_key(user32, 0x22)  # PageDown
+            time.sleep(0.04)
+        _press_key(user32, 0x23)  # End
     except Exception as exc:
         return {
             "status": "not_scrolled",
@@ -155,9 +182,15 @@ def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
         "status": "scrolled",
         "attempted": True,
         "method": "win32_reply_area",
-        "point": {"x": x, "y": y},
+        "points": clicked_points,
         "wheel_steps": wheel_steps,
     }
+
+
+def _press_key(user32, virtual_key: int) -> None:
+    user32.keybd_event(virtual_key, 0, 0, 0)
+    time.sleep(0.025)
+    user32.keybd_event(virtual_key, 0, 0x0002, 0)
 
 
 def _scroll_candidates(window) -> list[object]:
@@ -176,10 +209,11 @@ def _scroll_candidates(window) -> list[object]:
             continue
         seen.add(identity)
         unique.append(candidate)
-    return sorted(unique, key=_scroll_candidate_sort_key)
+    window_rect = _control_rect_tuple(window)
+    return sorted(unique, key=lambda control: _scroll_candidate_sort_key(control, window_rect))
 
 
-def _scroll_candidate_sort_key(control) -> tuple[int, int, int]:
+def _control_rect_tuple(control) -> tuple[int, int, int, int] | None:
     try:
         rect = control.rectangle()
         left = int(getattr(rect, "left", 0))
@@ -187,12 +221,38 @@ def _scroll_candidate_sort_key(control) -> tuple[int, int, int]:
         right = int(getattr(rect, "right", left))
         bottom = int(getattr(rect, "bottom", top))
     except Exception:
-        return (1, 0, 0)
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _scroll_candidate_sort_key(control, window_rect: tuple[int, int, int, int] | None) -> tuple[int, float, int, int]:
+    rect = _control_rect_tuple(control)
+    if not rect:
+        return (9, 9.0, 0, 0)
+    left, top, right, bottom = rect
     width = max(0, right - left)
     height = max(0, bottom - top)
     area = width * height
-    # The assistant conversation usually lives in the left/middle part of Trae.
-    return (0, -area, left)
+    if not window_rect:
+        return (0, 0.0, -area, left)
+    window_left, window_top, window_right, window_bottom = window_rect
+    window_width = max(1, window_right - window_left)
+    window_height = max(1, window_bottom - window_top)
+    center_x = (left + right) / 2
+    center_y = (top + bottom) / 2
+    ratio_x = (center_x - window_left) / window_width
+    ratio_y = (center_y - window_top) / window_height
+    assistant_region = 0.10 <= ratio_x <= 0.45 and 0.12 <= ratio_y <= 0.86
+    whole_window = width >= window_width * 0.86 and height >= window_height * 0.86
+    composer_like = ratio_y >= 0.82 and height <= window_height * 0.28
+    rank = 0 if assistant_region else 3
+    if whole_window:
+        rank += 2
+    if composer_like:
+        rank += 2
+    return (rank, abs(ratio_x - 0.30), -height, -area)
 
 
 def _control_summary(control) -> str:

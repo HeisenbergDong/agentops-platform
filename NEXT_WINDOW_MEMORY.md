@@ -1077,3 +1077,40 @@ npm.cmd run build
 下一轮真实测试提醒：
 - 必须重新下载并运行生产最新版 Worker ZIP；旧 Worker 遇到 `模型请求失败，请稍后重试。(3003)` 仍可能走主按钮 fallback。
 - 预期行为：遇到 3003/模型请求失败时，应识别为 `service_interrupted`，恢复命令在没有明确继续按钮时会直接向 Trae 输入“继续”，然后重新等待当前回合收口。
+
+## 2026-06-13 Trae 左侧回复区滚底与执行按钮识别修复记录（待部署）
+
+用户真实自测反馈：
+- Trae 已生成文档并出现“确认执行”卡片，但 Worker 没有把左侧回复条滚到最底部，因此看不到卡片底部的 `执行` 按钮。
+- 用户手动滚动后可以看到 `取消 / 执行`，说明问题不是没有确认卡片，而是 Worker 诊断前滚底不足。
+
+定位结果：
+- `scroll_assistant_to_bottom()` 先做一次坐标滚轮，如果返回 `scrolled` 就提前结束；在 Trae 当前布局下可能只滚到外层/错误区域，没有继续尝试 UIA 可滚动控件。
+- `diagnose_ui()` 只滚动并扫描一次按钮；如果第一轮按钮仍在视野外，就会误判为没有明确按钮，后续进入视觉/fallback。
+- 固定主按钮兜底缺少图中确认卡片底部右侧 `执行` 的更贴近点位。
+
+已完成代码改动：
+- `trace_copy.scroll_assistant_to_bottom()` 改成多策略滚底：
+  - 默认滚动步数从 8 提升到 14。
+  - 在左侧 assistant 回复区多个点位连续点击、滚轮、PageDown、End，覆盖窄滚动容器和不自动下拉的情况。
+  - 即使坐标滚动返回成功，也继续尝试 UIA `Document/Pane/List/Group/Custom` 候选控件，最多滚动 3 个最像左侧回复区的控件。
+  - 返回 `methods` 细节，便于后续从 Worker 结果里看实际滚了哪些路径。
+- `diagnose_ui()` 改成两段式：首次滚底扫描不到安全动作按钮时，再滚底一次并重新扫描按钮，同时返回 `diagnosis_attempts`。
+- `click_visual_intervention()` 截图/视觉识别前也先滚底，避免视觉分析看到的还是卡片上半截。
+- `click_primary_fallback()` 增加 `reply-card-primary` / `reply-card-execute` 点位，覆盖确认卡片底部右侧主按钮区域。
+- 新增测试 `test_diagnose_ui_scrolls_again_when_action_card_is_below_view`，覆盖第一轮无按钮、第二轮滚底后识别 `执行`。
+
+已验证：
+- Worker targeted：`12 passed`
+- Worker 全量：`89 passed, 2 warnings`
+- API 全量：`94 passed, 3 warnings`
+- Web build：通过，仅 Vite chunk size warning。
+- `git diff --check`：通过。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`。
+- Worker ZIP 大小：`27323853`。
+- Worker ZIP SHA256：`b3f8fad332cea6be4eecda449d5b04f559f964ef025b76dfcacfbab8f0d998a9`。
+
+待完成：
+- commit/push GitHub。
+- 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。

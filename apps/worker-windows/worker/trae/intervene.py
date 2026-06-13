@@ -10,6 +10,7 @@ from worker.trae import ui_cache
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.prompt import send_prompt, _send_keys
 from worker.trae.screenshot import capture_screenshot
+from worker.trae.trace_copy import scroll_assistant_to_bottom
 from worker.trae.ui_locator import normalize_action, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
@@ -201,11 +202,12 @@ def click_visual_intervention(
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     window = find_trae_window(timeout_seconds=timeout_seconds)
+    scroll_result = scroll_assistant_to_bottom(window)
     hwnd = int(getattr(window, "hwnd", 0) or 0)
     rect = _window_rect(hwnd)
     action = normalize_action(action or "continue_button")
     if not rect:
-        return {"status": "not_clicked", "mode": "visual-intervention", "reason": "missing_window_rect"}
+        return {"status": "not_clicked", "mode": "visual-intervention", "reason": "missing_window_rect", "scroll": scroll_result}
 
     cached = ui_cache.candidate_targets(action, rect)
     for target in cached[:2]:
@@ -215,7 +217,7 @@ def click_visual_intervention(
             continue
         clicked = _click_target(candidate, mode="cache-visual-intervention")
         ui_cache.record_success(action, candidate["center"], rect, source="cache", confidence=float(candidate.get("confidence") or 0.7))
-        return {**clicked, "action": action, "source": "cache"}
+        return {**clicked, "action": action, "source": "cache", "scroll": scroll_result}
 
     screenshot = _capture_for_visual_intervention()
     ai_analysis = {}
@@ -251,6 +253,7 @@ def click_visual_intervention(
                 "source": "ai_vision",
                 "screenshot": screenshot,
                 "ai_analysis": ai_analysis,
+                "scroll": scroll_result,
             }
         return {
             "status": "not_clicked",
@@ -259,6 +262,7 @@ def click_visual_intervention(
             "action": action,
             "screenshot": screenshot,
             "ai_analysis": ai_analysis,
+            "scroll": scroll_result,
         }
     return {
         "status": "not_clicked",
@@ -268,6 +272,7 @@ def click_visual_intervention(
         "screenshot": screenshot,
         "ai_analysis": ai_analysis,
         "ai_error": ai_error,
+        "scroll": scroll_result,
     }
 
 
@@ -284,6 +289,8 @@ def click_primary_fallback() -> dict:
     height = max(1, bottom - top)
     points = [
         ("risk-run", left + width * 0.255, top + height * 0.568),
+        ("reply-card-primary", left + width * 0.355, top + height * 0.652),
+        ("reply-card-execute", left + width * 0.350, top + height * 0.640),
         ("git-trust", left + width * 0.971, top + height * 0.918),
         ("keep-card", left + width * 0.319, top + height * 0.530),
         ("keep-left", left + width * 0.535, top + height * 0.150),

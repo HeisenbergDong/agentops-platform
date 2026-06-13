@@ -38,6 +38,53 @@ def test_diagnose_ui_classifies_safe_action_button(monkeypatch: pytest.MonkeyPat
     assert result["suggested_intervention"]["mode"] == "click-point"
 
 
+def test_diagnose_ui_scrolls_again_when_action_card_is_below_view(monkeypatch: pytest.MonkeyPatch):
+    class Rect:
+        left = 100
+        top = 650
+        right = 220
+        bottom = 690
+
+    class FakeButton:
+        def window_text(self):
+            return "\u6267\u884c"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        def __init__(self):
+            self.scans = 0
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            if control_type != "Button":
+                return []
+            self.scans += 1
+            return [] if self.scans == 1 else [FakeButton()]
+
+    fake_window = FakeWindow()
+    scrolls = []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: fake_window)
+    monkeypatch.setattr(
+        "worker.trae.diagnose.scroll_assistant_to_bottom",
+        lambda window: scrolls.append("scroll") or {"status": "scrolled", "attempt": len(scrolls)},
+    )
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "waiting")
+
+    result = diagnose_ui()
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_execute"
+    assert len(scrolls) == 2
+    assert result["diagnosis_attempts"][0]["match_count"] == 0
+    assert result["diagnosis_attempts"][1]["match_count"] == 1
+
+
 def test_diagnose_ui_detects_terminal_prompt(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         def window_text(self):

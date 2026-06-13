@@ -67,17 +67,22 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
     text = window_text_snapshot(window, limit=500)
     buttons = _button_summaries(window)
     window_rect = _window_rect(window)
-    matches = []
-    for button in buttons:
-        match = _classify_button(button)
-        if not match:
-            continue
-        if match["action"] in {"run", "run_anyway", "execute", "confirm", "continue"} and not _button_in_assistant_pane(
-            button, window_rect
-        ):
-            continue
-        matches.append(match)
-    matches.sort(key=lambda item: (item["priority"], item["confidence"], int(item["button"].get("center_y") or 0)), reverse=True)
+    matches = _action_matches(buttons, window_rect)
+    diagnosis_attempts = [
+        {"button_count": len(buttons), "match_count": len(matches), "scroll": scroll_result},
+    ]
+    if scroll_bottom and not matches:
+        extra_scroll = scroll_assistant_to_bottom(window)
+        text = window_text_snapshot(window, limit=500)
+        buttons = _button_summaries(window)
+        matches = _action_matches(buttons, window_rect)
+        if isinstance(scroll_result, dict):
+            scroll_result = {**scroll_result, "extra_attempt": extra_scroll}
+        else:
+            scroll_result = {"extra_attempt": extra_scroll}
+        diagnosis_attempts.append(
+            {"button_count": len(buttons), "match_count": len(matches), "scroll": extra_scroll},
+        )
     output_probe = probe_trace(text)
     terminal_prompt = detect_terminal_prompt(text)
 
@@ -124,6 +129,7 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
         "button_count": len(buttons),
         "buttons": buttons[:40],
         "matches": matches[:8],
+        "diagnosis_attempts": diagnosis_attempts,
         "terminal_prompt": terminal_prompt,
         "scroll_bottom": scroll_result,
         "suggested_intervention": suggested,
@@ -206,6 +212,21 @@ def _classify_button(button: dict[str, Any]) -> dict | None:
                 "button": button,
             }
     return None
+
+
+def _action_matches(buttons: list[dict[str, Any]], window_rect: dict | None) -> list[dict]:
+    matches = []
+    for button in buttons:
+        match = _classify_button(button)
+        if not match:
+            continue
+        if match["action"] in {"run", "run_anyway", "execute", "confirm", "continue"} and not _button_in_assistant_pane(
+            button, window_rect
+        ):
+            continue
+        matches.append(match)
+    matches.sort(key=lambda item: (item["priority"], item["confidence"], int(item["button"].get("center_y") or 0)), reverse=True)
+    return matches
 
 
 def _contains_marker(normalized: str, marker: str) -> bool:
