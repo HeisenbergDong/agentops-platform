@@ -1115,6 +1115,56 @@ npm.cmd run build
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
 
+## 2026-06-13 文件末尾最新状态
+
+- 最新已完成部署：`773bbb0 feat: add Trae completion supervisor`。
+- 生产 `.deploy-revision`：`773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
+- 生产 Worker ZIP 大小：`27327928`。
+- 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
+- 生产验证已通过：`agentops-api` active，API health 正常，首页和 Web 静态资源返回 `200 OK`。
+- 当前核心行为：Worker 内已有 Trae Supervisor 调度分析角色，先写出 `supervisor_decision.action/reason`，再由 Worker 执行 UI 动作。
+
+## 2026-06-13 最新状态索引
+
+- 最新已完成部署：`773bbb0 feat: add Trae completion supervisor`。
+- 生产 `.deploy-revision`：`773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
+- 生产 Worker ZIP 大小：`27327928`。
+- 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
+- 生产 API/Web 验证通过：API health 正常，首页和 Web 静态资源返回 `200 OK`。
+- 关键行为：Worker 内已有 Trae Supervisor 调度分析角色；它先产出 `supervisor_decision`，再由 Worker 执行 UI 动作。下一轮优先看 `supervisor_decision.action/reason`。
+
+## 2026-06-13 Trae Supervisor 调度分析角色补强部署完成记录
+
+本记录覆盖前文同名“待部署”记录。
+- 代码提交：`773bbb0 feat: add Trae completion supervisor`，完整 commit 为 `773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-773bbb0/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-202216-773bbb0`。
+- 已同步到生产：
+  - Worker 源码：`apps/worker-windows/worker/trae/supervisor.py`、`wait.py`。
+  - Worker 测试：`apps/worker-windows/tests/test_trae_supervisor.py`。
+  - API 源码：`apps/api/app/services/orchestrator/worker_results.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision`：`773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - Web 静态资源 `/assets/index-Cy1tcbtz.js` 和 `/assets/index-DFn3rpGU.css` 返回 `200 OK`。
+  - 生产 Worker ZIP 大小：`27327928`。
+  - 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
+  - 生产 Worker ZIP 文件头：`PK`。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP，关闭旧 `agentops-worker.exe`。
+- 预期行为：Dashboard/运行日志会出现 `Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。`
+- 预期行为：Trae 本地 turn 已 completed 时，即使右侧仍有 `保留/变更已完成`，Supervisor 也会直接判定 `collect_trace`，不再让 Worker 在 UI 上反复诊断。
+- 预期行为：3003/服务中断、本地 turn 未完成、终端提示、pending UI、首轮慢等待分别由 Supervisor 先判定 action，再由 Worker 执行动作。
+- 如果仍异常，优先看 Worker 返回里的 `supervisor_decision.action`、`supervisor_decision.reason`、`completion_gate`、`output_probe.reason`、`interventions[*].supervisor_action`。
+
 ## 2026-06-13 Trae Supervisor 调度分析角色补强记录（待部署）
 
 用户当前判断：
@@ -1338,3 +1388,12 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+
+## 2026-06-13 文件末尾最新状态
+
+- 最新已完成部署：`773bbb0 feat: add Trae completion supervisor`。
+- 生产 `.deploy-revision`：`773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
+- 生产 Worker ZIP 大小：`27327928`。
+- 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
+- 生产验证已通过：`agentops-api` active，API health 正常，首页和 Web 静态资源返回 `200 OK`。
+- 当前核心行为：Worker 内已有 Trae Supervisor 调度分析角色，先写出 `supervisor_decision.action/reason`，再由 Worker 执行 UI 动作。
