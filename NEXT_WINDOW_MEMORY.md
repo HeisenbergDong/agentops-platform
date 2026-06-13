@@ -994,3 +994,32 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产：API 源码、Web dist、新 Worker ZIP。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+
+## 2026-06-13 Trae 续写恢复流程日志准确性修复部署完成记录
+
+- 代码提交：`7943dd5 fix: clarify Trae recovery logs`，完整 commit 为 `7943dd536b4d18d0d4fa5895828d0c437d530077`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-7943dd5/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-145512-7943dd5`。
+- 已同步到生产：
+  - API 源码：`events.py`、`worker_results.py`。
+  - Worker 源码：`main.py`、`intervene.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision` 目标值：`7943dd536b4d18d0d4fa5895828d0c437d530077`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 首页 `http://115.190.113.8/` 返回 `200`。
+  - 生产 Worker ZIP 大小：`27321417`。
+  - 生产 Worker ZIP SHA256：`90b42794ecdf5531942f9a2051f227fcb065e9b13c1a6b6c57e5f2f56f4b689c`。
+  - 生产 API 已包含“当前回复还没有确认收口”新文案。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP；旧 Worker 不会上报 `action_taken`，Dashboard 无法精确区分“点击按钮”还是“输入继续”。
+- 预期日志变化：
+  - 可恢复未收口时显示“当前回复还没有确认收口（原因），Worker 正在尝试续写恢复”。
+  - `click_continue` 启动时显示“尝试让 Trae CN 当前回复继续收口”，不再固定写“点击继续按钮”。
+  - 如果没有真实按钮而是输入续写，应显示“没有确认到可点击的继续按钮，已向 Trae CN 输入‘继续’”。
+  - `wait_completion/copy_latest_reply` 的可恢复失败不再以 warning 显示“失败或需要人工处理”；真正无法安全自动处理时仍会进入人工处理。
