@@ -1114,3 +1114,31 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+
+## 2026-06-13 Trae 左侧回复区滚底与执行按钮识别修复部署完成记录
+
+- 代码提交：`4335e0b fix: scroll Trae reply pane before action detection`，完整 commit 为 `4335e0b22cf6422fa752864dbc13e328ac5159d3`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产发布目录 `/opt/agentops-platform`。
+- 上传目录：`/tmp/agentops-deploy-4335e0b/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260613-175909-4335e0b`。
+- 已同步到生产：
+  - Worker 源码：`trace_copy.py`、`diagnose.py`、`intervene.py`。
+  - Worker 测试：`test_trae_intervention.py`。
+  - Web dist：`index.html` 与 assets。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 生产 `.deploy-revision`：`4335e0b22cf6422fa752864dbc13e328ac5159d3`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - 公网 `http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - 生产 Worker ZIP 大小：`27323853`。
+  - 生产 Worker ZIP SHA256：`b3f8fad332cea6be4eecda449d5b04f559f964ef025b76dfcacfbab8f0d998a9`。
+  - 生产 Worker ZIP 文件头：`PK`。
+
+下一轮真实测试提醒：
+- 必须重新下载并运行生产最新版 Worker ZIP，关闭旧 `agentops-worker.exe`。
+- 预期行为：遇到图中这类“文档已生成，请问是否基于文档继续执行？”确认卡片时，Worker 会先强制滚动左侧回复区到底，第一轮没扫到按钮会再滚一次并重新扫描，然后优先点击真实 `执行` 按钮。
+- 如果 UIA 仍漏报按钮，视觉识别和主按钮兜底都会在截图/点击前再次滚底，并包含更贴近卡片底部右侧主按钮的兜底点位。
+- 如仍有问题，优先看 Worker 命令返回里的 `diagnosis.scroll_bottom`、`diagnosis.diagnosis_attempts` 和 `intervention.scroll`，确认实际滚动方法与第二轮按钮扫描结果。
