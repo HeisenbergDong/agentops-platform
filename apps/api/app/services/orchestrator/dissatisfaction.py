@@ -1,10 +1,30 @@
 from dataclasses import dataclass, field
+import json
 import re
 from typing import Any
+
+from sqlalchemy import select
+from sqlalchemy.orm import Session
+
+from app.db.models import RuntimeLog, User
+from app.db.repositories.roles import get_user_role
+from app.services.llm import LLMClient, LLMError, model_config_from_settings
+from app.services.user_settings import load_user_settings
 
 
 PRODUCT_LABEL = "产物不满意："
 PROCESS_LABEL = "过程不满意："
+TASK_DONE_INCOMPLETE = "未完成任务"
+TASK_DONE_OPTIONS = {"完成了任务", TASK_DONE_INCOMPLETE}
+REVIEWER_SYSTEM = """你是自动化作业里的“验收员”。你不能编造点击、截图、运行结果，也不能直接写飞书；只根据输入证据给不满意原因提案。
+要求：
+1. 必须区分产物问题和过程问题。
+2. 只能引用输入中存在的代码路径、命令结果、日志、文件变更和审查证据。
+3. 没有浏览器实测证据时，不能写“我点了/我点到/实际点击后”。
+4. 如果没有真实日志轨迹，应明确不能验真，不要把本地恢复摘要当日志。
+5. 如果日志轨迹因字段过长保存为 txt 附件，且上下文标明是已校验的真实原始日志轨迹，不得写“没有真实日志轨迹”或“只有超长占位说明”。
+6. 不满意原因要贴近当前业务系统，避免连续多轮同一句模板。
+只输出 JSON：{"task_done": "完成了任务|未完成任务", "satisfaction": "满意|不满意", "product_reason": "...", "process_reason": "...", "evidence_refs": ["..."], "confidence": 0.0}"""
 
 
 @dataclass(frozen=True)
@@ -20,17 +40,136 @@ class DissatisfactionEvidence:
     data: dict[str, Any] = field(default_factory=dict)
 
 
-def generate_dissatisfaction_reason(evidence: DissatisfactionEvidence) -> dict[str, Any]:
+def generate_dissatisfaction_reason(
+    evidence: DissatisfactionEvidence,
+    *,
+    db: Session | None = None,
+    user: User | None = None,
+    previous_reason: str = "",
+) -> dict[str, Any]:
     product = _product_reason(evidence)
     process = _process_reason(evidence)
-    reason = f"{PRODUCT_LABEL}{product}\n{PROCESS_LABEL}{process}"
+    rule_result = _finalize_reason(
+        {
+            "status": "generated",
+            "reason": f"{PRODUCT_LABEL}{product}\n{PROCESS_LABEL}{process}",
+            "product_reason": product,
+            "process_reason": process,
+            "task_done": TASK_DONE_INCOMPLETE,
+            "satisfaction": "不满意",
+            "failure_stage": evidence.failure_stage,
+            "evidence_summary": _evidence_summary(evidence),
+        },
+        evidence,
+        previous_reason=previous_reason,
+    )
+    llm_result = _reviewer_reason(db, user, evidence, rule_result, previous_reason)
+    if llm_result:
+        return llm_result
+    return rule_result
+
+
+def _reviewer_reason(
+    db: Session | None,
+    user: User | None,
+    evidence: DissatisfactionEvidence,
+    rule_result: dict[str, Any],
+    previous_reason: str,
+) -> dict[str, Any] | None:
+    if not db or not user:
+        return None
+    role = get_user_role(db, user.id, "dissatisfaction_writer")
+    if role and not role.enabled:
+        return None
+    model_key = role.model_config_key if role else "default"
+    messages = [
+        {"role": "system", "content": REVIEWER_SYSTEM},
+        {
+            "role": "user",
+            "content": json.dumps(
+                {
+                    "role": "reviewer",
+                    "hard_rules": {
+                        "must_not_fabricate_clicks": True,
+                        "must_not_use_local_recovery_as_log_trace": True,
+                        "must_reference_existing_evidence_only": True,
+                        "formal_write_requires_real_trace": True,
+                    },
+                    "context": _compact_evidence_for_reviewer(evidence, rule_result, previous_reason),
+                },
+                ensure_ascii=False,
+            ),
+        },
+    ]
+    try:
+        result = LLMClient().complete(
+            model_config_from_settings(load_user_settings(db, user.id), model_key),
+            messages,
+            purpose="dissatisfaction_reason",
+        )
+        proposal = _parse_json_object(result.text)
+    except (LLMError, Exception) as exc:
+        rule_result["llm_reviewer_error"] = str(exc)[:500]
+        return None
+
+    accepted = _accept_reviewer_proposal(proposal, evidence, previous_reason)
+    if not accepted:
+        rule_result["llm_reviewer"] = {
+            "accepted": False,
+            "rejected": _reviewer_reject_reason(proposal, evidence, previous_reason),
+            "model": result.model,
+            "wire_api": result.wire_api,
+        }
+        return None
+
+    product_reason = _strip_reason_role_prefix(sanitize_reason_phrase(proposal.get("product_reason") or ""))
+    process_reason = _strip_reason_role_prefix(sanitize_reason_phrase(proposal.get("process_reason") or ""))
+    llm_generated = _finalize_reason(
+        {
+            "status": "generated",
+            "reason": f"{PRODUCT_LABEL}{_sentence(product_reason)}\n{PROCESS_LABEL}{_sentence(process_reason)}",
+            "product_reason": product_reason,
+            "process_reason": process_reason,
+            "task_done": str(proposal.get("task_done") or TASK_DONE_INCOMPLETE),
+            "satisfaction": "不满意",
+            "failure_stage": evidence.failure_stage,
+            "evidence_summary": _evidence_summary(evidence),
+            "llm_reviewer": {
+                "accepted": True,
+                "model": result.model,
+                "wire_api": result.wire_api,
+                "confidence": proposal.get("confidence"),
+                "evidence_refs": proposal.get("evidence_refs") or [],
+            },
+        },
+        evidence,
+        previous_reason=previous_reason,
+    )
+    return llm_generated
+
+
+def _finalize_reason(result: dict[str, Any], evidence: DissatisfactionEvidence, previous_reason: str = "") -> dict[str, Any]:
+    reason = _normalize_dissatisfaction_prefix(str(result.get("reason") or ""))
+    lines = [line.strip() for line in reason.splitlines() if line.strip()]
+    product_line = next((line for line in lines if line.startswith(PRODUCT_LABEL)), "")
+    process_line = next((line for line in lines if line.startswith(PROCESS_LABEL)), "")
+    if not product_line or _too_generic_reason(product_line.replace(PRODUCT_LABEL, "", 1), evidence.prompt):
+        product_line = PRODUCT_LABEL + _sentence(_product_reason(evidence))
+    if not process_line or _too_generic_reason(process_line.replace(PROCESS_LABEL, "", 1), evidence.prompt):
+        process_line = PROCESS_LABEL + _sentence(_process_reason(evidence))
+    reason = _normalize_dissatisfaction_prefix(product_line + "\n" + process_line)
+    if previous_reason and _reason_is_too_similar(reason, previous_reason):
+        fallback = _current_round_fallback_reason(evidence)
+        reason = _normalize_dissatisfaction_prefix(fallback)
+        product_line = next((line for line in reason.splitlines() if line.startswith(PRODUCT_LABEL)), product_line)
+        process_line = next((line for line in reason.splitlines() if line.startswith(PROCESS_LABEL)), process_line)
     return {
-        "status": "generated",
         "reason": reason,
-        "product_reason": product,
-        "process_reason": process,
-        "failure_stage": evidence.failure_stage,
-        "evidence_summary": _evidence_summary(evidence),
+        "product_reason": product_line.replace(PRODUCT_LABEL, "", 1).strip(),
+        "process_reason": process_line.replace(PROCESS_LABEL, "", 1).strip(),
+        "task_done": TASK_DONE_INCOMPLETE,
+        "satisfaction": "不满意",
+        **{key: value for key, value in result.items() if key not in {"reason", "product_reason", "process_reason", "task_done", "satisfaction"}},
     }
 
 
@@ -77,6 +216,10 @@ def _product_reason(evidence: DissatisfactionEvidence) -> str:
     if stage == "product_reviewing":
         if not detail:
             detail = f"这轮要验收的是{domain}，但构建、测试或静态检查没有留下能通过的结果"
+        elif _is_tmc_context(evidence.prompt) and not all(term in detail for term in ["快递下单", "网点接单", "异常件处理"]):
+            detail = f"{detail}；这次要验收的是{domain}"
+        elif _is_agentops_context(evidence.prompt) and not all(term in detail for term in ["提示发送", "底部日志复制", "角色配置"]):
+            detail = f"{detail}；这次要验收的是{domain}"
         return f"{detail}，所以这版还不能当作完成的项目结果提交。"
     if stage == "browser_accepting":
         if not detail:
@@ -215,7 +358,7 @@ def _stage_label(stage: str) -> str:
 def _domain_hint(prompt: str) -> str:
     text = str(prompt or "")
     if any(term in text for term in ["AgentOps", "自动作业平台", "角色工作台", "模型配置", "提示发送"]):
-        return "任务轮次、角色配置、模型参数、提示发送、代码审查、浏览器验收和记录闭环"
+        return "任务轮次、角色配置、模型参数、提示发送、继续处理、底部日志复制、代码审查、浏览器验收、GitHub提交、飞书预览和异常状态记录"
     if any(term in text for term in ["TMC", "tmc", "快递", "骑手", "取件", "派送", "异常件"]):
         return "快递下单、网点接单、骑手取派、异常件处理和时效统计"
     if any(term in text for term in ["物流", "运单", "线路", "车辆", "装车", "签收", "回单"]):
@@ -227,3 +370,293 @@ def _domain_hint(prompt: str) -> str:
     if any(term in text for term in ["审批", "权限", "角色", "申请"]):
         return "申请流转、审批节点、角色权限和操作记录"
     return "核心业务流程、页面入口、数据状态和异常反馈"
+
+
+def _compact_evidence_for_reviewer(evidence: DissatisfactionEvidence, rule_result: dict[str, Any], previous_reason: str) -> dict[str, Any]:
+    return {
+        "mapped_before_llm": {
+            "任务是否完成": TASK_DONE_INCOMPLETE,
+            "产物及过程是否满意": "不满意",
+            "不满意原因": rule_result.get("reason") or "",
+        },
+        "draft": {
+            "User Prompt": evidence.prompt,
+            "failure_stage": evidence.failure_stage,
+            "failure_message": evidence.failure_message,
+            "command_type": evidence.command_type,
+            "result_status": evidence.result_status,
+            "previous_dissatisfaction_reason": previous_reason,
+            "日志轨迹": _short_text(evidence.trace_text, 18000),
+            "日志轨迹原始长度": len(evidence.trace_text or ""),
+            "截图路径": evidence.screenshot_path,
+            "runtime_log_text": _short_text(evidence.runtime_log_text, 8000),
+        },
+        "evidence_summary": _evidence_summary(evidence),
+        "data": _compact_data(evidence.data),
+        "domain_acceptance_areas": _expected_acceptance_areas(evidence.prompt),
+        "domain_boundary_examples": _expected_boundary_examples(evidence.prompt),
+    }
+
+
+def _compact_data(data: dict[str, Any]) -> dict[str, Any]:
+    if not isinstance(data, dict):
+        return {}
+    result: dict[str, Any] = {}
+    for key, value in data.items():
+        if isinstance(value, str):
+            result[key] = _short_text(value, 3000)
+        elif isinstance(value, dict):
+            result[key] = _compact_data(value)
+        elif isinstance(value, list):
+            result[key] = [_short_text(item, 800) if isinstance(item, str) else item for item in value[:12]]
+        else:
+            result[key] = value
+    return result
+
+
+def _parse_json_object(text: str) -> dict[str, Any]:
+    raw = str(text or "").strip()
+    if not raw:
+        raise ValueError("empty reviewer response")
+    fenced = re.search(r"```(?:json)?\s*(\{.*?\})\s*```", raw, flags=re.DOTALL)
+    candidate = fenced.group(1) if fenced else raw
+    if not candidate.lstrip().startswith("{"):
+        start = candidate.find("{")
+        end = candidate.rfind("}")
+        if start >= 0 and end > start:
+            candidate = candidate[start : end + 1]
+    data = json.loads(candidate)
+    if not isinstance(data, dict):
+        raise ValueError("reviewer JSON is not an object")
+    return data
+
+
+def _accept_reviewer_proposal(proposal: dict[str, Any], evidence: DissatisfactionEvidence, previous_reason: str) -> bool:
+    return not _reviewer_reject_reason(proposal, evidence, previous_reason)
+
+
+def _reviewer_reject_reason(proposal: dict[str, Any], evidence: DissatisfactionEvidence, previous_reason: str) -> str:
+    product = _strip_reason_role_prefix(sanitize_reason_phrase(proposal.get("product_reason") or ""))
+    process = _strip_reason_role_prefix(sanitize_reason_phrase(proposal.get("process_reason") or ""))
+    satisfaction = str(proposal.get("satisfaction") or "").strip()
+    if satisfaction != "不满意":
+        return "satisfaction_not_unsatisfied"
+    if len(product) < 35:
+        return "product_reason_too_short"
+    if len(process) < 45:
+        return "process_reason_too_short"
+    if _process_reason_cross_domain(product, evidence.prompt) or _process_reason_cross_domain(process, evidence.prompt):
+        return "cross_domain_reason"
+    if (_has_unsupported_click_claim(product) or _has_unsupported_click_claim(process)) and not _has_browser_action_evidence(evidence):
+        return "unsupported_click_claim"
+    full_reason = _normalize_dissatisfaction_prefix(f"{PRODUCT_LABEL}{_sentence(product)}\n{PROCESS_LABEL}{_sentence(process)}")
+    if previous_reason and _reason_is_too_similar(full_reason, previous_reason):
+        return "too_similar_to_previous"
+    return ""
+
+
+def _strip_reason_role_prefix(value: str) -> str:
+    text = str(value or "").strip()
+    return re.sub(r"^(产物|过程)(问题|不满意|不满意原因)\s*[:：]\s*", "", text)
+
+
+def _normalize_dissatisfaction_prefix(text: str) -> str:
+    value = str(text or "")
+    value = value.replace("产物不满意原因：", PRODUCT_LABEL)
+    value = value.replace("过程不满意原因：", PROCESS_LABEL)
+    return "\n".join(sanitize_reason_phrase(line) for line in value.splitlines() if sanitize_reason_phrase(line).strip())
+
+
+def _sentence(value: str) -> str:
+    text = str(value or "").strip(" 。；;")
+    if not text:
+        return ""
+    return text if text.endswith(("。", "！", "？")) else text + "。"
+
+
+def _too_generic_reason(value: str, prompt: str) -> bool:
+    text = str(value or "").strip()
+    if len(text) < 18:
+        return True
+    generic = {"功能不好用", "功能不好用。", "不好用", "不好用。", "代码有问题", "不够完善"}
+    if text in generic:
+        return True
+    return _process_reason_cross_domain(text, prompt)
+
+
+def _reason_key(value: str) -> str:
+    text = sanitize_reason_phrase(value)
+    text = re.sub(r"\d+", "#", text)
+    text = re.sub(r"\s+", "", text)
+    return text
+
+
+def _reason_is_too_similar(current: str, previous: str) -> bool:
+    if not current or not previous:
+        return False
+    left = _reason_key(current)
+    right = _reason_key(previous)
+    if not left or not right:
+        return False
+    if left == right:
+        return True
+    short, long = sorted((left, right), key=len)
+    return len(short) >= 90 and short in long
+
+
+def _current_round_fallback_reason(evidence: DissatisfactionEvidence) -> str:
+    areas = _expected_acceptance_areas(evidence.prompt)
+    product = (
+        f"{PRODUCT_LABEL}这次要验收 {areas}，当前记录还没有提供足够的代码审查、运行测试或页面复查证据来证明入口、状态变化、失败反馈和边界提示已经闭环，当前只能判定为无法确认可用。"
+    )
+    process = (
+        f"{PROCESS_LABEL}过程记录没有按“入口点击、接口或页面状态变化、错误提示、操作记录”把 {areas} 收口说明；"
+        "我看不到哪一步实际点了、预期是什么、结果变成什么，所以这轮还不能按已经验收通过处理。"
+    )
+    return product + "\n" + process
+
+
+def _process_reason_cross_domain(line: str, prompt: str) -> bool:
+    text = str(line or "")
+    if _is_agentops_context(prompt):
+        return _has_any_term(
+            text,
+            [
+                "物业质量",
+                "服务合同",
+                "在线招标",
+                "快递下单",
+                "网点接单",
+                "骑手取件",
+                "运单",
+                "线路",
+                "车辆调度",
+                "库位",
+                "入库",
+                "出库",
+                "全过程链路看板",
+                "告警规则",
+                "节点状态",
+            ],
+        )
+    if _is_tmc_context(prompt):
+        return _has_any_term(
+            text,
+            [
+                "举报入口",
+                "帖子/消息",
+                "帖子",
+                "热度",
+                "缺车",
+                "线路冲突",
+                "装车失败",
+                "节点滞留",
+                "费用核算",
+                "仓配联动",
+            ],
+        )
+    if _is_logistics_context(prompt):
+        return _has_any_term(text, ["举报入口", "帖子/消息", "骑手取件", "网点接单", "异常件处理", "客服仲裁"])
+    if _is_monitor_context(prompt):
+        return _has_any_term(text, ["帖子/消息", "骑手取件", "网点接单", "合同签订", "库位冲突"])
+    return False
+
+
+def _has_browser_action_evidence(evidence: DissatisfactionEvidence) -> bool:
+    text_parts = [
+        evidence.runtime_log_text,
+        evidence.trace_text,
+        json.dumps(evidence.data, ensure_ascii=False, default=str),
+    ]
+    text = "\n".join(str(item) for item in text_parts if item).lower()
+    return any(
+        term in text
+        for term in (
+            "playwright",
+            "puppeteer",
+            "page.goto",
+            "page.click",
+            "locator(",
+            "browser-use",
+            "browser click",
+            "浏览器实测",
+        )
+    )
+
+
+def _has_unsupported_click_claim(text: str) -> bool:
+    return any(
+        term in str(text or "")
+        for term in (
+            "我点到",
+            "我点了",
+            "我点击",
+            "实际点击后",
+            "点击后发现",
+            "点开后发现",
+            "打开页面后发现",
+        )
+    )
+
+
+def _expected_acceptance_areas(prompt: str) -> str:
+    text = str(prompt or "")
+    if _is_agentops_context(text):
+        return "任务轮次、角色配置、模型参数、提示发送、继续处理、底部日志复制、代码审查、浏览器验收、GitHub提交、飞书预览和异常状态记录"
+    if _is_tmc_context(text):
+        return "快递下单、网点接单、骑手取件、分拨扫描、派送签收、异常件处理、客户通知、客服仲裁和时效统计"
+    if _is_logistics_context(text):
+        return "运单、线路、车辆调度、节点轨迹、签收回单、异常滞留和费用统计"
+    if any(term in text for term in ["仓储系统", "仓储", "入库", "出库", "库位", "盘点", "波次"]):
+        return "入库、出库、库位、库存批次、盘点差异、波次拣货和异常库存预警"
+    if _is_monitor_context(text):
+        return "全过程链路看板、节点状态、告警规则、异常追踪、指标趋势和处理闭环"
+    if any(term in text for term in ["审批", "审批人", "权限", "申请"]):
+        return "申请列表、审批节点、角色权限、操作记录、统计图和异常提醒"
+    if any(term in text for term in ["看板", "工作台", "配置台", "仪表盘"]):
+        return "列表入口、编辑区、联动预览、数据概览、校验和异常反馈"
+    return "核心列表、编辑操作、联动预览、数据统计、校验和异常反馈"
+
+
+def _expected_boundary_examples(prompt: str) -> str:
+    text = str(prompt or "")
+    if _is_agentops_context(text):
+        return "Trae 卡住、输出过长、底部复制拿不到完整轨迹、构建失败、浏览器验收失败、GitHub 提交失败、飞书无空行或附件上传失败这些边界反馈"
+    if _is_tmc_context(text):
+        return "地址缺失、重量超限、无人接单、取件超时、分拨漏扫、派送失败、签收异常、费用估算不一致这些边界反馈"
+    if _is_logistics_context(text):
+        return "缺车、线路冲突、装车失败、节点滞留、签收异常、费用核算不一致这些边界反馈"
+    if any(term in text for term in ["仓储系统", "仓储", "库存", "库位", "入库", "出库", "盘点", "波次", "SKU"]):
+        return "缺库存、库位冲突、批次过期、盘点差异、出库复核失败这些边界反馈"
+    if _is_monitor_context(text):
+        return "节点滞留、轨迹中断、告警未处理、重复告警这些边界反馈"
+    if any(term in text for term in ["审批", "审批人", "权限", "申请"]):
+        return "越权、缺审批人、记录为空这些边界反馈"
+    return "空数据、必填项缺失、不可用状态和异常提示这些边界反馈"
+
+
+def _is_agentops_context(text: str) -> bool:
+    return _has_any_term(str(text or ""), ["AgentOps", "自动作业平台", "角色工作台", "模型配置", "提示发送", "日志轨迹", "Worker", "Trae"])
+
+
+def _is_tmc_context(text: str) -> bool:
+    return _has_any_term(str(text or ""), ["TMC", "tmc", "快递", "骑手", "取件", "派送", "异常件", "网点接单"])
+
+
+def _is_logistics_context(text: str) -> bool:
+    return _has_any_term(str(text or ""), ["物流", "运单", "线路", "车辆", "装车", "签收", "回单"])
+
+
+def _is_monitor_context(text: str) -> bool:
+    return _has_any_term(str(text or ""), ["监控", "告警", "链路", "全过程", "节点状态"])
+
+
+def _has_any_term(text: str, terms: list[str]) -> bool:
+    return any(term in str(text or "") for term in terms)
+
+
+def _short_text(value: Any, limit: int = 180) -> str:
+    text = " ".join(str(value or "").split())
+    if len(text) > limit:
+        return text[: limit - 3] + "..."
+    return text

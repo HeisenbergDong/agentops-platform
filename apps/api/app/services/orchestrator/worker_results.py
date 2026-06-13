@@ -1291,7 +1291,12 @@ def _add_dissatisfaction_log(
     round_: TaskRound,
     evidence: DissatisfactionEvidence,
 ) -> dict:
-    generated = generate_dissatisfaction_reason(evidence)
+    generated = generate_dissatisfaction_reason(
+        evidence,
+        db=db,
+        user=db.get(User, job.user_id),
+        previous_reason=_previous_dissatisfaction_reason(db, job.id, round_.id),
+    )
     add_log(
         db,
         job_id=job.id,
@@ -1302,6 +1307,24 @@ def _add_dissatisfaction_log(
         extra=generated,
     )
     return generated
+
+
+def _previous_dissatisfaction_reason(db: Session, job_id: str, round_id: str) -> str:
+    item = db.scalar(
+        select(RuntimeLog)
+        .where(
+            RuntimeLog.job_id == job_id,
+            RuntimeLog.stage == "dissatisfaction_reason",
+            RuntimeLog.round_id != round_id,
+        )
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
+    )
+    if not item:
+        return ""
+    if isinstance(item.extra, dict):
+        return str(item.extra.get("reason") or item.extra.get("product_reason") or item.extra.get("process_reason") or "")
+    return str(item.message or "")
 
 
 def _advance_to_browser_accepting(

@@ -166,7 +166,8 @@ def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch)
     assert command.status == "queued"
     prompt = command.payload["prompt"]
     assert "做一个订单看板" in command.payload["prompt"]
-    assert "中等规模" in prompt
+    assert any(term in prompt for term in ("别做成单页静态 demo", "不要只做一个很小的 demo", "不要停在说明页"))
+    assert any(term in prompt for term in ("业务模块", "详情", "状态", "本地模拟", "可运行"))
     assert any(stack in prompt for stack in ("Python", "Go", "Vue", "Java"))
     assert "你现在在 Trae CN" not in prompt
     assert "AgentOps 自动作业" not in prompt
@@ -455,6 +456,48 @@ def test_prompt_quality_rejects_first_round_too_small_positive_scope():
     error = prompt_writer.prompt_quality_error(db, job, current, "做一个很简单的小 demo，只要一个页面。")
 
     assert error == "first_round_too_small"
+
+
+def test_followup_fallback_uses_d_drive_bugfix_target_without_meta_language():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["订单管理平台：客户、订单、售后"])
+    current = TaskRound(id="round2", job_id=job.id, round_index=2, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, current])
+    db.commit()
+
+    prompt = prompt_writer.build_followup_fallback_prompt(
+        job,
+        current,
+        "产物不满意：订单保存按钮没有接上点击处理。\n过程不满意：没有说明入口点击、状态变化和失败提示。",
+    )
+
+    assert "按钮" in prompt or "点击" in prompt
+    assert "保存" in prompt
+    assert "产物不满意" not in prompt
+    assert "过程不满意" not in prompt
+    assert "不满意原因" not in prompt
+
+
+def test_agentops_first_round_fallback_keeps_business_github_feishu_trace_abilities():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    job = Job(
+        id="job1",
+        user_id=user.id,
+        status=JobState.PROMPT_READY,
+        directions=["AgentOps 多角色 LLM + Windows Worker 自动作业平台：提示发送、底部日志复制、GitHub提交和飞书预览闭环"],
+    )
+    current = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PROMPT_READY, prompt="")
+    db.add_all([job, current])
+    db.commit()
+
+    prompt = prompt_writer.build_fallback_prompt(job, current)
+
+    assert "底部日志复制" in prompt
+    assert "GitHub" in prompt
+    assert "飞书" in prompt
+    assert prompt_writer.prompt_quality_error(db, job, current, prompt) == ""
 
 
 def test_assigned_worker_config_is_scoped_to_bound_user_settings():
