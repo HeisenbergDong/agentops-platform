@@ -1142,3 +1142,40 @@ npm.cmd run build
 - 预期行为：遇到图中这类“文档已生成，请问是否基于文档继续执行？”确认卡片时，Worker 会先强制滚动左侧回复区到底，第一轮没扫到按钮会再滚一次并重新扫描，然后优先点击真实 `执行` 按钮。
 - 如果 UIA 仍漏报按钮，视觉识别和主按钮兜底都会在截图/点击前再次滚底，并包含更贴近卡片底部右侧主按钮的兜底点位。
 - 如仍有问题，优先看 Worker 命令返回里的 `diagnosis.scroll_bottom`、`diagnosis.diagnosis_attempts` 和 `intervention.scroll`，确认实际滚动方法与第二轮按钮扫描结果。
+
+## 2026-06-13 Trae 3003 优先级与窗口还原修复记录（待部署）
+
+用户真实自测反馈：
+- 图中 Trae 左侧明确显示 `模型请求失败，请稍后重试。(3003)`，但 Worker 没有正确判断成服务中断恢复。
+- 同一画面右侧编辑器顶部还有 `变更已完成，请确认是否... / 保留` 操作条，可能抢走了恢复判断。
+- Trae 窗口再次从最大化变成非最大化。
+- 用户询问“谁负责控制 Trae”：结论是服务端调度器负责任务状态和 Worker 命令编排，Windows Worker 负责真实控制 Trae 窗口；提示词角色只生成业务提示词，不直接控制 Trae。
+
+定位结果：
+- `wait_completion()` 原逻辑在检查 `probe_trace()` 的 `service_interrupted` 之前，会先执行 `diagnose_ui()` 查找可点击按钮；当右侧出现 `保留` 等按钮时，可能先点文件应用/保留，而不是把 3003 当作当前回合未收口去输入“继续”。
+- `diagnose_ui()` 原逻辑也是先按按钮匹配生成 `suggested_intervention`，后判断 `output_probe`；因此 `3003 + 保留按钮` 同时可见时，服务中断优先级不够高。
+- 上一轮滚底改动中，`scroll_assistant_to_bottom()` 会继续尝试 UIA 候选控件；候选最后包含整个 TraeWindow，调用 `window.set_focus()` 时底层默认 `SW_RESTORE`，可能把已经最大化的窗口还原。
+
+已完成代码改动：
+- `TraeWindow.set_focus()` 改为 `_set_foreground_window(..., show_window=None)`，聚焦窗口不再触发 `SW_RESTORE`。
+- `diagnose_ui()` 中 `output_probe.reason == service_interrupted` 时优先返回 `continue-text`，压过 `保留/确认/执行` 等按钮。
+- `wait_completion()` 在稳定判断阶段先检查 `probe_trace(latest_text)` 的可恢复输出原因，再做按钮诊断；服务中断会先走恢复。
+- `_try_auto_intervention(reason="service_interrupted")` 强制使用 `continue-text`，即使诊断看到 `保留` 按钮也不先点击按钮。
+- 新增测试：
+  - `test_diagnose_ui_prioritizes_3003_recovery_over_keep_button`
+  - `test_wait_completion_prioritizes_service_interruption_before_visible_buttons`
+
+已验证：
+- Worker targeted：`16 passed`
+- Worker 全量：`91 passed, 2 warnings`
+- API 全量：`94 passed, 3 warnings`
+- Web build：通过，仅 Vite chunk size warning。
+- `git diff --check`：通过。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`。
+- Worker ZIP 大小：`27322028`。
+- Worker ZIP SHA256：`1433a7989e20bba037a57773a5a7ab4ffc7eb3ee3889f11672fa75bbcab9489c`。
+
+待完成：
+- commit/push GitHub。
+- 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。

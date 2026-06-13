@@ -90,7 +90,12 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
     suggested = {}
     confidence = 0.0
     reason = ""
-    if matches:
+    if output_probe.get("reason") == "service_interrupted":
+        state = "service_interrupted"
+        confidence = 0.9
+        suggested = {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
+        reason = str(output_probe.get("reason") or "")
+    elif matches:
         best = matches[0]
         state = f"awaiting_{best['action']}"
         confidence = best["confidence"]

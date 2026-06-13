@@ -57,7 +57,7 @@ class TraeWindow:
         _show_window(self.hwnd, SW_MAXIMIZE)
 
     def set_focus(self) -> None:
-        _set_foreground_window(self.hwnd)
+        _set_foreground_window(self.hwnd, show_window=None)
 
     def descendants(self, control_type: str) -> list["AutomationElement"]:
         element = self._uia_element()

@@ -85,6 +85,41 @@ def test_diagnose_ui_scrolls_again_when_action_card_is_below_view(monkeypatch: p
     assert result["diagnosis_attempts"][1]["match_count"] == 1
 
 
+def test_diagnose_ui_prioritizes_3003_recovery_over_keep_button(monkeypatch: pytest.MonkeyPatch):
+    class Rect:
+        left = 100
+        top = 200
+        right = 220
+        bottom = 240
+
+    class FakeButton:
+        def window_text(self):
+            return "\u4fdd\u7559"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeButton()] if control_type == "Button" else []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        "worker.trae.diagnose.window_text_snapshot",
+        lambda window, limit=500: "模型请求失败，请稍后重试。(3003)",
+    )
+
+    result = diagnose_ui()
+
+    assert result["state"] == "service_interrupted"
+    assert result["suggested_intervention"] == {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
+
+
 def test_diagnose_ui_detects_terminal_prompt(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         def window_text(self):
@@ -284,6 +319,53 @@ def test_wait_completion_intervenes_before_marking_stable_done(monkeypatch: pyte
 
     assert result["status"] == "completed"
     assert interventions == [{"mode": "click-point", "x": 1, "y": 2}]
+
+
+def test_wait_completion_prioritizes_service_interruption_before_visible_buttons(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    interventions = []
+    diagnosis_calls = {"count": 0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        wait_module,
+        "window_text_snapshot",
+        lambda window: "模型请求失败，请稍后重试。(3003)\n保留 Ctrl+Enter",
+    )
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom):
+        diagnosis_calls["count"] += 1
+        return {"state": "awaiting_keep", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
+
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    def fake_apply(intervention, timeout_seconds):
+        interventions.append(intervention)
+        return {"status": "applied"}
+
+    monkeypatch.setattr(wait_module, "apply_intervention", fake_apply)
+
+    with pytest.raises(wait_module.TraeAutomationError):
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=100,
+            max_interventions=1,
+        )
+
+    assert interventions == [{"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}]
+    assert diagnosis_calls["count"] == 1
 
 
 def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.MonkeyPatch):

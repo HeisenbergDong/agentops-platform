@@ -83,6 +83,21 @@ def wait_completion(
         elif not busy and not changed:
             stable_since = stable_since or time.monotonic()
             if time.monotonic() - stable_since >= stable_seconds:
+                output_probe = probe_trace(latest_text)
+                if output_probe.get("reason") in RECOVERABLE_OUTPUT_REASONS:
+                    intervention = _try_auto_intervention(
+                        reason=str(output_probe.get("reason") or "output_recoverable"),
+                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+                    )
+                    interventions.append(intervention)
+                    if intervention.get("status") == "applied" and len(interventions) <= max_interventions:
+                        stable_since = None
+                        last_change_at = time.monotonic()
+                        _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
+                        continue
+                    raise TraeAutomationError(
+                        f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention failed"
+                    )
                 intervention_reason = ""
                 terminal_prompt = detect_terminal_prompt(latest_text)
                 if terminal_prompt:
@@ -102,21 +117,6 @@ def wait_completion(
                         last_change_at = time.monotonic()
                         _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
                         continue
-                output_probe = probe_trace(latest_text)
-                if output_probe.get("reason") in RECOVERABLE_OUTPUT_REASONS:
-                    intervention = _try_auto_intervention(
-                        reason=str(output_probe.get("reason") or "output_recoverable"),
-                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                    )
-                    interventions.append(intervention)
-                    if intervention.get("status") == "applied" and len(interventions) <= max_interventions:
-                        stable_since = None
-                        last_change_at = time.monotonic()
-                        _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
-                        continue
-                    raise TraeAutomationError(
-                        f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention failed"
-                    )
                 if _looks_like_window_chrome_only(latest_text):
                     raise TraeAutomationError(
                         "Trae output did not contain assistant content; only window chrome text was detected"
@@ -236,7 +236,9 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
             "diagnosis_state": "",
         }
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
-    if not suggested and reason in RECOVERABLE_OUTPUT_REASONS:
+    if reason == "service_interrupted":
+        suggested = {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}
+    elif not suggested and reason in RECOVERABLE_OUTPUT_REASONS:
         suggested = {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}
     if not isinstance(suggested, dict) or not suggested:
         return {
