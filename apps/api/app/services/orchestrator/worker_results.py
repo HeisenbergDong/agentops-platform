@@ -163,13 +163,14 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         job.status = JobState.COLLECTING_TRACE
         if round_:
             round_.status = JobState.COLLECTING_TRACE
+        wait_extra = _wait_completion_supervisor_extra(extra, result.data)
         add_log(
             db,
             job_id=job.id,
             round_id=round_.id if round_ else None,
             stage=JobState.COLLECTING_TRACE,
             message="Trae output appears stable; collecting the full assistant trace.",
-            extra=extra,
+            extra=wait_extra,
         )
         copy_command = _enqueue_worker_command(
             db,
@@ -1404,6 +1405,29 @@ def _wait_completion_payload(source_command: WorkerCommand, round_: TaskRound | 
     if extra:
         payload.update(extra)
     return payload
+
+
+def _wait_completion_supervisor_extra(extra: dict, data: dict) -> dict:
+    if not isinstance(data, dict):
+        return extra
+    supervisor_decision = data.get("supervisor_decision")
+    if not isinstance(supervisor_decision, dict) or not supervisor_decision:
+        return extra
+    return {
+        **extra,
+        "supervisor_decision": supervisor_decision,
+        "display_message": _wait_completion_supervisor_display_message(supervisor_decision),
+    }
+
+
+def _wait_completion_supervisor_display_message(supervisor_decision: dict) -> str:
+    action = str(supervisor_decision.get("action") or "").strip()
+    reason = str(supervisor_decision.get("reason") or "").strip()
+    if action == "collect_trace":
+        return "\u0053\u0075\u0070\u0065\u0072\u0076\u0069\u0073\u006f\u0072 \u5df2\u786e\u8ba4 \u0054\u0072\u0061\u0065 \u0043\u004e \u5f53\u524d\u56de\u5408\u5b8c\u6210\uff0c\u0057\u006f\u0072\u006b\u0065\u0072 \u5f00\u59cb\u83b7\u53d6\u56de\u590d\u5185\u5bb9\u548c\u6267\u884c\u8f68\u8ff9\u3002"
+    if reason:
+        return f"\u0053\u0075\u0070\u0065\u0072\u0076\u0069\u0073\u006f\u0072 \u5df2\u7ed9\u51fa \u0054\u0072\u0061\u0065 \u0043\u004e \u89c2\u5bdf\u7ed3\u8bba\uff08{reason}\uff09\uff0c\u0057\u006f\u0072\u006b\u0065\u0072 \u7ee7\u7eed\u6267\u884c\u8c03\u5ea6\u6d41\u7a0b\u3002"
+    return "\u0053\u0075\u0070\u0065\u0072\u0076\u0069\u0073\u006f\u0072 \u5df2\u7ed9\u51fa \u0054\u0072\u0061\u0065 \u0043\u004e \u89c2\u5bdf\u7ed3\u8bba\uff0c\u0057\u006f\u0072\u006b\u0065\u0072 \u7ee7\u7eed\u6267\u884c\u8c03\u5ea6\u6d41\u7a0b\u3002"
 
 
 def _default_wait_intervention_idle_seconds(round_: TaskRound | None) -> int:

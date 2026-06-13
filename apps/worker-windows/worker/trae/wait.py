@@ -5,6 +5,7 @@ from typing import Callable
 from worker.trae.diagnose import detect_terminal_prompt, diagnose_ui
 from worker.trae.intervene import apply_intervention
 from worker.trae.session_probe import probe_latest_trae_turn
+from worker.trae.supervisor import SupervisorObservation, decide_next_action
 from worker.trae.trace_copy import probe_trace
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
@@ -24,11 +25,6 @@ BUSY_MARKERS = (
 RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
 WINDOW_CHROME_TEXTS = {"最小化", "最大化", "关闭", "Minimize", "Maximize", "Close"}
 MIN_COMPLETION_TEXT_CHARS = 80
-RECOVERABLE_TURN_REASONS = {
-    "awaiting_current_continuation",
-    "no_completed_turn_after_prompt_send",
-    "current_turn_missing",
-}
 WINDOW_CHROME_TEXTS = WINDOW_CHROME_TEXTS | {
     "\u6700\u5c0f\u5316",
     "\u6700\u5927\u5316",
@@ -37,22 +33,6 @@ WINDOW_CHROME_TEXTS = WINDOW_CHROME_TEXTS | {
     "\u5173\u95ed",
     "Restore",
 }
-PENDING_INTERVENTION_MARKERS = (
-    "\u53d8\u66f4\u5df2\u5b8c\u6210",
-    "\u8bf7\u786e\u8ba4\u662f\u5426",
-    "\u4fdd\u7559",
-    "\u4fdd\u7559\u53d8\u66f4",
-    "\u4fdd\u5b58",
-    "\u786e\u8ba4\u6267\u884c",
-    "\u7ee7\u7eed\u6267\u884c",
-    "\u4ecd\u8981\u8fd0\u884c",
-    "\u662f\u5426\u7ee7\u7eed",
-    "Keep",
-    "Keep Changes",
-    "Save",
-    "Run anyway",
-    "Ok to proceed",
-)
 
 
 def wait_completion(
@@ -89,90 +69,36 @@ def wait_completion(
         elif not busy and not changed:
             stable_since = stable_since or time.monotonic()
             if time.monotonic() - stable_since >= stable_seconds:
-                output_probe = probe_trace(latest_text)
-                turn_probe = probe_latest_trae_turn(
+                decision = _supervisor_decision(
+                    latest_text=latest_text,
+                    busy=busy,
                     prompt=prompt,
                     workspace_path=workspace_path,
-                    sent_after_epoch=sent_at_epoch,
-                    sent_after=sent_at,
+                    sent_at_epoch=sent_at_epoch,
+                    sent_at=sent_at,
+                    idle_seconds=time.monotonic() - last_change_at,
+                    intervention_idle_seconds=intervention_idle_seconds,
+                    interventions=interventions,
+                    max_interventions=max_interventions,
                 )
-                gate = _completion_gate(turn_probe, output_probe, latest_text)
-                if gate["passed"]:
-                    if _looks_like_window_chrome_only(latest_text):
-                        raise TraeAutomationError(
-                            "Trae output did not contain assistant content; only window chrome text was detected"
-                        )
-                    return _completed_result(
-                        stable_seconds=stable_seconds,
-                        latest_text=latest_text,
-                        output_probe=output_probe,
-                        turn_probe=turn_probe,
-                        gate=gate,
-                        interventions=interventions,
-                    )
-                if output_probe.get("reason") in RECOVERABLE_OUTPUT_REASONS:
-                    if len(interventions) >= max_interventions:
-                        raise TraeAutomationError(
-                            f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention limit reached"
-                        )
-                    intervention = _try_auto_intervention(
-                        reason=str(output_probe.get("reason") or "output_recoverable"),
-                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                    )
-                    interventions.append(intervention)
-                    if intervention.get("status") == "applied" and len(interventions) <= max_interventions:
-                        stable_since = None
-                        last_change_at = time.monotonic()
-                        _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
-                        continue
-                    raise TraeAutomationError(
-                        f"Trae output is stable but not complete ({output_probe.get('reason')}); auto intervention failed"
-                    )
-                terminal_prompt = detect_terminal_prompt(latest_text)
-                if terminal_prompt and len(interventions) < max_interventions:
-                    intervention = _try_auto_intervention(
-                        reason="terminal_prompt",
-                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                    )
-                    interventions.append(intervention)
-                    if intervention.get("status") == "applied":
-                        stable_since = None
-                        last_change_at = time.monotonic()
-                        _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
-                        continue
-                if _looks_like_window_chrome_only(latest_text):
-                    raise TraeAutomationError(
-                        "Trae output did not contain assistant content; only window chrome text was detected"
-                    )
-                if gate.get("recoverable") and len(interventions) < max_interventions:
-                    intervention = _try_completion_gate_intervention(
-                        gate,
-                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                    )
-                    if intervention:
-                        interventions.append(intervention)
-                        if intervention.get("status") == "applied":
-                            stable_since = None
-                            last_change_at = time.monotonic()
-                            _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
-                            continue
-                if (
-                    gate.get("recoverable")
-                    and intervention_idle_seconds > 0
-                    and time.monotonic() - last_change_at >= intervention_idle_seconds
-                    and len(interventions) < max_interventions
-                ):
-                    intervention = _try_auto_intervention(
-                        reason=f"completion_gate:{gate.get('reason') or 'waiting'}",
-                        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
-                    )
-                    interventions.append(intervention)
+                outcome = _handle_supervisor_decision(
+                    decision=decision,
+                    stable_seconds=stable_seconds,
+                    latest_text=latest_text,
+                    interventions=interventions,
+                    timeout_seconds=timeout_seconds,
+                )
+                if outcome.get("status") == "completed":
+                    return outcome
+                if outcome.get("status") == "failed":
+                    raise TraeAutomationError(str(outcome.get("error") or "Trae supervisor decision failed"))
+                if outcome.get("status") == "applied":
                     stable_since = None
                     last_change_at = time.monotonic()
                     _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
                     continue
                 stable_since = None
-                if not gate.get("recoverable"):
+                if not decision.get("recoverable"):
                     last_change_at = time.monotonic()
                 _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
                 continue
@@ -187,37 +113,121 @@ def wait_completion(
             and time.monotonic() - last_change_at >= intervention_idle_seconds
             and len(interventions) < max_interventions
         ):
-            output_probe = probe_trace(latest_text)
-            turn_probe = probe_latest_trae_turn(
+            decision = _supervisor_decision(
+                latest_text=latest_text,
+                busy=busy,
                 prompt=prompt,
                 workspace_path=workspace_path,
-                sent_after_epoch=sent_at_epoch,
-                sent_after=sent_at,
+                sent_at_epoch=sent_at_epoch,
+                sent_at=sent_at,
+                idle_seconds=time.monotonic() - last_change_at,
+                intervention_idle_seconds=intervention_idle_seconds,
+                interventions=interventions,
+                max_interventions=max_interventions,
             )
-            gate = _completion_gate(turn_probe, output_probe, latest_text)
-            if gate["passed"]:
-                if _looks_like_window_chrome_only(latest_text):
-                    raise TraeAutomationError(
-                        "Trae output did not contain assistant content; only window chrome text was detected"
-                    )
-                return _completed_result(
-                    stable_seconds=stable_seconds,
-                    latest_text=latest_text,
-                    output_probe=output_probe,
-                    turn_probe=turn_probe,
-                    gate=gate,
-                    interventions=interventions,
-                )
-            reason = str(output_probe.get("reason") or "idle_no_output_change")
-            if reason not in RECOVERABLE_OUTPUT_REASONS:
-                reason = "idle_no_output_change"
-            intervention = _try_auto_intervention(reason=reason, timeout_seconds=min(10.0, max(2.0, timeout_seconds)))
-            interventions.append(intervention)
-            last_change_at = time.monotonic()
-            stable_since = None
+            outcome = _handle_supervisor_decision(
+                decision=decision,
+                stable_seconds=stable_seconds,
+                latest_text=latest_text,
+                interventions=interventions,
+                timeout_seconds=timeout_seconds,
+            )
+            if outcome.get("status") == "completed":
+                return outcome
+            if outcome.get("status") == "failed":
+                raise TraeAutomationError(str(outcome.get("error") or "Trae supervisor decision failed"))
+            if outcome.get("status") == "applied":
+                last_change_at = time.monotonic()
+                stable_since = None
         _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
 
     raise TraeAutomationError("Trae output did not become stable before wait_completion timeout")
+
+
+def _supervisor_decision(
+    *,
+    latest_text: str,
+    busy: bool,
+    prompt: str,
+    workspace_path: str,
+    sent_at_epoch: float | None,
+    sent_at: str,
+    idle_seconds: float,
+    intervention_idle_seconds: float,
+    interventions: list[dict],
+    max_interventions: int,
+) -> dict:
+    output_probe = probe_trace(latest_text)
+    turn_probe = probe_latest_trae_turn(
+        prompt=prompt,
+        workspace_path=workspace_path,
+        sent_after_epoch=sent_at_epoch,
+        sent_after=sent_at,
+    )
+    terminal_prompt = detect_terminal_prompt(latest_text)
+    return decide_next_action(
+        SupervisorObservation(
+            latest_text=latest_text,
+            output_probe=output_probe,
+            turn_probe=turn_probe,
+            busy=busy,
+            terminal_prompt=terminal_prompt,
+            idle_seconds=idle_seconds,
+            intervention_idle_seconds=intervention_idle_seconds,
+            intervention_count=len(interventions),
+            max_interventions=max_interventions,
+            window_chrome_only=_looks_like_window_chrome_only(latest_text),
+        )
+    )
+
+
+def _handle_supervisor_decision(
+    *,
+    decision: dict,
+    stable_seconds: float,
+    latest_text: str,
+    interventions: list[dict],
+    timeout_seconds: float,
+) -> dict:
+    action = str(decision.get("action") or "wait")
+    if action == "collect_trace":
+        return _completed_result(
+            stable_seconds=stable_seconds,
+            latest_text=latest_text,
+            output_probe=decision.get("output_probe") or {},
+            turn_probe=decision.get("turn_probe") or {},
+            gate=decision.get("completion_gate") or {},
+            interventions=interventions,
+            supervisor_decision=decision,
+        )
+    if action == "fail":
+        reason = str(decision.get("reason") or "supervisor_failed")
+        if reason == "window_chrome_only":
+            message = "Trae output did not contain assistant content; only window chrome text was detected"
+        else:
+            message = f"Trae supervisor could not recover current turn ({reason})"
+        return {"status": "failed", "error": message, "supervisor_decision": decision}
+    if action in {"recover_service_interruption", "continue_output", "answer_terminal_prompt", "apply_pending_ui", "diagnose_idle"}:
+        reason = str(decision.get("reason") or action)
+        if action == "answer_terminal_prompt":
+            reason = "terminal_prompt"
+        elif action == "diagnose_idle" and reason not in RECOVERABLE_OUTPUT_REASONS:
+            reason = f"completion_gate:{reason}"
+        intervention = _try_auto_intervention(
+            reason=reason,
+            timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+        )
+        intervention["supervisor_action"] = action
+        intervention["supervisor_reason"] = str(decision.get("reason") or "")
+        interventions.append(intervention)
+        if action in {"recover_service_interruption", "continue_output"} and intervention.get("status") != "applied":
+            return {
+                "status": "failed",
+                "error": f"Trae output is stable but not complete ({decision.get('reason')}); auto intervention failed",
+                "supervisor_decision": decision,
+            }
+        return {"status": "applied", "intervention": intervention, "supervisor_decision": decision}
+    return {"status": "waiting", "supervisor_decision": decision}
 
 
 def _completed_result(
@@ -228,6 +238,7 @@ def _completed_result(
     turn_probe: object,
     gate: dict,
     interventions: list[dict],
+    supervisor_decision: dict | None = None,
 ) -> dict:
     return {
         "status": "completed",
@@ -237,6 +248,7 @@ def _completed_result(
         "output_probe": output_probe,
         "trae_turn": turn_probe,
         "completion_gate": gate,
+        "supervisor_decision": supervisor_decision or {},
         "interventions": interventions,
     }
 
@@ -248,52 +260,6 @@ def _looks_like_window_chrome_only(text: str) -> bool:
     if len("\n".join(lines)) < MIN_COMPLETION_TEXT_CHARS and all(line in WINDOW_CHROME_TEXTS for line in lines):
         return True
     return False
-
-
-def _completion_gate(turn_probe: object, output_probe: object, latest_text: str) -> dict:
-    pending_intervention_visible = _has_pending_intervention_text(latest_text)
-    if isinstance(turn_probe, dict) and turn_probe.get("status") == "found":
-        turn_status = str(turn_probe.get("turn_status") or "")
-        if turn_status == "completed":
-            return {
-                "passed": True,
-                "reason": "ok",
-                "session_id": str(turn_probe.get("session_id") or ""),
-                "user_message_id": str(turn_probe.get("user_message_id") or ""),
-                "pending_intervention_visible": pending_intervention_visible,
-            }
-    if pending_intervention_visible:
-        return {"passed": False, "reason": "pending_intervention_visible", "recoverable": True}
-    if not isinstance(turn_probe, dict):
-        return {"passed": False, "reason": "turn_probe_unavailable", "recoverable": False}
-    if turn_probe.get("status") != "found":
-        reason = str(turn_probe.get("reason") or "current_turn_missing")
-        return {
-            "passed": False,
-            "reason": reason,
-            "recoverable": reason in RECOVERABLE_TURN_REASONS,
-            "candidate": turn_probe.get("candidate") if isinstance(turn_probe.get("candidate"), dict) else None,
-        }
-    turn_status = str(turn_probe.get("turn_status") or "")
-    if turn_status != "completed":
-        return {
-            "passed": False,
-            "reason": f"trae_turn_not_completed:{turn_status or 'unknown'}",
-            "recoverable": True,
-            "session_id": str(turn_probe.get("session_id") or ""),
-            "user_message_id": str(turn_probe.get("user_message_id") or ""),
-        }
-    return {
-        "passed": True,
-        "reason": "ok",
-        "session_id": str(turn_probe.get("session_id") or ""),
-        "user_message_id": str(turn_probe.get("user_message_id") or ""),
-    }
-
-
-def _has_pending_intervention_text(text: str) -> bool:
-    lowered = str(text or "").lower()
-    return any(marker.lower() in lowered for marker in PENDING_INTERVENTION_MARKERS)
 
 
 def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], None] | None) -> None:
@@ -345,19 +311,3 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
         "result": result,
         "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
     }
-
-
-def _try_completion_gate_intervention(gate: dict, timeout_seconds: float) -> dict:
-    reason = str(gate.get("reason") or "completion_gate_waiting")
-    if reason in {"pending_intervention_visible", "awaiting_current_continuation"}:
-        return _try_auto_intervention(reason=reason, timeout_seconds=timeout_seconds)
-    return {}
-
-
-def _diagnose_suggested_intervention(timeout_seconds: float) -> dict:
-    try:
-        diagnosis = diagnose_ui(timeout_seconds=timeout_seconds, scroll_bottom=True)
-    except Exception:
-        return {}
-    suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
-    return suggested if isinstance(suggested, dict) else {}

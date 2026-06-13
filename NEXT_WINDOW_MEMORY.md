@@ -1115,6 +1115,52 @@ npm.cmd run build
 - 部署生产新版 Worker ZIP，并同步当前源码/Web dist。
 - 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
 
+## 2026-06-13 Trae Supervisor 调度分析角色补强记录（待部署）
+
+用户当前判断：
+- 需要补一个明确的 Supervisor / 调度分析角色，而不是让 Worker 只在 Trae UI 上来回晃鼠标。
+- 参考 `D:\adbz` 后，合理边界应是：调度分析负责综合信号判断下一步，Worker 负责执行具体 UI/窗口动作。
+
+架构结论：
+- 服务端调度器仍负责作业状态和 Worker 命令编排，例如 `send_prompt -> wait_completion -> copy_latest_reply`。
+- Windows Worker 内新增 Trae Supervisor，负责本机 Trae 观察分析：本地 Trae turn、回复探针、UI 文本、终端提示、窗口 chrome-only、防空闲误判、干预次数等。
+- Worker 本身不是独立大模型角色；它有规则化的本地观察和执行能力。后续如需要 LLM 级 UI 全局分析，可以把 Supervisor 的 observation/decision 作为入口接入。
+
+已完成代码改动：
+- 新增 `apps/worker-windows/worker/trae/supervisor.py`：
+  - 定义 `SupervisorObservation` 和 `decide_next_action()`。
+  - 明确输出动作：`collect_trace`、`recover_service_interruption`、`continue_output`、`answer_terminal_prompt`、`apply_pending_ui`、`diagnose_idle`、`wait`、`fail`。
+  - 本地 Trae turn `completed` 优先进入 trace 采集；即使右侧仍有 `保留/变更已完成` 操作条，也不会再误卡在 UI 干预。
+  - `service_interrupted/3003` 类中断优先恢复，不被右侧 `保留/确认` 按钮抢走。
+  - 首轮慢等待继续按较长 `intervention_idle_seconds`，未到阈值只等待，不乱点 UI。
+  - chrome-only 窗口文本仍会失败保护，避免把 `最小化/恢复/关闭` 误判为完成。
+- `apps/worker-windows/worker/trae/wait.py`：
+  - `wait_completion()` 改为调用 Supervisor 生成结构化 decision，再由 `_handle_supervisor_decision()` 执行动作。
+  - 完成结果新增 `supervisor_decision`，后续日志可直接看到判断依据。
+- `apps/api/app/services/orchestrator/worker_results.py`：
+  - `wait_completion` 成功进入 `collecting_trace` 时，把 `supervisor_decision` 提升到日志 `extra` 顶层。
+  - 控制台显示：`Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。`
+- 新增 `apps/worker-windows/tests/test_trae_supervisor.py`，覆盖完成优先、3003 恢复优先、pending UI、首轮慢等待、空闲诊断、chrome-only 保护。
+- 更新 `apps/api/tests/test_worker_results.py`，覆盖 Supervisor 决策写入运行日志和中文展示。
+
+已验证：
+- Worker targeted：`55 passed`
+- API targeted：`44 passed`
+- `py_compile`：通过
+- Worker 全量：`98 passed, 2 warnings`
+- API 全量：`94 passed, 3 warnings`
+- Web build：通过，仅 Vite chunk size warning。
+- `git diff --check`：通过。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`
+- Worker ZIP 大小：`27327928`
+- Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`
+
+待完成：
+- commit/push GitHub。
+- 部署生产：API 源码、Web dist、Worker ZIP。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。
+- 部署完成后再追加本条记录的完成版。
+
 ## 2026-06-13 Trae 本地回合完成优先与首轮慢等待修复部署完成记录
 
 本记录覆盖前文同名“待部署”记录。

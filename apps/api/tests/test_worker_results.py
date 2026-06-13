@@ -206,16 +206,36 @@ def test_wait_completion_success_queues_trace_copy():
     handle_worker_result(
         db,
         command,
-        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"text_chars": 1000}),
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "text_chars": 1000,
+                "supervisor_decision": {
+                    "action": "collect_trace",
+                    "reason": "trae_turn_completed",
+                    "completion_gate": {"passed": True, "reason": "ok"},
+                },
+            },
+        ),
     )
 
     db.refresh(job)
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    collect_log = db.scalar(
+        select(RuntimeLog)
+        .where(RuntimeLog.stage == JobState.COLLECTING_TRACE)
+        .where(RuntimeLog.message == "Trae output appears stable; collecting the full assistant trace.")
+    )
     assert job.status == JobState.COLLECTING_TRACE
     assert round_.status == JobState.COLLECTING_TRACE
     assert next_command is not None
     assert next_command.status == "queued"
+    assert collect_log is not None
+    assert collect_log.extra["supervisor_decision"]["action"] == "collect_trace"
+    assert collect_log.display_message == "Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。"
 
 
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):
