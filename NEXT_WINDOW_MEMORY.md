@@ -1124,6 +1124,58 @@ npm.cmd run build
 - 生产验证已通过：`agentops-api` active，API health 正常，首页和 Web 静态资源返回 `200 OK`。
 - 当前核心行为：Worker 内已有 Trae Supervisor 调度分析角色，先写出 `supervisor_decision.action/reason`，再由 Worker 执行 UI 动作。
 
+## 2026-06-13 Trae Watcher + Supervisor 三层观察改造记录（待部署）
+
+本轮目标：让 `wait_completion` 不再只看 UI 文本/按钮稳定，而是先汇总真实活动信号：Trae agent log、项目文件 mtime、当前 turn probe、trace probe、latest text hash，再交给规则型 Supervisor 决策。这样首轮 Trae 慢但日志/项目仍在变化时，Worker 会继续等待，不会过早点 `确认/执行/保留` 等按钮。
+
+已完成代码改动：
+- 新增 `apps/worker-windows/worker/trae/watcher.py`：
+  - `activity_snapshot()` 汇总项目目录最新 mtime 和 Trae agent log 最新 mtime，忽略 `node_modules/dist/build/target/.venv/__pycache__/.git/.npm-cache`。
+  - `latest_agent_log_path()` 查找 `%APPDATA%\Trae CN\User\logs` 和 `%APPDATA%\Trae CN\logs` 下的 `ai-agent_*_stdout.log`。
+  - `filtered_agent_log_tail()` 过滤 noisy 行，保留 `main_routine/chat_turn/task/tool/error/3003` 等有意义日志，并产出 `tail_hash`。
+  - `build_trae_observation()` 汇总 `turn_probe/output_probe/activity/project_write/log/latest_text_hash/idle_seconds`。
+- `apps/worker-windows/worker/trae/supervisor.py`：
+  - `SupervisorObservation` 增加 watcher/activity 字段。
+  - 决策顺序现在保持：completed 优先 collect_trace，3003/awaiting_continuation 优先恢复，terminal prompt 优先回答，chrome-only fail，未完成且 recent activity 则 wait，之后才 pending UI/idle diagnose。
+  - `supervisor_decision` 中新增 `watcher_observation` 和 `activity_summary`。
+- `apps/worker-windows/worker/trae/wait.py`：
+  - `_supervisor_decision()` 接入 `build_trae_observation()`。
+  - completed/applied/failed/waiting 结果保留 `watcher_observation` 和 `activity_summary`，便于 Dashboard 排查。
+- `apps/worker-windows/worker/runtime/command_runner.py`：
+  - `copy_latest_reply` 结果增加轻量 `supervisor_decision`，基于 `trace_probe/current_turn_gate` 描述 copy 后是否应该恢复、继续或通过。
+- `apps/api/app/services/orchestrator/worker_results.py`：
+  - `wait_completion` 成功日志提升 `watcher_observation/activity_summary` 到 log extra 顶层。
+  - copy 后 recoverable `current_turn_gate` 仍回到 `click_continue` recovery，不推进截图/测试/GitHub/飞书。
+- `apps/api/app/services/trae_ui_analyst.py`：
+  - 输出 schema 扩展为 `status/screen_state/recommended_action/confidence/risk/target/evidence/blocked_reason`。
+  - 保持旧 `targets` 兼容；如果模型只返回新 `target`，会同步进 `targets`，供 Worker 现有视觉点击逻辑使用。
+  - 对 delete/discard/cancel/reset/clear 等危险目标强制 `risk=blocked`、`recommended_action=do_not_click`。
+
+新增/更新测试：
+- Worker：
+  - `tests/test_trae_watcher.py`
+  - `tests/test_trae_supervisor.py`
+  - `tests/test_trae_intervention.py`
+  - `tests/test_command_runner.py`
+- API：
+  - `tests/test_worker_results.py`
+  - `tests/test_trae_ui_analyst.py`
+
+本地验证：
+- Worker 全量：`apps/worker-windows` 中 `.\.venv\Scripts\python -m pytest tests -q`，结果 `105 passed, 2 warnings`。
+- API 全量：`apps/api` 中 `..\worker-windows\.venv\Scripts\python -m pytest tests -q`，结果 `97 passed, 3 warnings`。
+- Web build：`apps/web` 中 `npm.cmd run build`，通过，仅 Vite chunk size warning。
+- `git diff --check`：通过，仅提示 `wait.py` CRLF 将被 Git 规范化。
+- Worker 打包：`powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean` 成功。
+- 本地 Worker ZIP：`apps/worker-windows/dist/agentops-worker-windows.zip`
+  - size：`27336132`
+  - SHA256：`fd5d4d5170113f87db6d41fe9265a8a0f4d1b688f853dada20ba10895d60448c`
+
+待完成：
+- commit/push GitHub。
+- 部署 API 源码、Web dist、Worker ZIP 到生产 `/opt/agentops-platform`，Web dist 使用 tar，不用 Windows zip。
+- 生产验证：`systemctl is-active agentops-api`、本机和公网 `/api/health`、首页和 assets 200、Worker ZIP size/SHA256、`.deploy-revision`。
+
 ## 2026-06-13 最新状态索引
 
 - 最新已完成部署：`773bbb0 feat: add Trae completion supervisor`。

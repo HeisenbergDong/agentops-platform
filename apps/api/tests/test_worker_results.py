@@ -212,6 +212,11 @@ def test_wait_completion_success_queues_trace_copy():
             status="success",
             data={
                 "text_chars": 1000,
+                "watcher_observation": {
+                    "activity": {"recent": False, "source": "agent_log", "quiet_seconds": 301.0},
+                    "log": {"tail_hash": "abc123"},
+                },
+                "activity_summary": {"recent": False, "source": "agent_log", "quiet_seconds": 301.0},
                 "supervisor_decision": {
                     "action": "collect_trace",
                     "reason": "trae_turn_completed",
@@ -235,6 +240,8 @@ def test_wait_completion_success_queues_trace_copy():
     assert next_command.status == "queued"
     assert collect_log is not None
     assert collect_log.extra["supervisor_decision"]["action"] == "collect_trace"
+    assert collect_log.extra["watcher_observation"]["activity"]["source"] == "agent_log"
+    assert collect_log.extra["activity_summary"]["quiet_seconds"] == 301.0
     assert collect_log.display_message == "Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。"
 
 
@@ -352,6 +359,49 @@ def test_copy_latest_reply_service_interruption_queues_continue_recovery():
     assert round_.status == JobState.AWAITING_CONTINUE
     assert round_.trace_status == "service_interrupted"
     assert next_command is not None
+
+
+def test_copy_latest_reply_recoverable_current_turn_gate_queues_continue(tmp_path, monkeypatch):
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    trace = _valid_trace()
+    monkeypatch.setattr(worker_results.settings, "attachment_root", tmp_path / "storage")
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": trace,
+                "trace_probe": {"complete_like": True, "reason": "ok"},
+                "current_turn_gate": {
+                    "passed": False,
+                    "reason": "awaiting_current_continuation",
+                    "recoverable": True,
+                },
+                "supervisor_decision": {
+                    "action": "continue_output",
+                    "reason": "awaiting_current_continuation",
+                    "recoverable": True,
+                },
+                "trae_turn": {"status": "missing", "reason": "awaiting_current_continuation"},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert round_.trace_status == "awaiting_current_continuation"
+    assert next_command is not None
+    recovery_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.AWAITING_CONTINUE).limit(1))
+    assert recovery_log is not None
+    assert recovery_log.extra["data"]["supervisor_decision"]["action"] == "continue_output"
 
 
 def test_capture_screenshot_records_attachment_and_advances_to_product_reviewing():

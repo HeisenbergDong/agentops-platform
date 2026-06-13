@@ -49,6 +49,47 @@ def test_supervisor_applies_pending_ui_only_when_turn_is_not_completed():
     assert decision["completion_gate"]["reason"] == "pending_intervention_visible"
 
 
+def test_supervisor_waits_on_recent_activity_before_pending_ui():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+            idle_seconds=15,
+            intervention_idle_seconds=300,
+            max_interventions=3,
+            recent_activity=True,
+            activity_source="agent_log",
+            activity_quiet_seconds=2.4,
+            log_tail_hash="abc123",
+        )
+    )
+
+    assert decision["action"] == "wait"
+    assert decision["reason"] == "recent_trae_activity"
+    assert decision["activity_summary"]["recent"] is True
+    assert decision["activity_summary"]["source"] == "agent_log"
+
+
+def test_supervisor_recovers_3003_even_with_recent_activity():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u6a21\u578b\u8bf7\u6c42\u5931\u8d25\uff0c\u8bf7\u7a0d\u540e\u91cd\u8bd5\u3002(3003)\n\u786e\u8ba4\u6267\u884c",
+            output_probe={"reason": "service_interrupted"},
+            turn_probe={"status": "missing", "reason": "current_turn_missing"},
+            idle_seconds=5,
+            intervention_idle_seconds=300,
+            max_interventions=3,
+            recent_activity=True,
+            activity_source="project",
+            activity_quiet_seconds=1.1,
+        )
+    )
+
+    assert decision["action"] == "recover_service_interruption"
+    assert decision["reason"] == "service_interrupted"
+
+
 def test_supervisor_waits_for_slow_first_round_before_idle_diagnosis():
     observation = SupervisorObservation(
         latest_text="Trae is quiet but has no completed turn yet",

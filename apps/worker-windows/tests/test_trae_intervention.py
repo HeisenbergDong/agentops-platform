@@ -5,6 +5,23 @@ from worker.trae.diagnose import diagnose_ui
 from worker.trae.intervene import apply_intervention, click_continue
 
 
+def _watcher_observation(recent: bool = False) -> dict:
+    return {
+        "activity": {
+            "recent": recent,
+            "source": "agent_log" if recent else "",
+            "quiet_seconds": 1.2 if recent else 999.0,
+            "path": "C:/Trae/ai-agent_stdout.log" if recent else "",
+            "last_write": "2026-06-13T12:00:00" if recent else "",
+        },
+        "project_write": {"mtime": 0.0, "path": "", "last_write": ""},
+        "log": {"path": "C:/Trae/ai-agent_stdout.log", "mtime": 1.0, "tail_hash": "abc123"},
+        "log_sample": [],
+        "latest_text_hash": "txt",
+        "idle_seconds": 0.0,
+    }
+
+
 def test_diagnose_ui_classifies_safe_action_button(monkeypatch: pytest.MonkeyPatch):
     class Rect:
         left = 100
@@ -240,6 +257,7 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
             else {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}
         ),
     )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -294,6 +312,7 @@ def test_wait_completion_intervenes_on_pending_ui_before_local_turn_completes(mo
             else {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}
         ),
     )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -349,6 +368,7 @@ def test_wait_completion_accepts_completed_turn_with_pending_keep_text(monkeypat
         "probe_latest_trae_turn",
         lambda **kwargs: {"status": "found", "turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
     )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -391,6 +411,7 @@ def test_wait_completion_prioritizes_service_interruption_before_visible_buttons
     )
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
     monkeypatch.setattr(wait_module, "probe_latest_trae_turn", lambda **kwargs: {"status": "missing", "reason": "current_turn_missing"})
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -432,6 +453,7 @@ def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.Mon
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "最小化\n最大化\n关闭")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -461,6 +483,7 @@ def test_wait_completion_rejects_restored_window_chrome_text(monkeypatch: pytest
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -503,6 +526,7 @@ def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch:
             "candidate": {"turn_status": "unknown"},
         },
     )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
@@ -523,3 +547,43 @@ def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch:
         )
 
     assert "did not become stable" in str(exc.value)
+
+
+def test_wait_completion_does_not_diagnose_pending_ui_while_recent_activity(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    diagnosis_calls = {"count": 0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u786e\u8ba4\u6267\u884c\nTrae still working")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+    )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(True))
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom):
+        diagnosis_calls["count"] += 1
+        return {"state": "awaiting_execute", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    with pytest.raises(wait_module.TraeAutomationError):
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=100,
+            max_interventions=1,
+        )
+
+    assert diagnosis_calls["count"] == 0

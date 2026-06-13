@@ -40,16 +40,31 @@ class SupervisorObservation:
     intervention_count: int = 0
     max_interventions: int = 0
     window_chrome_only: bool = False
+    recent_activity: bool = False
+    activity_source: str = ""
+    activity_quiet_seconds: float | None = None
+    log_tail_hash: str = ""
+    project_last_write: str = ""
+    watcher_observation: dict[str, Any] | None = None
 
 
 def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
     pending_intervention_visible = has_pending_intervention_text(observation.latest_text)
     gate = completion_gate(observation.turn_probe, observation.output_probe, observation.latest_text)
+    activity_summary = {
+        "recent": bool(observation.recent_activity),
+        "source": str(observation.activity_source or ""),
+        "quiet_seconds": observation.activity_quiet_seconds,
+        "log_tail_hash": str(observation.log_tail_hash or ""),
+        "project_last_write": str(observation.project_last_write or ""),
+    }
     context = {
         "completion_gate": gate,
         "pending_intervention_visible": pending_intervention_visible,
         "output_probe": observation.output_probe,
         "turn_probe": observation.turn_probe or {},
+        "watcher_observation": observation.watcher_observation or {},
+        "activity_summary": activity_summary,
         "idle_seconds": round(float(observation.idle_seconds or 0.0), 3),
         "intervention_idle_seconds": round(float(observation.intervention_idle_seconds or 0.0), 3),
         "intervention_count": int(observation.intervention_count or 0),
@@ -108,6 +123,14 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             "action": "fail",
             "reason": "window_chrome_only",
             "recoverable": False,
+            **context,
+        }
+
+    if observation.recent_activity:
+        return {
+            "action": "wait",
+            "reason": "recent_trae_activity",
+            "recoverable": True,
             **context,
         }
 

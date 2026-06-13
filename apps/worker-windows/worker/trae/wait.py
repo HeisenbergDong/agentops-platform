@@ -7,6 +7,7 @@ from worker.trae.intervene import apply_intervention
 from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.supervisor import SupervisorObservation, decide_next_action
 from worker.trae.trace_copy import probe_trace
+from worker.trae.watcher import build_trae_observation
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
 BUSY_MARKERS = (
@@ -164,6 +165,18 @@ def _supervisor_decision(
         sent_after_epoch=sent_at_epoch,
         sent_after=sent_at,
     )
+    watcher_observation = build_trae_observation(
+        project_path=workspace_path,
+        started_at_epoch=sent_at_epoch,
+        quiet_seconds=intervention_idle_seconds,
+        latest_text=latest_text,
+        turn_probe=turn_probe if isinstance(turn_probe, dict) else {},
+        output_probe=output_probe,
+        idle_seconds=idle_seconds,
+    )
+    activity = watcher_observation.get("activity") if isinstance(watcher_observation, dict) else {}
+    project_write = watcher_observation.get("project_write") if isinstance(watcher_observation, dict) else {}
+    log = watcher_observation.get("log") if isinstance(watcher_observation, dict) else {}
     terminal_prompt = detect_terminal_prompt(latest_text)
     return decide_next_action(
         SupervisorObservation(
@@ -177,6 +190,12 @@ def _supervisor_decision(
             intervention_count=len(interventions),
             max_interventions=max_interventions,
             window_chrome_only=_looks_like_window_chrome_only(latest_text),
+            recent_activity=bool(activity.get("recent")) if isinstance(activity, dict) else False,
+            activity_source=str(activity.get("source") or "") if isinstance(activity, dict) else "",
+            activity_quiet_seconds=activity.get("quiet_seconds") if isinstance(activity, dict) else None,
+            log_tail_hash=str(log.get("tail_hash") or "") if isinstance(log, dict) else "",
+            project_last_write=str(project_write.get("last_write") or "") if isinstance(project_write, dict) else "",
+            watcher_observation=watcher_observation,
         )
     )
 
@@ -206,7 +225,7 @@ def _handle_supervisor_decision(
             message = "Trae output did not contain assistant content; only window chrome text was detected"
         else:
             message = f"Trae supervisor could not recover current turn ({reason})"
-        return {"status": "failed", "error": message, "supervisor_decision": decision}
+        return {"status": "failed", "error": message, "supervisor_decision": decision, **_decision_observation_fields(decision)}
     if action in {"recover_service_interruption", "continue_output", "answer_terminal_prompt", "apply_pending_ui", "diagnose_idle"}:
         reason = str(decision.get("reason") or action)
         if action == "answer_terminal_prompt":
@@ -225,9 +244,15 @@ def _handle_supervisor_decision(
                 "status": "failed",
                 "error": f"Trae output is stable but not complete ({decision.get('reason')}); auto intervention failed",
                 "supervisor_decision": decision,
+                **_decision_observation_fields(decision),
             }
-        return {"status": "applied", "intervention": intervention, "supervisor_decision": decision}
-    return {"status": "waiting", "supervisor_decision": decision}
+        return {
+            "status": "applied",
+            "intervention": intervention,
+            "supervisor_decision": decision,
+            **_decision_observation_fields(decision),
+        }
+    return {"status": "waiting", "supervisor_decision": decision, **_decision_observation_fields(decision)}
 
 
 def _completed_result(
@@ -249,7 +274,16 @@ def _completed_result(
         "trae_turn": turn_probe,
         "completion_gate": gate,
         "supervisor_decision": supervisor_decision or {},
+        "watcher_observation": (supervisor_decision or {}).get("watcher_observation") or {},
+        "activity_summary": (supervisor_decision or {}).get("activity_summary") or {},
         "interventions": interventions,
+    }
+
+
+def _decision_observation_fields(decision: dict) -> dict:
+    return {
+        "watcher_observation": decision.get("watcher_observation") or {},
+        "activity_summary": decision.get("activity_summary") or {},
     }
 
 

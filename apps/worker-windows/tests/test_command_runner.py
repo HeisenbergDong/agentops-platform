@@ -4,6 +4,7 @@ import subprocess
 import pytest
 
 from worker.runtime import command_runner
+from worker.runtime.command_runner import _copy_supervisor_decision
 from worker.runtime.command_runner import _current_turn_gate
 from worker.runtime.command_runner import CommandRunner
 from worker.project.git_submit import run_git_submit
@@ -435,6 +436,7 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     assert result["data"]["raw_text"] == "trace"
     assert result["data"]["timeout_seconds"] == 7.0
     assert result["data"]["current_turn_gate"]["passed"] is True
+    assert result["data"]["supervisor_decision"]["action"] == "collect_trace_candidate"
 
 
 def test_scan_project_uses_workspace_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -744,6 +746,17 @@ def test_current_turn_gate_recovers_unfinished_current_turn():
     assert gate["passed"] is False
     assert gate["recoverable"] is True
     assert gate["reason"] == "trae_turn_not_completed:running"
+
+
+def test_copy_supervisor_decision_recovers_gate_failure():
+    decision = _copy_supervisor_decision(
+        {"passed": False, "reason": "awaiting_current_continuation", "recoverable": True},
+        {"reason": "ok"},
+    )
+
+    assert decision["action"] == "continue_output"
+    assert decision["reason"] == "awaiting_current_continuation"
+    assert decision["recoverable"] is True
 
 
 def test_scroll_assistant_to_bottom_uses_scrollable_controls_without_hwnd():

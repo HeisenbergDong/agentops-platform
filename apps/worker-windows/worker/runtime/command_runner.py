@@ -214,6 +214,7 @@ class CommandRunner:
             sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
         result["current_turn_gate"] = _current_turn_gate(result.get("trae_turn"), result.get("trace_probe"))
+        result["supervisor_decision"] = _copy_supervisor_decision(result.get("current_turn_gate"), result.get("trace_probe"))
         return result
 
     def _click_continue(self, payload: dict[str, Any]) -> dict:
@@ -416,3 +417,54 @@ def _recoverable_turn_gate_reason(reason: str) -> bool:
     if reason in RECOVERABLE_TURN_GATE_REASONS:
         return True
     return reason.startswith("trae_turn_not_completed:")
+
+
+def _copy_supervisor_decision(current_turn_gate: object, trace_probe: object = None) -> dict:
+    gate = current_turn_gate if isinstance(current_turn_gate, dict) else {}
+    probe = trace_probe if isinstance(trace_probe, dict) else {}
+    probe_reason = str(probe.get("reason") or "")
+    gate_reason = str(gate.get("reason") or "")
+    if probe_reason == "service_interrupted":
+        return {
+            "action": "recover_service_interruption",
+            "reason": probe_reason,
+            "recoverable": True,
+            "source": "copy_latest_reply",
+            "current_turn_gate": gate,
+            "trace_probe": probe,
+        }
+    if probe_reason == "awaiting_continuation":
+        return {
+            "action": "continue_output",
+            "reason": probe_reason,
+            "recoverable": True,
+            "source": "copy_latest_reply",
+            "current_turn_gate": gate,
+            "trace_probe": probe,
+        }
+    if bool(gate.get("passed")):
+        return {
+            "action": "collect_trace_candidate",
+            "reason": "current_turn_gate_passed",
+            "recoverable": False,
+            "source": "copy_latest_reply",
+            "current_turn_gate": gate,
+            "trace_probe": probe,
+        }
+    if bool(gate.get("recoverable")):
+        return {
+            "action": "continue_output",
+            "reason": gate_reason or "current_turn_gate_recoverable",
+            "recoverable": True,
+            "source": "copy_latest_reply",
+            "current_turn_gate": gate,
+            "trace_probe": probe,
+        }
+    return {
+        "action": "fail",
+        "reason": gate_reason or "current_turn_gate_failed",
+        "recoverable": False,
+        "source": "copy_latest_reply",
+        "current_turn_gate": gate,
+        "trace_probe": probe,
+    }

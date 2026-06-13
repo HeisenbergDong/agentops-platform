@@ -53,3 +53,45 @@ def test_trae_ui_analyst_normalizes_ratio_from_center():
 
     assert result["targets"][0]["ratio"] == {"x": 0.3633, "y": 0.945}
     assert result["targets"][0]["confidence"] == 0.93
+    assert result["recommended_action"] == "need_more_context"
+    assert result["risk"] == "safe"
+
+
+def test_trae_ui_analyst_normalizes_decision_schema_from_target():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_continue",
+        "recommended_action": "click_continue_button",
+        "confidence": 0.88,
+        "risk": "safe",
+        "target": {
+            "action": "continue_button",
+            "label": "继续",
+            "ratio": {"x": 0.32, "y": 0.64},
+        },
+        "evidence": ["visible continue button"],
+    }
+    context = {"window": {"bounds": {"left": 100, "top": 50, "width": 1000, "height": 700}}}
+
+    result = trae_ui_analyst._normalize_analysis(data, context)
+
+    assert result["screen_state"] == "awaiting_continue"
+    assert result["recommended_action"] == "click_continue_button"
+    assert result["target"]["center"] == {"x": 420, "y": 498}
+    assert result["confidence"] == 0.88
+    assert result["evidence"] == ["visible continue button"]
+
+
+def test_trae_ui_analyst_blocks_unsafe_target():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_keep_changes",
+        "recommended_action": "click_keep_button",
+        "risk": "safe",
+        "target": {"action": "delete_button", "label": "Delete all changes", "center": {"x": 10, "y": 20}},
+    }
+    result = trae_ui_analyst._normalize_analysis(data, {"window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}})
+
+    assert result["risk"] == "blocked"
+    assert result["recommended_action"] == "do_not_click"
+    assert result["blocked_reason"] == "unsafe_target_label"

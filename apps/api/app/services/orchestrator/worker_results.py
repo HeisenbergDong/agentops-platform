@@ -1411,10 +1411,17 @@ def _wait_completion_supervisor_extra(extra: dict, data: dict) -> dict:
     if not isinstance(data, dict):
         return extra
     supervisor_decision = data.get("supervisor_decision")
+    watcher_observation = data.get("watcher_observation")
+    activity_summary = data.get("activity_summary")
+    merged = dict(extra)
+    if isinstance(watcher_observation, dict) and watcher_observation:
+        merged["watcher_observation"] = watcher_observation
+    if isinstance(activity_summary, dict) and activity_summary:
+        merged["activity_summary"] = activity_summary
     if not isinstance(supervisor_decision, dict) or not supervisor_decision:
-        return extra
+        return merged
     return {
-        **extra,
+        **merged,
         "supervisor_decision": supervisor_decision,
         "display_message": _wait_completion_supervisor_display_message(supervisor_decision),
     }
