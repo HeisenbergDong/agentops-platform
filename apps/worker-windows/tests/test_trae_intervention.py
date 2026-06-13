@@ -107,6 +107,37 @@ def test_click_continue_reports_typed_continue_when_no_button(monkeypatch: pytes
     assert result["intervention"]["mode"] == "continue-text"
 
 
+def test_click_continue_types_continue_for_service_interruption_reason(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+
+    class FakeWindow:
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(
+        "worker.trae.intervene.diagnose_ui",
+        lambda timeout_seconds, scroll_bottom: {
+            "state": "idle_or_running",
+            "suggested_intervention": {},
+            "output_probe": {"reason": "missing_tool_trace_markers"},
+        },
+    )
+    monkeypatch.setattr("worker.trae.intervene.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        "worker.trae.intervene.send_prompt",
+        lambda text, submit=True: calls.append((text, submit)) or {"input": {"method": "adbz_coordinate_primary"}},
+    )
+    monkeypatch.setattr("worker.trae.intervene.click_visual_intervention", lambda **kwargs: {"status": "not_clicked"})
+    monkeypatch.setattr("worker.trae.intervene.click_primary_fallback", lambda: {"status": "clicked", "mode": "primary-fallback"})
+
+    result = click_continue(recovery_reason="service_interrupted")
+
+    assert calls == [("\u7ee7\u7eed", True)]
+    assert result["action_taken"] == "typed_continue"
+    assert result["intervention"]["mode"] == "continue-text"
+
+
 def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass

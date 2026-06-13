@@ -1022,3 +1022,36 @@ npm.cmd run build
   - `click_continue` 启动时显示“尝试让 Trae CN 当前回复继续收口”，不再固定写“点击继续按钮”。
   - 如果没有真实按钮而是输入续写，应显示“没有确认到可点击的继续按钮，已向 Trae CN 输入‘继续’”。
   - `wait_completion/copy_latest_reply` 的可恢复失败不再以 warning 显示“失败或需要人工处理”；真正无法安全自动处理时仍会进入人工处理。
+
+## 2026-06-13 Trae 3003 模型请求失败输入继续修复记录（待部署）
+
+用户真实自测反馈：
+- Trae 画面出现红色错误条：`模型请求失败，请稍后重试。(3003)`。
+- Dashboard 进入续写恢复后，Worker 没有判断出应该向 Trae 输入“继续”，而是显示未识别明确按钮并尝试安全主操作位置，最后没有继续当前回合。
+- 用户要求参考 `D:\adbz`：服务中断/请求失败属于当前回合未收口，应该继续当前轮，不能当成普通按钮查找失败。
+
+定位结果：
+- `probe_trace()` 的服务中断 marker 覆盖了 `服务端异常/请求失败/请稍后重试`，但没有明确覆盖 `模型请求失败` 和 `(3003)`。
+- `click_continue()` 只依赖当前 UI 诊断结果；如果 UIA 没读到红色错误条文本，且没有明确按钮，会落到 `click_primary_fallback()`，不会根据调度传来的 `recovery_reason=service_interrupted` 强制输入“继续”。
+
+已完成代码改动：
+- `trace_copy.SERVICE_INTERRUPTION_MARKERS` 新增 `模型请求失败`、`(3003)`、`3003`，能把截图中的 3003 状态归类为 `service_interrupted`。
+- `CommandRunner._click_continue()` 把 payload 里的 `recovery_reason` 传给 `click_continue()`。
+- `click_continue()` 新增 `recovery_reason` 参数；当恢复原因是 `service_interrupted`、`awaiting_continuation`、`awaiting_current_continuation`、`no_completed_turn_after_prompt_send`、`trae_turn_not_completed:*`，且没有明确按钮时，直接走 `continue-text` 输入“继续”，不再先尝试视觉/fallback 主按钮。
+- 补充测试：
+  - `test_probe_trace_reports_model_request_3003_interruption`
+  - `test_click_continue_types_continue_for_service_interruption_reason`
+
+已验证：
+- Worker targeted：`45 passed`
+- Worker 全量：`88 passed, 2 warnings`
+- API 全量：`94 passed, 3 warnings`
+- Web build：通过，仅 Vite chunk size warning。
+- Worker 打包成功：`apps/worker-windows/dist/agentops-worker-windows.zip`。
+- Worker ZIP 大小：`27321651`。
+- Worker ZIP SHA256：`cd99d41069299f33a7de8a63f443709ffb3e4a945df4f88f2fa0453312368f21`。
+
+待完成：
+- commit/push GitHub。
+- 部署生产新版 Worker ZIP；本次主要是 Worker 行为修复，API 源码无变化。
+- 生产验证：API health、首页、`.deploy-revision`、Worker ZIP 大小/SHA256。

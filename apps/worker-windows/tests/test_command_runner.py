@@ -707,6 +707,15 @@ def test_probe_trace_reports_service_interruption():
     assert result["reason"] == "service_interrupted"
 
 
+def test_probe_trace_reports_model_request_3003_interruption():
+    trace = "toolName: edit\nstatus: success\n" + ("trace detail line\n" * 80) + "模型请求失败，请稍后重试。(3003)"
+
+    result = probe_trace(trace)
+
+    assert result["complete_like"] is False
+    assert result["reason"] == "service_interrupted"
+
+
 def test_detect_terminal_prompt_handles_npm_create_confirm():
     result = detect_terminal_prompt("Need to install the following packages: create-vite@latest\nOk to proceed? (y)")
 

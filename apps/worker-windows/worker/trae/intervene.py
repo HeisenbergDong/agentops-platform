@@ -48,6 +48,7 @@ UNSAFE_MARKERS = (
 
 def click_continue(
     timeout_seconds: float = 10.0,
+    recovery_reason: str = "",
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     focus_trae(timeout_seconds=timeout_seconds)
@@ -73,6 +74,16 @@ def click_continue(
             "action_taken": "clicked_button",
             "button_text": button_text,
             "diagnosis": _compact_diagnosis(diagnosis),
+        }
+
+    if _should_type_continue(recovery_reason, diagnosis):
+        result = apply_intervention({"mode": "continue-text", "text": "\u7ee7\u7eed"}, timeout_seconds=timeout_seconds)
+        return {
+            "status": "clicked" if result.get("status") == "applied" else result.get("status", "attempted"),
+            "action_taken": "typed_continue",
+            "intervention": result,
+            "diagnosis": _compact_diagnosis(diagnosis),
+            "recovery_reason": recovery_reason,
         }
 
     visual = click_visual_intervention(
@@ -136,6 +147,25 @@ def _action_taken_from_result(result: dict[str, Any]) -> str:
     if "visual-intervention" in mode:
         return "clicked_visual_target"
     return mode or "attempted"
+
+
+def _should_type_continue(recovery_reason: str, diagnosis: dict[str, Any]) -> bool:
+    reason = str(recovery_reason or "").strip()
+    if reason in {
+        "awaiting_continuation",
+        "awaiting_current_continuation",
+        "service_interrupted",
+        "no_completed_turn_after_prompt_send",
+    }:
+        return True
+    if reason.startswith("trae_turn_not_completed"):
+        return True
+    state = str(diagnosis.get("state") or "")
+    output_probe = diagnosis.get("output_probe") if isinstance(diagnosis, dict) else {}
+    output_reason = str(output_probe.get("reason") or "") if isinstance(output_probe, dict) else ""
+    if state in {"awaiting_continuation", "service_interrupted"}:
+        return True
+    return output_reason in {"awaiting_continuation", "service_interrupted"}
 
 
 def send_text_to_trae(text: str, submit: bool = True) -> dict:

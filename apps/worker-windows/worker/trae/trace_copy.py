@@ -21,6 +21,7 @@ CONTINUE_MARKERS = (
 )
 CONTINUE_BARE_MARKERS = ("\u7ee7\u7eed", "continue")
 SERVICE_INTERRUPTION_MARKERS = (
+    "\u6a21\u578b\u8bf7\u6c42\u5931\u8d25",
     "\u670d\u52a1\u7aef\u5f02\u5e38",
     "\u670d\u52a1\u5f02\u5e38",
     "\u7f51\u7edc\u5f02\u5e38",
@@ -30,6 +31,8 @@ SERVICE_INTERRUPTION_MARKERS = (
     "\u5df2\u4e2d\u65ad",
     "\u53d1\u751f\u9519\u8bef",
     "\u8bf7\u7a0d\u540e\u91cd\u8bd5",
+    "(3003)",
+    "3003",
     "ErrorResponse",
     "server error",
     "service error",

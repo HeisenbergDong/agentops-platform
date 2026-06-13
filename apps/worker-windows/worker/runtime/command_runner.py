@@ -219,6 +219,7 @@ class CommandRunner:
     def _click_continue(self, payload: dict[str, Any]) -> dict:
         return click_continue(
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            recovery_reason=str(payload.get("recovery_reason") or ""),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
         )
 
