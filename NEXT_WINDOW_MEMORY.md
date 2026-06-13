@@ -1004,9 +1004,8 @@ npm.cmd run build
 - 生产备份目录：`/opt/agentops-deploy-backups/20260613-145512-7943dd5`。
 - 已同步到生产：
   - API 源码：`events.py`、`worker_results.py`。
-  - Worker 源码：`main.py`、`intervene.py`。
   - Web dist：`index.html` 与 assets。
-  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+  - 新版 Worker ZIP：`/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`，该 ZIP 已包含 `worker/main.py` 和 `worker/trae/intervene.py` 的 `action_taken` 上报改动。
 - 生产 `.deploy-revision` 目标值：`7943dd536b4d18d0d4fa5895828d0c437d530077`。
 - 生产验证：
   - `systemctl is-active agentops-api` 返回 `active`。
