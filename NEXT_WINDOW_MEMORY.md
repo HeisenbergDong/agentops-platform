@@ -1477,3 +1477,45 @@ npm.cmd run build
 - 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
 - 生产验证已通过：`agentops-api` active，API health 正常，首页和 Web 静态资源返回 `200 OK`。
 - 当前核心行为：Worker 内已有 Trae Supervisor 调度分析角色，先写出 `supervisor_decision.action/reason`，再由 Worker 执行 UI 动作。
+## 2026-06-14 D-drive parity trace-copy fix deployed
+
+User direction:
+- Stop inventing around D:\adbz. First make MR.D/platform behave like D:\adbz, then optimize.
+- Root cause acknowledged: the platform treated D:\adbz as a reference and patched symptoms, instead of copying its main Trae loop semantics. Main gap in this round was trace collection after Trae finished.
+
+Implemented locally:
+- Worker `trace_copy.copy_latest_reply()` no longer accepts the first non-empty copy result. It now scans copy-button candidates, probes each candidate, immediately prefers complete raw tool trace, and only falls back to the best candidate when no complete trace is found.
+- API trace collection now retries `copy_latest_reply` first for copy/timing/scroll-like validation failures: `empty_trace`, `trace_too_short`, `missing_tool_trace_markers`, `partial_code_copy`, `final_summary_only`, `copy_command_failed`.
+- Default trace-copy retries: 5. Only after copy retries are exhausted does API fall back to continue recovery; only after recovery limits are exhausted does it mark `trace_missing_abort`.
+- Worker `copy_latest_reply` command is cancellation-aware via `CancellationToken.raise_if_cancelled`.
+- Runtime logs now show collecting_trace retry messages with copy attempt counters.
+
+Local verification already passed:
+- API targeted: 4 passed.
+- Worker targeted: 63 passed.
+- API full: 98 passed, 3 warnings.
+- Worker full: 106 passed, 2 warnings.
+- Web build passed with existing Vite chunk-size warning.
+- `git diff --check` passed.
+- Worker package built: `apps/worker-windows/dist/agentops-worker-windows.zip`
+  - size: `27337861`
+  - SHA256: `3D859251977DB138B144E160E850B25039C1B0C33B443C0CE3076143FA9F7245`
+
+Deployment:
+- Code commit: `d89b80c fix: retry Trae trace copy before recovery`
+- Full deployed revision: `d89b80c4f34265a6bdff0a313b641d5449f79b2f`
+- Pushed to `origin/main`.
+- Uploaded deploy bundle to prod: `/tmp/agentops-deploy-d89b80c/`.
+- Prod backup dir: `/opt/agentops-deploy-backups/20260614-021449-d89b80c`.
+- Synced API source, Worker source/tests/scripts, Web dist, and Worker ZIP to `/opt/agentops-platform`.
+- Restarted `agentops-api`; service is `active`.
+
+Prod verification:
+- `.deploy-revision`: `d89b80c4f34265a6bdff0a313b641d5449f79b2f`
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`
+- Homepage `http://115.190.113.8/`: `200 OK`
+- Web assets: `/assets/index-Cy1tcbtz.js` and `/assets/index-DFn3rpGU.css` both `200 OK`
+- Prod Worker ZIP size: `27337861`
+- Prod Worker ZIP SHA256: `3d859251977db138b144e160e850b25039c1b0c33b443c0ce3076143fa9f7245`
+- Prod Worker ZIP header: `PK`
