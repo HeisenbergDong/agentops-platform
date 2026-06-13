@@ -1117,12 +1117,12 @@ npm.cmd run build
 
 ## 2026-06-13 文件末尾最新状态
 
-- 最新已完成部署：`773bbb0 feat: add Trae completion supervisor`。
-- 生产 `.deploy-revision`：`773bbb08f21d7ab34df194e18a5cc8896e64c76b`。
-- 生产 Worker ZIP 大小：`27327928`。
-- 生产 Worker ZIP SHA256：`4e144fc8db8a0f113e2901c0c1a6cac40db8e0e393e0dc016fc0019598b5a3f0`。
+- 最新已完成部署：`e6622dc feat: add Trae watcher observation`。
+- 生产 `.deploy-revision`：`e6622dcd98d36113890085fac7f43de17e00a5af`。
+- 生产 Worker ZIP 大小：`27336132`。
+- 生产 Worker ZIP SHA256：`fd5d4d5170113f87db6d41fe9265a8a0f4d1b688f853dada20ba10895d60448c`。
 - 生产验证已通过：`agentops-api` active，API health 正常，首页和 Web 静态资源返回 `200 OK`。
-- 当前核心行为：Worker 内已有 Trae Supervisor 调度分析角色，先写出 `supervisor_decision.action/reason`，再由 Worker 执行 UI 动作。
+- 当前核心行为：Worker 已接入 Trae Watcher + Supervisor 三层观察；先看本地 turn/trace 和真实活动信号，recent activity 优先等待，completed 优先 collect_trace，3003/service_interrupted 优先输入“继续”，再由 Worker 执行安全 UI 动作。
 
 ## 2026-06-13 Trae Watcher + Supervisor 三层观察改造记录（待部署）
 
@@ -1175,6 +1175,34 @@ npm.cmd run build
 - commit/push GitHub。
 - 部署 API 源码、Web dist、Worker ZIP 到生产 `/opt/agentops-platform`，Web dist 使用 tar，不用 Windows zip。
 - 生产验证：`systemctl is-active agentops-api`、本机和公网 `/api/health`、首页和 assets 200、Worker ZIP size/SHA256、`.deploy-revision`。
+
+## 2026-06-13 Trae Watcher + Supervisor 三层观察改造部署完成记录
+
+- 代码提交：`e6622dc feat: add Trae watcher observation`，完整 commit 为 `e6622dcd98d36113890085fac7f43de17e00a5af`。
+- 已 push 到 GitHub `origin/main`。
+- 已部署到生产目录 `/opt/agentops-platform`：
+  - API 源码：同步 `apps/api/app`、`migrations`、`alembic.ini`、`pyproject.toml`，未覆盖生产 `apps/api/.venv`。
+  - Worker 源码：同步 `apps/worker-windows/worker`、`tests`、`scripts`、`pyproject.toml`、`README.md`。
+  - Web dist：使用 `web-dist.tar` 解包到 `/opt/agentops-platform/apps/web/dist`，未使用 Windows zip。
+  - Worker ZIP：上传到 `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`。
+- 上传目录：`/tmp/agentops-deploy-e6622dc/`。
+- 生产备份目录：`/opt/agentops-deploy-backups/20260614-002335-e6622dc/`。
+- 生产 `.deploy-revision`：`e6622dcd98d36113890085fac7f43de17e00a5af`。
+- 生产验证：
+  - `systemctl is-active agentops-api` 返回 `active`。
+  - `curl http://127.0.0.1:8000/api/health` 返回 `{"status":"ok","service":"agentops-api","database":true}`。
+  - `curl http://115.190.113.8/api/health` 返回同样健康结果。
+  - 首页 `http://115.190.113.8/` 返回 `200 OK`。
+  - Web assets `/assets/index-Cy1tcbtz.js` 和 `/assets/index-DFn3rpGU.css` 返回 `200 OK`。
+  - 生产 Worker ZIP size：`27336132`。
+  - 生产 Worker ZIP SHA256：`fd5d4d5170113f87db6d41fe9265a8a0f4d1b688f853dada20ba10895d60448c`。
+  - 生产 Worker ZIP 文件头：`PK`。
+
+后续真实作业验证重点：
+- 下载并运行生产最新版 Worker ZIP，关闭旧 `agentops-worker.exe`。
+- 首轮 Trae 慢但 agent log/project mtime 仍 recent 时，预期 `supervisor_decision.reason=recent_trae_activity`，不触发 UI 点击。
+- 3003/service_interrupted 仍应优先输入“继续”，不被 recent activity 或右侧保留/确认按钮抢走。
+- 当前 turn completed 时，即使 UI 仍有 `保留/变更已完成`，仍直接进入 copy trace。
 
 ## 2026-06-13 最新状态索引
 
