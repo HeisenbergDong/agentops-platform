@@ -1519,3 +1519,50 @@ Prod verification:
 - Prod Worker ZIP size: `27337861`
 - Prod Worker ZIP SHA256: `3d859251977db138b144e160e850b25039c1b0c33b443c0ce3076143fa9f7245`
 - Prod Worker ZIP header: `PK`
+## 2026-06-14 D-drive role parity deployed
+
+User direction:
+- Prompt writer and dissatisfaction writer must first match `D:\adbz` behavior before further optimization.
+- Keep platform wrappers such as multi-tenant users, configurable roles, server/local Worker interaction, and MR.D settings; do not invent new behavior that makes the base capability worse than `D:\adbz`.
+
+Implemented:
+- Prompt writer now uses a D-drive style `PROMPT_WRITER_SYSTEM` JSON contract: `prompt`, `prompt_kind`, `focus`, `acceptance_checks`, `difference_from_previous`.
+- Prompt writer payload now includes compact state/current/meta context, previous dissatisfaction, recent prompt history, directions, user rules, preferred stack, and D-drive hard rules.
+- Prompt fallback now uses D-drive style first-round direction tasks and domain followups for AgentOps, TMC/express, logistics, warehouse, monitor, and generic systems.
+- Followup fallback now detects fixable previous dissatisfaction and generates bugfix-style prompts with concrete fix targets instead of generic continuation.
+- Prompt quality gate now rejects prompt reuse of previous dissatisfaction phrases and keeps D-drive first-round/demo/template checks.
+- AgentOps prompts may contain business capabilities like Worker, GitHub, Feishu, and trace copy; only internal/meta evidence wording remains blocked.
+- Dissatisfaction writer now has a real reviewer role path: rule result first, optional `dissatisfaction_writer` LLM reviewer second, then strong D-drive validation/fallback.
+- Reviewer JSON contract: `task_done`, `satisfaction`, `product_reason`, `process_reason`, `evidence_refs`, `confidence`.
+- Dissatisfaction validation now enforces product/process sections, `task_done=未完成任务`, no unsupported click claims without browser evidence, previous-reason de-duplication, and cross-domain rejection.
+- Domain acceptance wording now includes D-drive AgentOps/TMC/logistics/warehouse/monitor acceptance and boundary examples.
+- Worker result dissatisfaction logging now passes user role config and previous dissatisfaction reason to the reviewer path.
+
+Verification:
+- API full: `102 passed, 3 warnings`.
+- Worker full: `106 passed, 2 warnings`.
+- Web build passed with existing Vite chunk-size warning.
+- `py_compile` for changed API modules passed.
+- `git diff --check` passed.
+- Worker ZIP rebuilt:
+  - size: `27336258`
+  - SHA256: `B9541DBA3AC5B7B955E61410B64DAB0C405D74AD7C942E1F346836191C821A98`
+
+Deployment:
+- Code commit: `edcb8da fix: align prompt and dissatisfaction roles with D drive`
+- Full deployed revision: `edcb8da18cb7e50d126b81e2c4fa29ffe5473739`
+- Pushed to `origin/main`.
+- Uploaded deploy bundle to prod: `/tmp/agentops-deploy-edcb8da/`.
+- Prod backup dir: `/opt/agentops-deploy-backups/20260614-030157-edcb8da`.
+- Synced API source, Worker source/tests/scripts, Web dist, and Worker ZIP to `/opt/agentops-platform`.
+- Restarted `agentops-api`; service is `active`.
+
+Prod verification:
+- `.deploy-revision`: `edcb8da18cb7e50d126b81e2c4fa29ffe5473739`
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`
+- Homepage `http://115.190.113.8/`: `200 OK`
+- Web assets: `/assets/index-Cy1tcbtz.js` and `/assets/index-DFn3rpGU.css` both `200 OK`
+- Prod Worker ZIP size: `27336258`
+- Prod Worker ZIP SHA256: `b9541dba3ac5b7b955e61410b64dab0c405d74ad7c942e1f346836191c821a98`
+- Prod Worker ZIP header: `PK`
