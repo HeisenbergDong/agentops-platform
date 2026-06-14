@@ -1630,3 +1630,49 @@ Important working-tree note:
 - Before this turn there were already unrelated unstaged changes in API and Worker project/dev-env files.
 - Do not stage/deploy those unrelated changes for this fix unless the user explicitly asks.
 - For packaging/deploy, prefer a clean worktree from the fix commit so the Worker ZIP only contains this Trae foreground/send fix.
+
+## 2026-06-14 Trae foreground and prompt send fix deployed
+
+This record completes the in-progress record above.
+
+- Code commit: `185d8dc fix: stabilize Trae foreground prompt sending`, full commit `185d8dc2cb61a2791cfb558dd18d7e9677ced34e`.
+- Pushed to GitHub `origin/main`.
+- Because the original local worktree had unrelated unstaged changes, final tests/package/commit/deploy were done from clean worktree:
+  - `D:\code-space\auto-tool\agentops-platform-trae-fix`
+- Worker ZIP built from that clean worktree:
+  - Size: `22425609`
+  - SHA256: `02cd0763d0feb8cb175b027aefc122b4203ed55628b86952beb0dd1ad522f1e1`
+  - Header: `PK`
+- Deployment artifacts uploaded to production:
+  - `/tmp/agentops-deploy-185d8dc/agentops-source-185d8dc.tar`
+  - `/tmp/agentops-deploy-185d8dc/agentops-worker-windows.zip`
+- Production backup dir:
+  - `/opt/agentops-deploy-backups/20260614-144037-185d8dc`
+- Synced to production:
+  - `apps/worker-windows/worker/trae/window.py`
+  - `apps/worker-windows/worker/trae/prompt.py`
+  - `apps/worker-windows/worker/runtime/command_runner.py`
+  - Worker tests touched by this fix.
+  - `storage/worker-packages/agentops-worker-windows.zip`
+  - `NEXT_WINDOW_MEMORY.md`
+- Production `.deploy-revision`: `185d8dc2cb61a2791cfb558dd18d7e9677ced34e`.
+- Restarted `agentops-api`; `systemctl is-active agentops-api` returned `active`.
+
+Production verification:
+- Local health: `{"status":"ok","service":"agentops-api","database":true}`
+- Public health: `{"status":"ok","service":"agentops-api","database":true}`
+- Homepage `http://115.190.113.8/`: `200`
+- Production source contains:
+  - `wait_for_workspace_window_or_any`
+  - `AppActivate(int(pid))`
+  - `strict_submission_verification`
+- Production Worker ZIP:
+  - Size: `22425609`
+  - SHA256: `02cd0763d0feb8cb175b027aefc122b4203ed55628b86952beb0dd1ad522f1e1`
+  - Header: `PK`
+
+Next real-test requirement:
+- User must download/run the new Worker ZIP and close old `agentops-worker.exe` instances first.
+- Expected behavior: on `send_prompt`, Trae should be maximized and foregrounded using AppActivate + foreground verification, then Worker should click the left-bottom SOLO input and send.
+- If local turn probe is late, `send_prompt` should not immediately manual-required; later `wait_completion` / trace gates decide whether the run actually completed.
+- If it still fails, inspect recent worker command result data for `open_trae.window_diagnostics`, `current_window`, `input`, `submit`, and `submission.status`.
