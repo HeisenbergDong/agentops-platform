@@ -1746,8 +1746,11 @@ Build/deploy:
 - Stopped old local Worker PIDs:
   - `13600`
   - `16104`
-- Started new local Worker; if it spawned two local processes, killed the extra one and kept one:
-  - kept PID `15812`
+- Started new local Worker.
+- Important correction: PyInstaller onefile shows two `agentops-worker.exe` processes (parent/bootstrap + child runtime). Do not kill one of the pair as a duplicate; doing so can stop Worker.
+- After correcting that, restarted local Worker again:
+  - visible PIDs: `12520` and `11640`
+  - server heartbeat refreshed at `2026-06-14 08:17:15 UTC`
 - Production DB now sees:
   - worker `local-windows-worker`
   - status `online`
