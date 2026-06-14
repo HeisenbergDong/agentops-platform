@@ -59,7 +59,7 @@ def test_send_prompt_clicks_solo_input_area_before_paste(monkeypatch):
     clicks: list[tuple[int, int]] = []
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: clipboard.append(text))
@@ -85,7 +85,7 @@ def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
     keys: list[str] = []
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
@@ -115,6 +115,67 @@ def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
     assert result["submission"]["probe"]["status"] == "found"
 
 
+def test_send_prompt_falls_back_when_workspace_title_is_missing(monkeypatch):
+    fake_window = FakeWindow([])
+    focus_calls: list[bool] = []
+
+    def fake_focus(**kwargs):
+        focus_calls.append(bool(kwargs.get("require_workspace_match")))
+        if kwargs.get("require_workspace_match"):
+            raise prompt_module.TraeAutomationError("workspace title not found")
+        return {
+            "status": "focused",
+            "window_title": "Trae CN",
+            "workspace_match": False,
+        }
+
+    monkeypatch.setattr(prompt_module, "focus_trae", fake_focus)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+
+    result = prompt_module.send_prompt("build it", workspace_path="D:/work/project", submit=False)
+
+    assert focus_calls == [True, False]
+    assert result["window_title"] == "Trae CN"
+    assert result["workspace_match"] is False
+
+
+def test_send_prompt_can_continue_when_submission_probe_is_unconfirmed(monkeypatch):
+    fake_window = FakeWindow([])
+
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        prompt_module,
+        "_verify_prompt_submission",
+        lambda **kwargs: (_ for _ in ()).throw(
+            prompt_module.PromptSendError(
+                "Prompt was pasted/submitted, but no new Trae user turn was detected.",
+                {"submission_probe": {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}},
+            )
+        ),
+    )
+
+    result = prompt_module.send_prompt(
+        "build it",
+        verify_submission=True,
+        strict_submission_verification=False,
+    )
+
+    assert result["status"] == "sent"
+    assert result["submission"]["status"] == "unconfirmed"
+    assert result["automation"]["submission_verified"] is False
+
+
 def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch, tmp_path):
     fake_window = FakeWindow([])
     clicks: list[tuple[int, int]] = []
@@ -124,7 +185,7 @@ def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch
 
     monkeypatch.setattr(prompt_module.ui_cache, "default_cache_path", lambda: tmp_path / "cache.json")
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
@@ -175,6 +236,7 @@ def test_send_prompt_uses_ai_vision_after_default_verification_fails(monkeypatch
     result = prompt_module.send_prompt(
         "build it",
         verify_submission=True,
+        strict_submission_verification=True,
         submission_timeout_seconds=0.5,
         ui_analyst=fake_ai,
     )
@@ -208,7 +270,7 @@ def test_send_prompt_does_not_click_send_button_when_submit_false(monkeypatch):
     clicks: list[tuple[int, int]] = []
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
@@ -226,7 +288,7 @@ def test_send_prompt_fails_when_submission_probe_never_sees_turn(monkeypatch):
     fake_window = FakeWindow([])
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
@@ -260,7 +322,7 @@ def test_send_prompt_uses_uia_candidate_when_window_bounds_missing(monkeypatch):
     keys: list[str] = []
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: None)
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
     monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: keys.append(keys_))
@@ -293,7 +355,7 @@ def test_send_prompt_falls_back_to_legacy_coordinate_without_uia(monkeypatch):
     keys: list[str] = []
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
-    monkeypatch.setattr(prompt_module, "find_trae_window", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
     monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: None)
     monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
     monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)

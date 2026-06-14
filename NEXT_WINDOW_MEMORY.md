@@ -1566,3 +1566,67 @@ Prod verification:
 - Prod Worker ZIP size: `27336258`
 - Prod Worker ZIP SHA256: `b9541dba3ac5b7b955e61410b64dab0c405d74ad7c942e1f346836191c821a98`
 - Prod Worker ZIP header: `PK`
+
+## 2026-06-14 Trae foreground and prompt send fix record (in progress)
+
+User real-test feedback:
+- In this round, Worker did not successfully write the prompt into Trae.
+- Trae was not brought to the foreground/top of the desktop.
+- Dashboard stopped at `send_prompt`: `Worker could not send the prompt automatically; manual intervention is required.`
+
+Root cause found:
+- Current platform Worker had drifted from `D:\adbz\trae_prompt_input.py`.
+- `D:\adbz` foreground activation uses `WScript.Shell.AppActivate(pid)`, Alt unlock, `SetForegroundWindow`, and verifies foreground pid.
+- Platform Worker only used Win32 foreground calls and did not use `AppActivate(pid)`, so Windows could leave the browser/Dashboard in front.
+- Platform `send_prompt()` also required a workspace-title match when finding Trae. Trae CN often does not expose the project slug in the top-level title during startup/reuse-window, so Worker could fail before writing.
+- Platform treated "prompt pasted/clicked send but local Trae turn probe not visible within timeout" as a hard `send_prompt` failure. That is stricter than `D:\adbz`; the later wait/trace gates should confirm real completion and keep the no-trace-no-submit rule.
+
+Implemented locally so far:
+- `apps/worker-windows/worker/trae/window.py`
+  - Added D-drive style `WScript.Shell.AppActivate(pid)` into the maximize/focus loop.
+  - Foreground verification still checks foreground hwnd/pid after each attempt.
+  - Top-level Trae discovery now also considers process image path, not only window title.
+  - Window selection now prefers workspace title, then current foreground Trae window, then largest Trae window.
+  - Added `wait_for_workspace_window_or_any()`: prefer exact workspace match but fall back to active Trae if Trae title omits the workspace marker.
+  - `ensure_trae_running()` uses this fallback after opening/reusing workspace.
+- `apps/worker-windows/worker/trae/prompt.py`
+  - `send_prompt()` now falls back from strict workspace-title focus to normal Trae focus.
+  - Replaced strict second `find_trae_window(... require_workspace_match=True)` with workspace-preferred fallback.
+  - Added `strict_submission_verification`; if false, failed local turn probe becomes `submission.status=unconfirmed` instead of failing the command after the prompt/send actions were performed.
+  - Keeps strict verification available for tests/manual use.
+- `apps/worker-windows/worker/runtime/command_runner.py`
+  - Normal server-driven `send_prompt` now defaults `strict_submission_verification=false`, so Worker proceeds to `wait_completion` after performing prompt/send actions even when the local turn probe is late.
+- Tests added/updated:
+  - Workspace-title-missing prompt focus fallback.
+  - Unconfirmed submission probe can continue.
+  - Foreground focus uses `AppActivate(pid)`.
+  - Workspace window wait falls back to any Trae window.
+
+Verification so far:
+- Worker targeted:
+  - `apps/worker-windows` `.\.venv\Scripts\python -m pytest tests/test_prompt_input.py tests/test_command_runner.py -q`
+  - Result: `48 passed`.
+- Worker full suite in clean worktree, split to avoid tool timeout:
+  - Group 1 `test_prompt_input.py test_command_runner.py`: `48 passed`.
+  - Group 2 `test_project_detection.py test_path_guard.py test_registration.py`: `14 passed`.
+  - Group 3 `test_screenshot.py test_session_probe.py test_trae_intervention.py`: `25 passed, 2 warnings` (existing Pillow deprecation warnings).
+  - Group 4 `test_trae_supervisor.py test_trae_watcher.py test_windows_service.py test_worker_main.py test_worker_supervisor.py`: `22 passed`.
+  - Total: `109 passed, 2 warnings`.
+- API related targeted:
+  - `apps/api` `python -m pytest tests/test_worker_results.py -q`
+  - Result: `46 passed`.
+- `git diff --check`: passed.
+- `py_compile` for changed Worker modules: passed.
+- Worker ZIP built from clean worktree:
+  - ZIP: `D:\code-space\auto-tool\agentops-platform-trae-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP size: `22425609`
+  - ZIP SHA256: `02cd0763d0feb8cb175b027aefc122b4203ed55628b86952beb0dd1ad522f1e1`
+  - ZIP header: `PK`.
+
+Known unrelated verification note:
+- `apps/api` targeted command including `tests/test_preflight.py` had one pre-existing prompt fallback text assertion failure on clean HEAD; `tests/test_worker_results.py` passed and this fix did not modify API/prompt fallback code.
+
+Important working-tree note:
+- Before this turn there were already unrelated unstaged changes in API and Worker project/dev-env files.
+- Do not stage/deploy those unrelated changes for this fix unless the user explicitly asks.
+- For packaging/deploy, prefer a clean worktree from the fix commit so the Worker ZIP only contains this Trae foreground/send fix.

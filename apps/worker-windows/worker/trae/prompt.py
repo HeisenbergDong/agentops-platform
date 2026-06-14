@@ -8,7 +8,7 @@ from worker.trae import ui_cache
 from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.ui_locator import locate_prompt_targets, target_for_action, validate_target
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
+from worker.trae.window import TraeAutomationError, focus_trae, wait_for_workspace_window_or_any
 
 PROMPT_INPUT_X_RATIO = 0.26
 PROMPT_INPUT_Y_RATIO = 0.88
@@ -49,6 +49,7 @@ def send_prompt(
     submit_hotkey: str = "{ENTER}",
     workspace_path: str | Path | None = None,
     verify_submission: bool = False,
+    strict_submission_verification: bool = True,
     sent_at_epoch: float | None = None,
     submission_timeout_seconds: float = 15.0,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
@@ -58,17 +59,20 @@ def send_prompt(
         raise PromptSendError("Prompt is empty")
 
     try:
-        focus_result = focus_trae(
-            workspace_path=workspace_path,
-            require_workspace_match=bool(workspace_path),
-        )
-        window = find_trae_window(
+        focus_result = _focus_trae_for_prompt(workspace_path)
+        window = wait_for_workspace_window_or_any(
             timeout_seconds=3.0,
             workspace_path=workspace_path,
-            require_workspace_match=bool(workspace_path),
+            prefer_workspace_match=bool(workspace_path),
         )
     except TraeAutomationError as exc:
-        raise PromptSendError(str(exc)) from exc
+        raise PromptSendError(
+            str(exc),
+            {
+                "stage": "focus_trae_failed",
+                "workspace_path": str(workspace_path or ""),
+            },
+        ) from exc
 
     try:
         set_clipboard_text(prompt)
@@ -85,12 +89,17 @@ def send_prompt(
             _send_keys(submit_hotkey)
         submission = {}
         if submit and verify_submission:
-            submission = _verify_prompt_submission(
-                prompt=prompt,
-                workspace_path=workspace_path,
-                sent_at_epoch=sent_at_epoch,
-                timeout_seconds=submission_timeout_seconds,
-            )
+            try:
+                submission = _verify_prompt_submission(
+                    prompt=prompt,
+                    workspace_path=workspace_path,
+                    sent_at_epoch=sent_at_epoch,
+                    timeout_seconds=submission_timeout_seconds,
+                )
+            except PromptSendError as exc:
+                if strict_submission_verification:
+                    raise
+                submission = _unconfirmed_submission(exc)
         return {
             "status": "sent",
             "chars": len(prompt),
@@ -112,6 +121,7 @@ def send_prompt(
         workspace_path=workspace_path,
         sent_at_epoch=sent_at_epoch,
         submission_timeout_seconds=submission_timeout_seconds,
+        strict_submission_verification=strict_submission_verification,
         window_rect=window_rect,
         window_title=str(focus_result.get("window_title") or ""),
         ui_analyst=ui_analyst,
@@ -129,6 +139,26 @@ def send_prompt(
         "submission": attempt_result.get("submission", {}),
         "automation": attempt_result.get("automation", {}),
     }
+
+
+def _focus_trae_for_prompt(workspace_path: str | Path | None) -> dict:
+    try:
+        return focus_trae(
+            workspace_path=workspace_path,
+            require_workspace_match=bool(workspace_path),
+        )
+    except TraeAutomationError as exc:
+        if not workspace_path:
+            raise
+        fallback = focus_trae(
+            workspace_path=workspace_path,
+            require_workspace_match=False,
+        )
+        fallback["workspace_focus_fallback"] = {
+            "requested_workspace_path": str(workspace_path),
+            "reason": str(exc),
+        }
+        return fallback
 
 
 def _verify_prompt_submission(
@@ -156,7 +186,8 @@ def _verify_prompt_submission(
     compact = _compact_submission_probe(last_probe)
     raise PromptSendError(
         "Prompt was pasted/submitted, but no new Trae user turn was detected. "
-        f"submission_probe={compact}"
+        f"submission_probe={compact}",
+        {"submission_probe": compact},
     )
 
 
@@ -200,6 +231,7 @@ def _send_prompt_with_adaptive_targets(
     workspace_path: str | Path | None,
     sent_at_epoch: float | None,
     submission_timeout_seconds: float,
+    strict_submission_verification: bool,
     window_rect: tuple[int, int, int, int],
     window_title: str,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
@@ -215,6 +247,7 @@ def _send_prompt_with_adaptive_targets(
             workspace_path=workspace_path,
             sent_at_epoch=sent_at_epoch,
             submission_timeout_seconds=submission_timeout_seconds,
+            strict_submission_verification=strict_submission_verification,
             window_rect=window_rect,
             workspace_marker=workspace_marker,
         )
@@ -236,6 +269,7 @@ def _send_prompt_with_adaptive_targets(
             workspace_path=workspace_path,
             sent_at_epoch=sent_at_epoch,
             submission_timeout_seconds=submission_timeout_seconds,
+            strict_submission_verification=strict_submission_verification,
             window_rect=analysis_window_rect,
             workspace_marker=workspace_marker,
             source="local_vision",
@@ -272,6 +306,7 @@ def _send_prompt_with_adaptive_targets(
                 workspace_path=workspace_path,
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=submission_timeout_seconds,
+                strict_submission_verification=strict_submission_verification,
                 window_rect=analysis_window_rect,
                 workspace_marker=workspace_marker,
                 source="ai_vision",
@@ -337,6 +372,7 @@ def _try_analysis_targets(
     workspace_path: str | Path | None,
     sent_at_epoch: float | None,
     submission_timeout_seconds: float,
+    strict_submission_verification: bool,
     window_rect: tuple[int, int, int, int],
     workspace_marker: str,
     source: str,
@@ -351,6 +387,7 @@ def _try_analysis_targets(
         workspace_path=workspace_path,
         sent_at_epoch=sent_at_epoch,
         submission_timeout_seconds=submission_timeout_seconds,
+        strict_submission_verification=strict_submission_verification,
         window_rect=window_rect,
         workspace_marker=workspace_marker,
     )
@@ -365,6 +402,7 @@ def _try_candidate_set(
     workspace_path: str | Path | None,
     sent_at_epoch: float | None,
     submission_timeout_seconds: float,
+    strict_submission_verification: bool,
     window_rect: tuple[int, int, int, int],
     workspace_marker: str,
 ) -> dict[str, Any]:
@@ -386,6 +424,7 @@ def _try_candidate_set(
     submit_result = {}
     if submit:
         submit_result = _click_target(send_target, method=_operation_method(source, "send_button"))
+    verified = not (submit and verify_submission)
     try:
         submission = {}
         if submit and verify_submission:
@@ -395,31 +434,35 @@ def _try_candidate_set(
                 sent_at_epoch=sent_at_epoch,
                 timeout_seconds=submission_timeout_seconds,
             )
+            verified = True
     except PromptSendError as exc:
-        if source.startswith("cache"):
+        if strict_submission_verification and source.startswith("cache"):
             ui_cache.record_failure("prompt_input", input_target, reason=str(exc))
             if send_target:
                 ui_cache.record_failure("send_button", send_target, reason=str(exc))
-        return {
-            "status": "failed",
-            "source": source,
-            "reason": "verification_failed",
-            "error": str(exc),
-            "details": exc.details,
-            "input": input_result,
-            "submit": submit_result,
-        }
-    ui_cache.record_success(
-        "prompt_input",
-        input_target["center"],
-        window_rect,
-        source=source,
-        method=str(input_target.get("method") or source),
-        confidence=float(input_target.get("confidence") or 0.8),
-        label=str(input_target.get("label") or ""),
-        workspace_marker=workspace_marker,
-    )
-    if submit and send_target:
+        if strict_submission_verification:
+            return {
+                "status": "failed",
+                "source": source,
+                "reason": "verification_failed",
+                "error": str(exc),
+                "details": exc.details,
+                "input": input_result,
+                "submit": submit_result,
+            }
+        submission = _unconfirmed_submission(exc)
+    if verified:
+        ui_cache.record_success(
+            "prompt_input",
+            input_target["center"],
+            window_rect,
+            source=source,
+            method=str(input_target.get("method") or source),
+            confidence=float(input_target.get("confidence") or 0.8),
+            label=str(input_target.get("label") or ""),
+            workspace_marker=workspace_marker,
+        )
+    if verified and submit and send_target:
         ui_cache.record_success(
             "send_button",
             send_target["center"],
@@ -435,7 +478,18 @@ def _try_candidate_set(
         "input": input_result,
         "submit": submit_result,
         "submission": submission,
-        "automation": {"strategy": source},
+        "automation": {
+            "strategy": source,
+            "submission_verified": verified,
+        },
+    }
+
+
+def _unconfirmed_submission(error: PromptSendError) -> dict[str, Any]:
+    return {
+        "status": "unconfirmed",
+        "error": str(error),
+        "details": error.details,
     }
 
 

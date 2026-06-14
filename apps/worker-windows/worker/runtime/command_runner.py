@@ -162,6 +162,7 @@ class CommandRunner:
                 submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
                 workspace_path=prompt_workspace_path,
                 verify_submission=bool(payload.get("verify_submission", True)),
+                strict_submission_verification=bool(payload.get("strict_submission_verification", False)),
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
                 ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,

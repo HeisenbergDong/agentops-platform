@@ -18,6 +18,7 @@ SW_MAXIMIZE = 3
 SW_RESTORE = 9
 VK_MENU = 0x12
 KEYEVENTF_KEYUP = 0x0002
+PROCESS_QUERY_LIMITED_INFORMATION = 0x1000
 TREE_SCOPE_DESCENDANTS = 4
 UIA_CONTROL_TYPE_PROPERTY_ID = 30003
 UIA_INVOKE_PATTERN_ID = 10000
@@ -180,10 +181,10 @@ def ensure_trae_running(
     launch_result = open_trae(trae_exe_path, workspace_path, reuse_window=reuse_window)
     if existing_any:
         time.sleep(2.0)
-    window = wait_for_stable_trae_window(
+    window = wait_for_workspace_window_or_any(
         timeout_seconds=launch_timeout_seconds,
         workspace_path=workspace_path,
-        require_workspace_match=bool(workspace_path),
+        prefer_workspace_match=bool(workspace_path),
     )
     title = _focus_window(window)
     return {
@@ -254,6 +255,35 @@ def wait_for_stable_trae_window(
         timeout_seconds=0.5,
         workspace_path=workspace_path,
         require_workspace_match=require_workspace_match,
+    )
+
+
+def wait_for_workspace_window_or_any(
+    timeout_seconds: float = 10.0,
+    workspace_path: Path | str | None = None,
+    prefer_workspace_match: bool = True,
+) -> TraeWindow:
+    """Prefer a workspace-title match, but fall back to the active Trae window.
+
+    Trae CN does not consistently expose the project/workspace name in the top
+    level title during startup or reuse-window launches. The old D:\\adbz path
+    treated the launched Trae process as the target and verified progress later
+    through local turn probes; this keeps that behavior while still preferring a
+    precise title match when it is available.
+    """
+    if prefer_workspace_match and workspace_path:
+        try:
+            return wait_for_stable_trae_window(
+                timeout_seconds=min(max(1.0, timeout_seconds * 0.35), 8.0),
+                workspace_path=workspace_path,
+                require_workspace_match=True,
+            )
+        except TraeAutomationError:
+            pass
+    return wait_for_stable_trae_window(
+        timeout_seconds=max(1.0, timeout_seconds),
+        workspace_path=workspace_path,
+        require_workspace_match=False,
     )
 
 
@@ -334,6 +364,16 @@ def _select_top_level_window(
                 return hwnd
         if require_workspace_match:
             return 0
+    foreground_hwnd = _foreground_window()
+    for hwnd, _title in windows:
+        if foreground_hwnd and hwnd == foreground_hwnd:
+            return hwnd
+    if windows:
+        return sorted(
+            windows,
+            key=lambda item: _window_area(item[0]),
+            reverse=True,
+        )[0][0]
     return windows[0][0] if windows else 0
 
 
@@ -379,7 +419,10 @@ def _find_top_level_windows(title_marker: str) -> list[tuple[int, str]]:
         if not user32.IsWindowVisible(hwnd):
             return True
         title = _window_title(hwnd)
-        if title_marker.lower() in title.lower():
+        pid = _window_process_id(int(hwnd))
+        image_path = _process_image_path(pid)
+        haystack = f"{title}\n{image_path}".lower()
+        if title_marker.lower() in haystack:
             found.append((int(hwnd), title))
         return True
 
@@ -427,6 +470,14 @@ def _window_rect(hwnd: int) -> tuple[int, int, int, int] | None:
     except Exception:
         return None
     return int(rect.left), int(rect.top), int(rect.right), int(rect.bottom)
+
+
+def _window_area(hwnd: int) -> int:
+    rect = _window_rect(hwnd)
+    if not rect:
+        return 0
+    left, top, right, bottom = rect
+    return max(0, right - left) * max(0, bottom - top)
 
 
 def _rect_dict(rect: tuple[int, int, int, int] | None) -> dict[str, int]:
@@ -478,6 +529,9 @@ def _maximize_and_focus_window(hwnd: int, attempts: int = 5) -> dict:
     for _attempt in range(max(1, attempts)):
         _show_window(hwnd, SW_MAXIMIZE)
         time.sleep(0.25)
+        if window_pid:
+            _app_activate_pid(window_pid)
+            time.sleep(0.15)
         _tap_alt_for_foreground_unlock()
         _set_foreground_window(hwnd, show_window=None)
         time.sleep(0.35)
@@ -529,6 +583,41 @@ def _window_process_id(hwnd: int) -> int:
     return int(pid.value)
 
 
+def _process_image_path(pid: int) -> str:
+    if not pid:
+        return ""
+    kernel32 = ctypes.windll.kernel32
+    handle = None
+    try:
+        kernel32.OpenProcess.argtypes = [ctypes.c_ulong, ctypes.c_bool, ctypes.c_ulong]
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        kernel32.QueryFullProcessImageNameW.argtypes = [
+            ctypes.c_void_p,
+            ctypes.c_ulong,
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_ulong),
+        ]
+        kernel32.QueryFullProcessImageNameW.restype = ctypes.c_bool
+        kernel32.CloseHandle.argtypes = [ctypes.c_void_p]
+        kernel32.CloseHandle.restype = ctypes.c_bool
+        handle = kernel32.OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, False, int(pid))
+        if not handle:
+            return ""
+        size = ctypes.c_ulong(4096)
+        buffer = ctypes.create_unicode_buffer(size.value)
+        if kernel32.QueryFullProcessImageNameW(handle, 0, buffer, ctypes.byref(size)):
+            return buffer.value
+    except Exception:
+        return ""
+    finally:
+        if handle:
+            try:
+                kernel32.CloseHandle(handle)
+            except Exception:
+                pass
+    return ""
+
+
 def _foreground_window() -> int:
     try:
         return int(ctypes.windll.user32.GetForegroundWindow() or 0)
@@ -565,6 +654,18 @@ def _set_foreground_window(hwnd: int, show_window: int | None = SW_RESTORE) -> N
             user32.AttachThreadInput(current_thread, target_thread, False)
         if foreground_thread:
             user32.AttachThreadInput(current_thread, foreground_thread, False)
+
+
+def _app_activate_pid(pid: int) -> bool:
+    if not pid:
+        return False
+    try:
+        import comtypes.client
+
+        shell = comtypes.client.CreateObject("WScript.Shell")
+        return bool(shell.AppActivate(int(pid)))
+    except Exception:
+        return False
 
 
 def _mouse_click(x: int, y: int) -> None:

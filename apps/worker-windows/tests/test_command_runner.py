@@ -49,6 +49,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
             "submitted": submit,
             "submit_hotkey": submit_hotkey,
             "verify_submission": kwargs.get("verify_submission"),
+            "strict_submission_verification": kwargs.get("strict_submission_verification"),
             "workspace_path": str(kwargs.get("workspace_path") or ""),
         },
     )
@@ -69,6 +70,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["data"]["status"] == "sent"
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
     assert result["data"]["verify_submission"] is True
+    assert result["data"]["strict_submission_verification"] is False
     assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
@@ -100,6 +102,7 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
             "submitted": submit,
             "submit_hotkey": submit_hotkey,
             "verify_submission": kwargs.get("verify_submission"),
+            "strict_submission_verification": kwargs.get("strict_submission_verification"),
             "workspace_path": str(kwargs.get("workspace_path") or ""),
         },
     )
@@ -228,6 +231,7 @@ def test_focus_window_maximizes_and_verifies_foreground(monkeypatch: pytest.Monk
     monkeypatch.setattr(trae_window, "_window_title", lambda hwnd: "target-project - Trae CN")
     monkeypatch.setattr(trae_window, "_set_process_dpi_aware", lambda: calls.append(("dpi", 0, None)))
     monkeypatch.setattr(trae_window, "_show_window", lambda hwnd, command: calls.append(("show", hwnd, command)))
+    monkeypatch.setattr(trae_window, "_app_activate_pid", lambda pid: calls.append(("appactivate", pid, None)) or True)
     monkeypatch.setattr(trae_window, "_tap_alt_for_foreground_unlock", lambda: calls.append(("alt", 0, None)))
     monkeypatch.setattr(trae_window, "_set_foreground_window", lambda hwnd, show_window=None: calls.append(("foreground", hwnd, show_window)))
     monkeypatch.setattr(trae_window, "_window_process_id", lambda hwnd: 4242)
@@ -239,7 +243,29 @@ def test_focus_window_maximizes_and_verifies_foreground(monkeypatch: pytest.Monk
 
     assert title == "target-project - Trae CN"
     assert ("show", 777, trae_window.SW_MAXIMIZE) in calls
+    assert ("appactivate", 4242, None) in calls
     assert ("foreground", 777, None) in calls
+
+
+def test_wait_for_workspace_window_or_any_falls_back_when_title_missing(monkeypatch: pytest.MonkeyPatch):
+    calls = []
+
+    def fake_wait(timeout_seconds, workspace_path=None, require_workspace_match=False, **_kwargs):
+        calls.append(require_workspace_match)
+        if require_workspace_match:
+            raise TraeAutomationError("workspace window missing")
+        return trae_window.TraeWindow(303)
+
+    monkeypatch.setattr(trae_window, "wait_for_stable_trae_window", fake_wait)
+
+    window = trae_window.wait_for_workspace_window_or_any(
+        timeout_seconds=10,
+        workspace_path="D:/work/target-project",
+        prefer_workspace_match=True,
+    )
+
+    assert window.hwnd == 303
+    assert calls == [True, False]
 
 
 def test_find_trae_window_requires_workspace_match(monkeypatch: pytest.MonkeyPatch):
