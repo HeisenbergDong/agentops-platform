@@ -1800,3 +1800,38 @@ Verification:
 
 Deployment status:
 - Pending commit/push/deploy and Worker ZIP rebuild at the time this note was written.
+
+## 2026-06-14 Strict prompt send and stop cleanup deployed
+
+This record completes the strict prompt send and stop cleanup fix above.
+
+- Code commit: `68c9531 fix: require Trae prompt confirmation and clean stops`, full commit `68c9531d958cd2ff85be4c42e9792804ac7b5cbe`.
+- The first local commit `49473bb` was rebased/cherry-picked onto newer remote Trae foreground/title commits before push, so production includes both the earlier title fallback fixes and this strict-send/cleanup fix.
+- Final Worker ZIP was built from clean worktree `C:\Users\PC\AppData\Local\Temp\agentops-merge-20260614204108`:
+  - ZIP size: `27342996`
+  - ZIP SHA256: `13dd731c20f24c4857e7c1ca2903024ea27e6c4a87da3604844062a2b6d14ad6`
+  - ZIP header: `PK`
+- Verification before deploy:
+  - API targeted `test_worker_results.py test_preflight.py`: `69 passed`.
+  - Worker targeted `test_prompt_input.py test_command_runner.py test_worker_main.py test_registration.py`: `63 passed`.
+  - API full: `104 passed, 3 warnings`.
+  - Worker full: `114 passed, 2 warnings`.
+  - Web build passed from the main local worktree with the existing Vite chunk-size warning; web source had no dirty changes.
+  - `git diff --check` passed.
+- Deployment:
+  - Uploaded bundle: `/tmp/agentops-deploy-68c9531/`.
+  - Production backup dir: `/opt/agentops-deploy-backups/20260614-211100-68c9531`.
+  - Synced API source with `.venv` excluded, Worker source/scripts, Web dist, and Worker ZIP.
+  - Production `.deploy-revision` initially set to `68c9531d958cd2ff85be4c42e9792804ac7b5cbe`.
+- Production verification:
+  - `systemctl is-active agentops-api`: `active`.
+  - Local health: `{"status":"ok","service":"agentops-api","database":true}`.
+  - Public health: `{"status":"ok","service":"agentops-api","database":true}`.
+  - Homepage `http://115.190.113.8/`: `200 OK`.
+  - Production Worker ZIP size/SHA/header match the final build: `27342996`, `13dd731c20f24c4857e7c1ca2903024ea27e6c4a87da3604844062a2b6d14ad6`, `PK`.
+- Local process check after deploy:
+  - No running `agentops-worker` or `Trae` processes were visible in the current Windows process list.
+
+Next real-test expectation:
+- A Worker on version `0.1.2-strict-send-stop-cleanup` should not report success when prompt submission is unconfirmed. If Trae startup is too slow or the prompt did not enter the chat, the flow should stop as manual_required instead of moving to wait_completion.
+- Stop/reopen commands now include workspace/project context and should clean workspace-scoped shells/dev servers plus `trae-sandbox.exe` leftovers without closing the main Trae window by default.
