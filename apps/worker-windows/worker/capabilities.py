@@ -1,10 +1,15 @@
 SUPPORTED_APPS = ["Trae CN"]
 
+WORKER_RUNTIME_VERSION = "0.1.1-trae-title-fallback"
+
 CAPABILITIES = [
     "auto_launch_trae",
     "open_trae",
     "focus_trae",
     "send_prompt",
+    "trae_workspace_title_fallback",
+    "trae_appactivate_foreground",
+    "prompt_submission_unconfirmed_continue",
     "wait_completion",
     "diagnose_ui",
     "click_continue",

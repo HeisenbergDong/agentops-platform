@@ -11,7 +11,7 @@ from typing import Any
 if __package__ in {None, ""}:
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
 
-from worker.capabilities import CAPABILITIES, SUPPORTED_APPS
+from worker.capabilities import CAPABILITIES, SUPPORTED_APPS, WORKER_RUNTIME_VERSION
 from worker.config import WorkerSettings, apply_assigned_config, default_config_path, load_worker_settings
 from worker.connection.client import WorkerClient
 from worker.connection.uploader import AttachmentUploader
@@ -41,7 +41,8 @@ def run_once(
         "display_name": worker_settings.display_name,
         "worker_type": worker_settings.worker_type,
         "machine_fingerprint": machine_fingerprint(),
-        "version": worker_settings.version,
+        "version": WORKER_RUNTIME_VERSION,
+        "config_version": worker_settings.version,
         "supported_apps": SUPPORTED_APPS,
         "capabilities": CAPABILITIES,
         "current_stage": runner.state.stage,

@@ -2,6 +2,7 @@ from pathlib import Path
 
 from worker.config import WorkerSettings
 from worker import main as worker_main
+from worker.capabilities import WORKER_RUNTIME_VERSION
 
 
 class FakeClient:
@@ -9,10 +10,12 @@ class FakeClient:
         self.commands = commands
         self.ack_response = ack_response
         self.heartbeat_response = heartbeat_response or {"status": "ok"}
+        self.heartbeats = []
         self.results = []
         self.logs = []
 
     def heartbeat(self, payload):
+        self.heartbeats.append(payload)
         return self.heartbeat_response
 
     def poll_commands(self, worker_id):
@@ -78,6 +81,24 @@ def test_run_once_skips_command_cancelled_after_ack(tmp_path: Path):
     assert processed == 1
     assert runner.ran is False
     assert client.results[0]["status"] == "cancelled"
+
+
+def test_run_once_heartbeat_reports_runtime_version(tmp_path: Path):
+    client = FakeClient(commands=[], ack_response={})
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+        version="0.1.0",
+    )
+
+    processed = worker_main.run_once(client=client, runner=FakeRunner(), worker_settings=settings)
+
+    assert processed == 0
+    assert client.heartbeats[0]["version"] == WORKER_RUNTIME_VERSION
+    assert client.heartbeats[0]["config_version"] == "0.1.0"
+    assert "trae_workspace_title_fallback" in client.heartbeats[0]["capabilities"]
 
 
 def test_wait_completion_recovery_event_is_info_and_carries_result(tmp_path: Path):

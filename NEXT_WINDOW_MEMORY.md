@@ -1676,3 +1676,91 @@ Next real-test requirement:
 - Expected behavior: on `send_prompt`, Trae should be maximized and foregrounded using AppActivate + foreground verification, then Worker should click the left-bottom SOLO input and send.
 - If local turn probe is late, `send_prompt` should not immediately manual-required; later `wait_completion` / trace gates decide whether the run actually completed.
 - If it still fails, inspect recent worker command result data for `open_trae.window_diagnostics`, `current_window`, `input`, `submit`, and `submission.status`.
+
+## 2026-06-14 Worker still failed before prompt input - fixed local old Worker process
+
+User reported another real run failed before Worker did useful work. Screenshot logs showed:
+
+- `15:05:17` Worker received prompt and was opening Trae CN.
+- `15:06:32` flow required manual handling: `Worker could not send the prompt automatically`.
+
+Production DB investigation for latest `send_prompt` command `08e676e4bb4e4060a0d4d758796cc07d` showed the actual error:
+
+- `Trae window for workspace 'permission-system-e6dd6a33' was not found`
+- Diagnostics had exactly one Trae top-level window:
+  - title: `Trae CN`
+  - workspace_match: `False`
+  - matching_count: `0`
+- The failure happened before paste/send, in the startup/focus path.
+
+Root cause:
+
+- Production download package had been updated, but the local machine was still running two old Worker processes from:
+  - `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker.exe`
+- Those old processes were still version `0.1.0` and were claiming jobs.
+- Also patched the remaining code path so an already-running Trae window with title only `Trae CN` no longer fails before prompt input.
+
+Code changes in clean worktree `D:\code-space\auto-tool\agentops-platform-trae-fix`:
+
+- `apps/worker-windows/worker/trae/window.py`
+  - Existing-window branch in `ensure_trae_running()` now calls `wait_for_workspace_window_or_any(...)`, so it prefers a workspace-title match but falls back to any Trae window.
+- `apps/worker-windows/worker/capabilities.py`
+  - Added `WORKER_RUNTIME_VERSION = "0.1.1-trae-title-fallback"`.
+  - Added capability markers:
+    - `trae_workspace_title_fallback`
+    - `trae_appactivate_foreground`
+    - `prompt_submission_unconfirmed_continue`
+- `apps/worker-windows/worker/main.py`
+  - Heartbeat now reports code runtime version instead of stale config version.
+  - Keeps old config version as `config_version`.
+- Tests:
+  - Added regression test for existing Trae window title missing workspace marker.
+  - Added heartbeat runtime-version test.
+
+Verification:
+
+- Targeted Worker tests:
+  - `test_command_runner.py test_worker_main.py`: `45 passed`
+- Additional Worker groups:
+  - `test_project_detection.py test_path_guard.py test_registration.py`: `14 passed`
+  - `test_screenshot.py`: `3 passed, 2 warnings` (existing Pillow deprecation)
+  - `test_session_probe.py`: `6 passed`
+  - `test_trae_supervisor.py test_trae_watcher.py test_windows_service.py test_worker_supervisor.py`: `16 passed`
+- `git diff --check`: passed.
+- `py_compile` changed Worker modules: passed.
+- `test_trae_intervention.py` is slow in this desktop tool and hit the 120s tool-call ceiling after 13 dots with no failure output; no code in that module was changed.
+
+Build/deploy:
+
+- Built new Worker EXE directly with PyInstaller from clean worktree using the existing Worker venv:
+  - EXE size: `27751907`
+  - EXE SHA256: `54ec144ed3d7ea0aaa5e020f2ceb3151fa74a2143a3f353bff74618bd6681094`
+- Packaged Worker ZIP:
+  - `D:\code-space\auto-tool\agentops-platform-trae-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - ZIP size: `27341192`
+  - ZIP SHA256: `1197c1d039c201d4460a91192c609d2ea3c2e8ade1e9f615a99392c5fad8ba3f`
+  - Header: `PK`
+- Replaced local old runtime at:
+  - `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker.exe`
+  - `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows.zip`
+- Stopped old local Worker PIDs:
+  - `13600`
+  - `16104`
+- Started new local Worker; if it spawned two local processes, killed the extra one and kept one:
+  - kept PID `15812`
+- Production DB now sees:
+  - worker `local-windows-worker`
+  - status `online`
+  - version `0.1.1-trae-title-fallback`
+  - capability `trae_workspace_title_fallback`
+- Replaced production download package:
+  - `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`
+  - SHA256: `1197c1d039c201d4460a91192c609d2ea3c2e8ade1e9f615a99392c5fad8ba3f`
+  - Header: `PK`
+- Production health:
+  - local/public `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+
+Next real-test expectation:
+
+- User can click “重开” or “开始” again without manually downloading Worker; the local Worker already running should be the new build.
+- If it still fails, immediately query the latest `send_prompt` result. A new-code failure should include version `0.1.1-trae-title-fallback` in worker heartbeat and should not die on `Trae CN` title mismatch alone.

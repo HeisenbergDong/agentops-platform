@@ -312,6 +312,41 @@ def test_ensure_trae_running_reuses_existing_window_for_target_workspace(monkeyp
     assert result["workspace_match"] is True
 
 
+def test_ensure_trae_running_falls_back_for_existing_window_title_missing(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    workspace = tmp_path / "target-project"
+    fallback_window = trae_window.TraeWindow(202)
+    wait_calls = []
+
+    monkeypatch.setattr(trae_window, "_try_find_trae_window", lambda **_kwargs: fallback_window)
+    monkeypatch.setattr(
+        trae_window,
+        "wait_for_workspace_window_or_any",
+        lambda timeout_seconds, workspace_path=None, prefer_workspace_match=True: wait_calls.append(
+            (timeout_seconds, workspace_path, prefer_workspace_match)
+        )
+        or fallback_window,
+    )
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "Trae CN")
+    monkeypatch.setattr(
+        trae_window,
+        "trae_window_diagnostics",
+        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 0},
+    )
+
+    result = trae_window.ensure_trae_running(
+        Path("C:/Trae/Trae.exe"),
+        workspace,
+        launch_timeout_seconds=10,
+    )
+
+    assert result["status"] == "already_running"
+    assert result["window_title"] == "Trae CN"
+    assert result["workspace_match"] is False
+    assert wait_calls == [(6.0, workspace, True)]
+
+
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     runner = CommandRunner(worker_id="worker-test")
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)

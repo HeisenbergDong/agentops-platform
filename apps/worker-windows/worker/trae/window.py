@@ -162,10 +162,10 @@ def ensure_trae_running(
         require_workspace_match=bool(workspace_path),
     )
     if existing and not force_open_workspace:
-        window = wait_for_stable_trae_window(
+        window = wait_for_workspace_window_or_any(
             workspace_path=workspace_path,
             timeout_seconds=min(launch_timeout_seconds, 6.0),
-            require_workspace_match=bool(workspace_path),
+            prefer_workspace_match=bool(workspace_path),
         )
         title = _focus_window(window)
         return {
