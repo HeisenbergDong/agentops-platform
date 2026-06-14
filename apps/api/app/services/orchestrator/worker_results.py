@@ -108,6 +108,17 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
 
     extra = _result_extra(command, result)
     if result.status in {"ok", "success", "completed"}:
+        unconfirmed_reason = _prompt_submission_unconfirmed_reason(result.data)
+        if unconfirmed_reason:
+            _mark_manual_required(
+                db,
+                job,
+                round_,
+                "Worker clicked/pasted in Trae but did not confirm that Trae received a new prompt; retry or manual intervention is required.",
+                "prompt_submission_unconfirmed",
+                {**extra, "unconfirmed_reason": unconfirmed_reason},
+            )
+            return
         if result.data.get("sent_at_epoch") and "sent_at_epoch" not in command.payload:
             command.payload = {**command.payload, "sent_at_epoch": result.data.get("sent_at_epoch")}
         job.status = JobState.WAITING_TRAE
@@ -160,6 +171,18 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
         result.status,
         extra,
     )
+
+
+def _prompt_submission_unconfirmed_reason(data: dict) -> str:
+    if not isinstance(data, dict):
+        return ""
+    submission = data.get("submission") if isinstance(data.get("submission"), dict) else {}
+    if submission.get("status") == "unconfirmed":
+        return str(submission.get("error") or "submission_unconfirmed")
+    automation = data.get("automation") if isinstance(data.get("automation"), dict) else {}
+    if automation.get("submission_verified") is False:
+        return "submission_not_verified"
+    return ""
 
 
 def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:

@@ -10,6 +10,7 @@ from worker.project.scanner import scan_project
 from worker.project.workspace import ensure_project_workspace
 from worker.runtime.cancellation import CancellationToken, CommandCancelled
 from worker.runtime.state import WorkerRuntimeState
+from worker.runtime.stop_cleanup import cleanup_local_activity
 from worker.safety.path_guard import assert_within_root
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.intervene import click_confirm, click_continue
@@ -88,7 +89,7 @@ class CommandRunner:
                 data = self._git_submit(payload, cancellation)
             elif command_type == "stop_current_task":
                 self.state.stop_requested = True
-                data = {"stopped": True}
+                data = self._stop_current_task(payload)
             else:
                 return self._failed(command_id, f"Unsupported command type: {command_type}", lease_id=lease_id)
             return self._success(command_id, data, lease_id=lease_id)
@@ -162,9 +163,9 @@ class CommandRunner:
                 submit_hotkey=str(payload.get("submit_hotkey") or "{ENTER}"),
                 workspace_path=prompt_workspace_path,
                 verify_submission=bool(payload.get("verify_submission", True)),
-                strict_submission_verification=bool(payload.get("strict_submission_verification", False)),
+                strict_submission_verification=bool(payload.get("strict_submission_verification", True)),
                 sent_at_epoch=sent_at_epoch,
-                submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 15)),
+                submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 30)),
                 ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
             )
         except PromptSendError as exc:
@@ -189,6 +190,24 @@ class CommandRunner:
         send_result["workspace"] = workspace_info
         self.state.current_window_title = str(send_result.get("window_title") or self.state.current_window_title)
         return send_result
+
+    def _stop_current_task(self, payload: dict[str, Any]) -> dict:
+        workspace_path = None
+        workspace_error = ""
+        raw_workspace_path = payload.get("trae_workspace_path") or payload.get("workspace_path")
+        if raw_workspace_path:
+            try:
+                workspace_path = self._workspace_path(raw_workspace_path)
+            except Exception as exc:
+                workspace_error = str(exc)
+        cleanup = cleanup_local_activity(
+            workspace_path=workspace_path,
+            project_name=str(payload.get("project_name") or payload.get("project_slug") or ""),
+            kill_trae=bool(payload.get("kill_trae", False)),
+        )
+        if workspace_error:
+            cleanup["workspace_path_error"] = workspace_error
+        return {"stopped": True, "cleanup": cleanup}
 
     def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))

@@ -1767,3 +1767,36 @@ Next real-test expectation:
 
 - User can click “重开” or “开始” again without manually downloading Worker; the local Worker already running should be the new build.
 - If it still fails, immediately query the latest `send_prompt` result. A new-code failure should include version `0.1.1-trae-title-fallback` in worker heartbeat and should not die on `Trae CN` title mismatch alone.
+
+## 2026-06-14 Strict prompt send and stop cleanup fix record
+
+User real-test feedback:
+- Trae startup can be slow; Worker clicked send before the prompt was actually accepted, then Dashboard waited as if Trae was working.
+- Recent whole-flow tests made the PC slow; Stop did not reliably clean local Trae/sandbox/process leftovers.
+
+Root cause found:
+- Previous foreground/title fallback fix made server-driven send_prompt default to non-strict submission verification. When Trae local history did not show a new user turn, Worker returned submission.status=unconfirmed but still completed the command as sent.
+- API trusted successful send_prompt results and queued wait_completion even for old Worker results containing unconfirmed submission data.
+- stop_current_task only set WorkerRuntimeState.stop_requested and returned stopped=true; it did not attempt job/workspace-scoped local process cleanup.
+
+Implemented:
+- Worker send_prompt is strict again by default. Server-driven CommandRunner now passes strict_submission_verification=true unless explicitly overridden.
+- Submission probe timeout default increased from 15s to 30s to give slow Trae startup/local history writes more room without accepting false positives.
+- API dispatch_prompt_to_worker now explicitly sends strict_submission_verification=true and submission_timeout_seconds=30.
+- API send_prompt result handler now rejects completed/success results whose submission.status is unconfirmed or automation.submission_verified=false, marking the job manual_required instead of queuing wait_completion. This protects against old Worker binaries too.
+- Added Worker runtime stop cleanup module. stop_current_task now returns cleanup details and attempts workspace/project-scoped taskkill /T /F for matching shells/dev servers plus Trae sandbox leftovers. It does not kill the main Trae window unless kill_trae=true is explicitly sent.
+- Stop/reopen API commands now include project_name and workspace_path/trae_workspace_path when available so local cleanup can target the current job instead of guessing.
+- Worker version bumped to 0.1.2-strict-send-stop-cleanup and capabilities now include strict_prompt_submission_verification and workspace_process_cleanup.
+- Added/updated tests for strict send defaults, explicit non-strict legacy mode, API unconfirmed-result rejection, stop/reopen cleanup payloads, and workspace process cleanup matching.
+
+Verification:
+- Worker targeted: 51 passed.
+- API targeted: 72 passed.
+- Worker full: 114 passed, 2 warnings.
+- API full: 107 passed, 3 warnings.
+- Web build passed with existing Vite chunk-size warning.
+- Additional registration/main/command and preflight targeted tests passed after version/capability bump.
+- git diff --check passed.
+
+Deployment status:
+- Pending commit/push/deploy and Worker ZIP rebuild at the time this note was written.

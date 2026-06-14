@@ -7,7 +7,7 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
-from app.db.models import Attachment, Job, RuntimeLog, TaskRound, User, WorkerCommand
+from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import (
     add_log,
@@ -169,6 +169,7 @@ def reopen_job(
     job = current_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to reopen."}
+    old_runtime_context = current_job_runtime_context(db, job)
 
     rule_version = active_rule_version(db)
     round_, reset = reset_job_for_reopen(
@@ -200,7 +201,14 @@ def reopen_job(
             },
         )
     if reset["cancelled_active_commands"]:
-        command = enqueue_stop_worker_command(db, user.id, job.id, None, reason="user_reopen")
+        command = enqueue_stop_worker_command(
+            db,
+            user.id,
+            job.id,
+            None,
+            reason="user_reopen",
+            runtime_context=old_runtime_context,
+        )
         if command:
             add_log(
                 db,
@@ -454,7 +462,13 @@ def stop_job(
             level="warning",
             extra={"cancelled_commands": cancelled_commands},
         )
-    command = enqueue_stop_worker_command(db, user.id, job.id, round_.id if round_ else None)
+    command = enqueue_stop_worker_command(
+        db,
+        user.id,
+        job.id,
+        round_.id if round_ else None,
+        runtime_context=current_job_runtime_context(db, job, round_),
+    )
     if command:
         add_log(
             db,
@@ -660,7 +674,14 @@ def refreshed_retry_payload(payload: dict | None, worker_settings: dict, previou
     return result
 
 
-def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id: str | None, reason: str = "user_stop"):
+def enqueue_stop_worker_command(
+    db: Session,
+    user_id: str,
+    job_id: str,
+    round_id: str | None,
+    reason: str = "user_stop",
+    runtime_context: dict | None = None,
+):
     settings = load_user_settings(db, user_id)
     worker_id = settings.get("worker", {}).get("worker_id")
     if not worker_id:
@@ -678,9 +699,28 @@ def enqueue_stop_worker_command(db: Session, user_id: str, job_id: str, round_id
             type=WorkerCommandType.STOP_CURRENT_TASK,
             job_id=job_id,
             round_id=round_id,
-            payload={"reason": reason},
+            payload={"reason": reason, **(runtime_context or {})},
         ),
     )
+
+
+def current_job_runtime_context(db: Session, job: Job, round_: TaskRound | None = None) -> dict[str, str]:
+    active_round = round_ or latest_round(db, job.id)
+    project = db.get(Project, active_round.project_id) if active_round and active_round.project_id else None
+    if not project:
+        project = db.scalar(
+            select(Project)
+            .where(Project.job_id == job.id)
+            .order_by(Project.created_at.desc())
+            .limit(1)
+        )
+    if not project:
+        return {}
+    result: dict[str, str] = {"project_name": project.name}
+    if project.workspace_path:
+        result["workspace_path"] = project.workspace_path
+        result["trae_workspace_path"] = project.workspace_path
+    return result
 
 
 def is_worker_offline(worker) -> bool:

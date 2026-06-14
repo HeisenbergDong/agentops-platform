@@ -16,7 +16,7 @@ class WorkerSettings(BaseSettings):
     worker_id: str = "local-windows-worker"
     display_name: str = ""
     worker_type: str = "windows_trae"
-    version: str = "0.1.0"
+    version: str = "0.1.2-strict-send-stop-cleanup"
     trae_exe_path: Path = Path(r"D:\app\Trae CN\Trae CN.exe")
     workspace_root: Path = Path(r"D:\code-space\coding-soler")
     browser_url: str = ""

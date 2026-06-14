@@ -4,7 +4,7 @@ from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
 from app.api import jobs as jobs_api
-from app.api.jobs import StartJobRequest, reopen_job, retry_worker_command, start_job
+from app.api.jobs import StartJobRequest, reopen_job, retry_worker_command, start_job, stop_job
 from app.api.workers import assigned_worker_config
 from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, User, Worker, WorkerCommand
 from app.db.models.base import now_utc
@@ -166,7 +166,16 @@ def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch)
     assert command.status == "queued"
     prompt = command.payload["prompt"]
     assert "做一个订单看板" in command.payload["prompt"]
-    assert any(term in prompt for term in ("别做成单页静态 demo", "不要只做一个很小的 demo", "不要停在说明页"))
+    assert any(
+        term in prompt
+        for term in (
+            "别做成单页静态 demo",
+            "不要只做一个很小的 demo",
+            "不要停在说明页",
+            "按真实业务人员会使用的方式实现",
+            "不能只给文案或占位",
+        )
+    )
     assert any(term in prompt for term in ("业务模块", "详情", "状态", "本地模拟", "可运行"))
     assert any(stack in prompt for stack in ("Python", "Go", "Vue", "Java"))
     assert "你现在在 Trae CN" not in prompt
@@ -329,9 +338,45 @@ def test_reopen_job_resets_current_job_rounds_counts_and_runtime(monkeypatch):
     assert stop_command is not None
     assert stop_command.job_id == job.id
     assert stop_command.round_id is None
+    assert stop_command.payload["reason"] == "user_reopen"
+    assert stop_command.payload["project_name"] == "old-project"
+    assert stop_command.payload["workspace_path"] == "D:/work/project/old-project"
     assert reset_log is not None
     assert reset_log.extra["old_rounds"] == 1
     assert reset_log.extra["cancelled_active_commands"] == 1
+
+
+def test_stop_job_queues_workspace_cleanup_payload():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.WAITING_TRAE, directions=["demo"])
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="roles-dashboard",
+        direction="demo",
+        workspace_path="D:/mr-d/roles-dashboard",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.WAITING_TRAE,
+    )
+    db.add_all([job, project, round_])
+    db.commit()
+
+    result = stop_job(user=user, db=db)
+
+    stop_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value))
+    assert result["job"]["status"] == JobState.STOPPED
+    assert stop_command is not None
+    assert stop_command.payload["reason"] == "user_stop"
+    assert stop_command.payload["project_name"] == "roles-dashboard"
+    assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
 
 
 def test_reopen_job_with_background_task_returns_before_prompt_generation(monkeypatch):
@@ -555,7 +600,8 @@ def test_worker_dispatch_uses_current_user_worker_settings_only():
     assert command.payload["trae_workspace_path"].replace("\\", "/").startswith("D:/mr-d/demo-")
     assert "force_open_workspace" not in command.payload
     assert command.payload["verify_submission"] is True
-    assert command.payload["submission_timeout_seconds"] == 20
+    assert command.payload["strict_submission_verification"] is True
+    assert command.payload["submission_timeout_seconds"] == 30
 
 
 def test_worker_dispatch_names_project_from_chinese_core_feature():

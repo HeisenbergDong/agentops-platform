@@ -144,7 +144,35 @@ def test_send_prompt_falls_back_when_workspace_title_is_missing(monkeypatch):
     assert result["workspace_match"] is False
 
 
-def test_send_prompt_can_continue_when_submission_probe_is_unconfirmed(monkeypatch):
+def test_send_prompt_rejects_unconfirmed_submission_by_default(monkeypatch):
+    fake_window = FakeWindow([])
+
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        prompt_module,
+        "_verify_prompt_submission",
+        lambda **kwargs: (_ for _ in ()).throw(
+            prompt_module.PromptSendError(
+                "Prompt was pasted/submitted, but no new Trae user turn was detected.",
+                {"submission_probe": {"status": "missing", "reason": "no_completed_turn_after_prompt_send"}},
+            )
+        ),
+    )
+
+    with pytest.raises(prompt_module.PromptSendError):
+        prompt_module.send_prompt(
+            "build it",
+            verify_submission=True,
+        )
+
+
+def test_send_prompt_can_continue_when_submission_probe_is_explicitly_non_strict(monkeypatch):
     fake_window = FakeWindow([])
 
     monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})

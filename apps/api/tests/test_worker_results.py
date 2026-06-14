@@ -43,6 +43,39 @@ def test_send_prompt_success_advances_job_to_waiting_trae():
     assert logs[0].display_message == "Worker 已把提示词输入 Trae CN 并发送。"
 
 
+def test_send_prompt_unconfirmed_result_marks_manual_required():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "chars": 10,
+                "submission": {
+                    "status": "unconfirmed",
+                    "error": "Prompt was pasted/submitted, but no new Trae user turn was detected.",
+                },
+                "automation": {"submission_verified": False},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED))
+    assert job.status == JobState.MANUAL_REQUIRED
+    assert round_.status == JobState.MANUAL_REQUIRED
+    assert next_command is None
+    assert log is not None
+    assert log.extra["unconfirmed_reason"] == "Prompt was pasted/submitted, but no new Trae user turn was detected."
+
+
 def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)

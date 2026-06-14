@@ -13,16 +13,79 @@ from worker.trae import trace_copy
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae import window as trae_window
 from worker.trae.window import TraeAutomationError
+from worker.runtime import stop_cleanup
 
 
 def test_runner_uses_configured_worker_id():
-    runner = CommandRunner(worker_id="worker-test")
-
-    result = runner.run({"command_id": "cmd-1", "type": "stop_current_task", "payload": {}})
+    result = CommandRunner(worker_id="worker-test").run({"command_id": "cmd-1", "type": "stop_current_task", "payload": {}})
 
     assert result["worker_id"] == "worker-test"
     assert result["status"] == "success"
-    assert result["data"] == {"stopped": True}
+    assert result["data"]["stopped"] is True
+
+
+def test_stop_current_task_cleans_workspace_processes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    cleaned = {}
+
+    def fake_cleanup(**kwargs):
+        cleaned.update(kwargs)
+        return {"status": "completed", "killed": [{"pid": 1234}], "errors": []}
+
+    monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
+    monkeypatch.setattr(command_runner, "cleanup_local_activity", fake_cleanup)
+
+    runner = CommandRunner(worker_id="worker-test")
+    result = runner.run(
+        {
+            "command_id": "cmd-stop",
+            "type": "stop_current_task",
+            "payload": {
+                "workspace_path": "project",
+                "project_name": "demo-project",
+            },
+        }
+    )
+
+    assert result["status"] == "success"
+    assert result["data"]["stopped"] is True
+    assert result["data"]["cleanup"]["killed"][0]["pid"] == 1234
+    assert cleaned == {"workspace_path": workspace, "project_name": "demo-project", "kill_trae": False}
+
+
+def test_stop_cleanup_matches_workspace_and_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "roles-dashboard"
+    workspace.mkdir()
+    killed = []
+    monkeypatch.setattr(
+        stop_cleanup,
+        "_query_processes",
+        lambda: [
+            {
+                "pid": 101,
+                "name": "node.exe",
+                "command_line": f"node server.js --cwd {workspace}",
+            },
+            {
+                "pid": 102,
+                "name": "node.exe",
+                "command_line": "node unrelated.js",
+            },
+            {
+                "pid": 103,
+                "name": "trae-sandbox.exe",
+                "command_line": "trae-sandbox.exe exec --command-line <by-env>",
+            },
+        ],
+    )
+    monkeypatch.setattr(stop_cleanup, "_kill_process_tree", lambda pid: killed.append(pid) or {"ok": True})
+
+    result = stop_cleanup.cleanup_local_activity(workspace_path=workspace, project_name="roles-dashboard")
+
+    assert result["status"] == "completed"
+    assert killed == [101, 103]
+    assert [item["pid"] for item in result["killed"]] == [101, 103]
 
 
 def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -70,7 +133,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["data"]["status"] == "sent"
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
     assert result["data"]["verify_submission"] is True
-    assert result["data"]["strict_submission_verification"] is False
+    assert result["data"]["strict_submission_verification"] is True
     assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
@@ -114,6 +177,7 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
     assert result["status"] == "success"
     assert result["data"]["open_trae"]["status"] == "already_running"
     assert result["data"]["verify_submission"] is True
+    assert result["data"]["strict_submission_verification"] is True
     assert result["data"]["workspace_path"] == str(tmp_path)
     assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
 

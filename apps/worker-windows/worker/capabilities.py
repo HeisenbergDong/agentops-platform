@@ -21,4 +21,6 @@ CAPABILITIES = [
     "browser_acceptance",
     "git_submit",
     "stop_current_task",
+    "strict_prompt_submission_verification",
+    "workspace_process_cleanup",
 ]
