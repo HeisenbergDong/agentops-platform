@@ -26,6 +26,13 @@ PENDING_INTERVENTION_MARKERS = (
     "Run anyway",
     "Ok to proceed",
 )
+UI_COMPLETION_MARKERS = (
+    "\u4efb\u52a1\u5b8c\u6210",
+    "\u4efb\u52a1\u5df2\u5b8c\u6210",
+    "\u5df2\u5b8c\u6210\u4efb\u52a1",
+    "Task completed",
+    "task completed",
+)
 
 
 @dataclass(frozen=True)
@@ -71,6 +78,8 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
         "max_interventions": int(observation.max_interventions or 0),
     }
 
+    ui_completion_visible = has_ui_completion_text(observation.latest_text)
+
     if gate["passed"]:
         if observation.window_chrome_only:
             return {
@@ -87,6 +96,14 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
         }
 
     output_reason = str((observation.output_probe or {}).get("reason") or "")
+    if ui_completion_visible and output_reason not in RECOVERABLE_OUTPUT_REASONS and not observation.window_chrome_only:
+        return {
+            "action": "collect_trace",
+            "reason": "ui_completion_detected",
+            "recoverable": False,
+            **context,
+        }
+
     if output_reason in RECOVERABLE_OUTPUT_REASONS:
         if observation.intervention_count >= observation.max_interventions:
             return {
@@ -118,14 +135,6 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             **context,
         }
 
-    if observation.window_chrome_only:
-        return {
-            "action": "fail",
-            "reason": "window_chrome_only",
-            "recoverable": False,
-            **context,
-        }
-
     if observation.recent_activity:
         return {
             "action": "wait",
@@ -134,7 +143,28 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             **context,
         }
 
+    if observation.window_chrome_only:
+        return {
+            "action": "wait",
+            "reason": "window_chrome_only",
+            "recoverable": True,
+            **context,
+        }
+
     if gate.get("reason") == "pending_intervention_visible":
+        idle_ready = (
+            observation.intervention_idle_seconds > 0
+            and observation.idle_seconds >= observation.intervention_idle_seconds
+            and observation.intervention_count < observation.max_interventions
+            and not observation.busy
+        )
+        if not idle_ready:
+            return {
+                "action": "wait",
+                "reason": "pending_intervention_visible",
+                "recoverable": True,
+                **context,
+            }
         if observation.intervention_count >= observation.max_interventions:
             return {
                 "action": "wait",
@@ -223,3 +253,8 @@ def completion_gate(turn_probe: object, output_probe: object, latest_text: str) 
 def has_pending_intervention_text(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(marker.lower() in lowered for marker in PENDING_INTERVENTION_MARKERS)
+
+
+def has_ui_completion_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in UI_COMPLETION_MARKERS)

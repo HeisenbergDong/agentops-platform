@@ -437,6 +437,8 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         intervention_idle_seconds: float,
         max_interventions: int,
         cancellation_check=None,
+        progress_callback=None,
+        progress_interval_seconds: float = 10.0,
         prompt: str = "",
         workspace_path: str = "",
         sent_at_epoch: float | None = None,
@@ -448,6 +450,8 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         received["intervention_idle_seconds"] = intervention_idle_seconds
         received["max_interventions"] = max_interventions
         received["cancellable"] = callable(cancellation_check)
+        received["progress_callback"] = callable(progress_callback)
+        received["progress_interval_seconds"] = progress_interval_seconds
         received["prompt"] = prompt
         received["workspace_path"] = workspace_path
         received["sent_at_epoch"] = sent_at_epoch
@@ -471,6 +475,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
                 "workspace_path": "current",
                 "sent_at_epoch": 123.5,
                 "sent_at": "2026-06-13T00:00:00Z",
+                "progress_interval_seconds": 7,
             },
         }
     )
@@ -483,11 +488,76 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "intervention_idle_seconds": 11.0,
         "max_interventions": 5,
         "cancellable": True,
+        "progress_callback": True,
+        "progress_interval_seconds": 7.0,
         "prompt": "build feature",
         "workspace_path": str(Path("D:/work/current")),
         "sent_at_epoch": 123.5,
         "sent_at": "2026-06-13T00:00:00Z",
     }
+
+
+def test_wait_completion_progress_posts_worker_log(monkeypatch: pytest.MonkeyPatch):
+    class FakeClient:
+        def __init__(self):
+            self.logs = []
+
+        def post_log(self, worker_id, payload):
+            self.logs.append((worker_id, payload))
+
+    client = FakeClient()
+
+    def fake_wait_completion(
+        timeout_seconds: float,
+        stable_seconds: float,
+        poll_interval_seconds: float,
+        intervention_idle_seconds: float,
+        max_interventions: int,
+        cancellation_check=None,
+        progress_callback=None,
+        progress_interval_seconds: float = 10.0,
+        **_kwargs,
+    ):
+        progress_callback(
+            {
+                "event": "trae_activity",
+                "display_message": "Trae CN 正常工作中，检测到 agent_log 更新，继续等待。",
+                "activity_source": "agent_log",
+            }
+        )
+        return {"status": "completed"}
+
+    monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
+    monkeypatch.setattr(command_runner.settings, "workspace_root", Path("D:/work"))
+
+    result = CommandRunner(worker_id="worker-test", worker_client=client).run(
+        {
+            "command_id": "cmd-progress",
+            "type": "wait_completion",
+            "payload": {
+                "job_id": "job1",
+                "round_id": "round1",
+                "workspace_path": "current",
+            },
+        }
+    )
+
+    assert result["status"] == "success"
+    assert client.logs == [
+        (
+            "worker-test",
+            {
+                "command_id": "cmd-progress",
+                "job_id": "job1",
+                "round_id": "round1",
+                "stage": "waiting_trae",
+                "level": "info",
+                "message": "trae_activity",
+                "display_message": "Trae CN 正常工作中，检测到 agent_log 更新，继续等待。",
+                "extra": {"event": "trae_activity", "activity_source": "agent_log"},
+            },
+        )
+    ]
 
 
 def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
@@ -498,6 +568,8 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
         intervention_idle_seconds: float,
         max_interventions: int,
         cancellation_check=None,
+        progress_callback=None,
+        progress_interval_seconds: float = 10.0,
         **_kwargs,
     ):
         assert cancellation_check is not None

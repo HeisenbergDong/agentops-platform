@@ -69,7 +69,7 @@ class CommandRunner:
                 data = self._send_prompt(payload)
                 self.state.stage = "prompt_sent"
             elif command_type == "wait_completion":
-                data = self._wait_completion(payload, cancellation)
+                data = self._wait_completion(payload, cancellation, command_id)
                 self.state.stage = "trae_completed"
             elif command_type == "diagnose_ui":
                 data = diagnose_ui()
@@ -209,20 +209,46 @@ class CommandRunner:
             cleanup["workspace_path_error"] = workspace_error
         return {"stopped": True, "cleanup": cleanup}
 
-    def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken) -> dict:
+    def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken, command_id: str = "") -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
         return wait_completion(
             timeout_seconds=float(payload.get("timeout_seconds", 900)),
             stable_seconds=float(payload.get("stable_seconds", 15)),
             poll_interval_seconds=float(payload.get("poll_interval_seconds", 2)),
-            intervention_idle_seconds=float(payload.get("intervention_idle_seconds", 60)),
+            intervention_idle_seconds=float(payload.get("intervention_idle_seconds", 30)),
             max_interventions=int(payload.get("max_interventions", 3)),
             cancellation_check=cancellation.raise_if_cancelled,
+            progress_callback=lambda event: self._post_wait_progress(command_id, payload, event),
+            progress_interval_seconds=float(payload.get("progress_interval_seconds", 10)),
             prompt=str(payload.get("prompt") or ""),
             workspace_path=str(workspace_path or self.settings.workspace_root),
             sent_at_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
+
+    def _post_wait_progress(self, command_id: str, payload: dict[str, Any], event: dict[str, Any]) -> None:
+        if not self.worker_client:
+            return
+        display_message = str(event.get("display_message") or "").strip()
+        if not display_message:
+            return
+        extra = {key: value for key, value in event.items() if key != "display_message"}
+        try:
+            self.worker_client.post_log(
+                self.worker_id,
+                {
+                    "command_id": command_id,
+                    "job_id": payload.get("job_id"),
+                    "round_id": payload.get("round_id"),
+                    "stage": "waiting_trae",
+                    "level": "info",
+                    "message": str(event.get("event") or "wait_completion progress"),
+                    "display_message": display_message,
+                    "extra": extra,
+                },
+            )
+        except Exception:
+            return
 
     def _copy_latest_reply(self, payload: dict[str, Any], cancellation: CancellationToken | None = None) -> dict:
         result = copy_latest_reply(

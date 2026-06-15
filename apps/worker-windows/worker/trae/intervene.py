@@ -2,7 +2,6 @@ from __future__ import annotations
 
 import ctypes
 import time
-from pathlib import Path
 from typing import Any, Callable
 
 from worker.system.clipboard import ClipboardError, set_clipboard_text
@@ -87,28 +86,10 @@ def click_continue(
             "recovery_reason": recovery_reason,
         }
 
-    visual = click_visual_intervention(
-        action=_action_from_diagnosis(diagnosis),
-        timeout_seconds=timeout_seconds,
-        ui_analyst=ui_analyst,
+    state = str(diagnosis.get("state") or "") if isinstance(diagnosis, dict) else ""
+    raise TraeAutomationError(
+        f"No explicit Trae intervention target was found; diagnosis_state={state or 'unknown'}"
     )
-    if visual.get("status") == "clicked":
-        return {
-            "status": "clicked",
-            "action_taken": "clicked_visual_target",
-            "intervention": visual,
-            "diagnosis": _compact_diagnosis(diagnosis),
-        }
-
-    fallback = click_primary_fallback()
-    if fallback.get("status") == "clicked":
-        return {
-            "status": "clicked",
-            "action_taken": "clicked_primary_fallback",
-            "intervention": fallback,
-            "diagnosis": _compact_diagnosis(diagnosis),
-        }
-    raise TraeAutomationError("No safe Trae intervention target was found")
 
 
 def click_confirm() -> dict:

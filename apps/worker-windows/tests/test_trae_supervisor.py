@@ -39,8 +39,8 @@ def test_supervisor_applies_pending_ui_only_when_turn_is_not_completed():
             latest_text="\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation",
             output_probe={"reason": "missing_tool_trace_markers"},
             turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
-            idle_seconds=1,
-            intervention_idle_seconds=300,
+            idle_seconds=31,
+            intervention_idle_seconds=30,
             max_interventions=3,
         )
     )
@@ -95,10 +95,10 @@ def test_supervisor_waits_for_slow_first_round_before_idle_diagnosis():
         latest_text="Trae is quiet but has no completed turn yet",
         output_probe={"reason": "missing_tool_trace_markers"},
         turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
-        idle_seconds=120,
-        intervention_idle_seconds=300,
-        max_interventions=3,
-    )
+            idle_seconds=29,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+        )
 
     decision = decide_next_action(observation)
 
@@ -112,8 +112,8 @@ def test_supervisor_diagnoses_idle_after_configured_quiet_period():
             latest_text="Trae is quiet and no completed turn arrived",
             output_probe={"reason": "missing_tool_trace_markers"},
             turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
-            idle_seconds=301,
-            intervention_idle_seconds=300,
+            idle_seconds=31,
+            intervention_idle_seconds=30,
             max_interventions=3,
         )
     )
@@ -137,3 +137,36 @@ def test_supervisor_rejects_chrome_only_even_when_old_turn_completed():
 
     assert decision["action"] == "fail"
     assert decision["reason"] == "window_chrome_only"
+
+
+def test_supervisor_waits_on_chrome_only_when_current_turn_not_confirmed():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "current_turn_missing"},
+            window_chrome_only=True,
+            idle_seconds=31,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+        )
+    )
+
+    assert decision["action"] == "wait"
+    assert decision["reason"] == "window_chrome_only"
+
+
+def test_supervisor_collects_trace_from_visible_task_complete_text():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u4efb\u52a1\u5b8c\u6210\n9 \u4e2a\u6587\u4ef6\u53d8\u66f4\nindex.html +193 -0",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+            idle_seconds=31,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+        )
+    )
+
+    assert decision["action"] == "collect_trace"
+    assert decision["reason"] == "ui_completion_detected"

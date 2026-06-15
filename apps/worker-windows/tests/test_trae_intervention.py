@@ -2,7 +2,7 @@ import pytest
 
 from worker.trae import wait as wait_module
 from worker.trae.diagnose import diagnose_ui
-from worker.trae.intervene import apply_intervention, click_continue
+from worker.trae.intervene import TraeAutomationError, apply_intervention, click_continue
 
 
 def _watcher_observation(recent: bool = False) -> dict:
@@ -237,6 +237,36 @@ def test_click_continue_types_continue_for_service_interruption_reason(monkeypat
     assert result["intervention"]["mode"] == "continue-text"
 
 
+def test_click_continue_rejects_idle_state_without_explicit_target(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(
+        "worker.trae.intervene.diagnose_ui",
+        lambda timeout_seconds, scroll_bottom: {
+            "state": "idle_or_running",
+            "suggested_intervention": {},
+            "output_probe": {"reason": "missing_tool_trace_markers"},
+        },
+    )
+    monkeypatch.setattr("worker.trae.intervene.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        "worker.trae.intervene.click_visual_intervention",
+        lambda **kwargs: pytest.fail("visual cache should not be used without explicit evidence"),
+    )
+    monkeypatch.setattr(
+        "worker.trae.intervene.click_primary_fallback",
+        lambda: pytest.fail("primary fallback should not be used without explicit evidence"),
+    )
+
+    with pytest.raises(TraeAutomationError) as exc:
+        click_continue(recovery_reason="worker_command_error")
+
+    assert "No explicit Trae intervention target" in str(exc.value)
+
+
 def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
@@ -340,7 +370,7 @@ def test_wait_completion_intervenes_on_pending_ui_before_local_turn_completes(mo
         timeout_seconds=4,
         stable_seconds=0.5,
         poll_interval_seconds=0.5,
-        intervention_idle_seconds=100,
+        intervention_idle_seconds=0.5,
         max_interventions=1,
     )
 
@@ -443,7 +473,7 @@ def test_wait_completion_prioritizes_service_interruption_before_visible_buttons
     assert diagnosis_calls["count"] == 1
 
 
-def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.MonkeyPatch):
+def test_wait_completion_keeps_observing_window_chrome_only_text(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
 
@@ -453,6 +483,7 @@ def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.Mon
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "最小化\n最大化\n关闭")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module, "probe_latest_trae_turn", lambda **kwargs: {"status": "missing", "reason": "current_turn_missing"})
     monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
@@ -470,10 +501,10 @@ def test_wait_completion_rejects_window_chrome_only_text(monkeypatch: pytest.Mon
             max_interventions=0,
         )
 
-    assert "only window chrome text" in str(exc.value)
+    assert "did not become stable" in str(exc.value)
 
 
-def test_wait_completion_rejects_restored_window_chrome_text(monkeypatch: pytest.MonkeyPatch):
+def test_wait_completion_keeps_observing_restored_window_chrome_text(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
 
@@ -483,6 +514,7 @@ def test_wait_completion_rejects_restored_window_chrome_text(monkeypatch: pytest
     monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module, "probe_latest_trae_turn", lambda **kwargs: {"status": "missing", "reason": "current_turn_missing"})
     monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
 
     def fake_sleep(seconds, cancellation_check):
@@ -500,7 +532,52 @@ def test_wait_completion_rejects_restored_window_chrome_text(monkeypatch: pytest
             max_interventions=0,
         )
 
-    assert "only window chrome text" in str(exc.value)
+    assert "did not become stable" in str(exc.value)
+
+
+def test_wait_completion_accepts_visible_task_complete_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    diagnosis_calls = {"count": 0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        wait_module,
+        "window_text_snapshot",
+        lambda window: "\u4efb\u52a1\u5b8c\u6210\n9 \u4e2a\u6587\u4ef6\u53d8\u66f4\nindex.html +193 -0\napp.js +506 -0",
+    )
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+    )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom):
+        diagnosis_calls["count"] += 1
+        return {"state": "idle_or_running", "suggested_intervention": {}}
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    result = wait_module.wait_completion(
+        timeout_seconds=3,
+        stable_seconds=0.5,
+        poll_interval_seconds=0.5,
+        intervention_idle_seconds=0.5,
+        max_interventions=1,
+    )
+
+    assert result["status"] == "completed"
+    assert result["supervisor_decision"]["reason"] == "ui_completion_detected"
+    assert diagnosis_calls["count"] == 0
 
 
 def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch: pytest.MonkeyPatch):

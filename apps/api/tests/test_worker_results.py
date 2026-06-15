@@ -278,6 +278,77 @@ def test_wait_completion_success_queues_trace_copy():
     assert collect_log.display_message == "Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。"
 
 
+def test_wait_completion_chrome_only_requeues_observation_without_click_continue():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {"prompt": "demo", "workspace_path": "project-a"}
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not contain assistant content; only window chrome text was detected",
+            data={
+                "supervisor_decision": {"action": "wait", "reason": "window_chrome_only"},
+                "activity_summary": {"recent": False},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    wait_commands = list(
+        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)).all()
+    )
+    click_commands = list(
+        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value)).all()
+    )
+    retry = [item for item in wait_commands if item.id != command.id][0]
+    last_log = list(db.scalars(select(RuntimeLog).order_by(RuntimeLog.created_at)).all())[-1]
+
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert retry.payload["wait_observation_attempts"] == 1
+    assert retry.payload["intervention_idle_seconds"] == 30
+    assert retry.payload["workspace_path"] == "project-a"
+    assert click_commands == []
+    assert "不会点击恢复按钮" in last_log.display_message
+
+
+def test_wait_completion_worker_command_error_requeues_observation_without_click_continue():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="No explicit Trae intervention target was found; diagnosis_state=idle_or_running",
+            data={},
+        ),
+    )
+
+    click_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    retry = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)
+        .where(WorkerCommand.id != command.id)
+    )
+
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert click_command is None
+    assert retry is not None
+    assert retry.payload["wait_observation_attempts"] == 1
+
+
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)

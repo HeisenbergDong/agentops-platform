@@ -52,8 +52,9 @@ TRACE_COPY_RETRY_REASONS = {
     "copy_command_failed",
 }
 DEFAULT_MAX_TRACE_COPY_ATTEMPTS = 5
-FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 300
-FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 90
+FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
+FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
+DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -224,6 +225,17 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
             extra={"worker_id": copy_command.worker_id, "command_id": copy_command.id},
         )
         return
+
+    if _should_observe_wait_failure_without_recovery(extra):
+        if _queue_wait_observation_retry(
+            db,
+            command,
+            job,
+            round_,
+            "Worker did not find a safe Trae recovery action; continuing observation without clicking.",
+            extra,
+        ):
+            return
 
     _queue_continue_recovery(
         db,
@@ -1466,6 +1478,82 @@ def _queue_continue_recovery(
     )
 
 
+def _queue_wait_observation_retry(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    attempts = int(source_command.payload.get("wait_observation_attempts") or 0) + 1
+    max_attempts = int(
+        source_command.payload.get("max_wait_observation_attempts") or DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS
+    )
+    if attempts > max_attempts:
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            "Worker repeatedly could not read a safe Trae completion signal; manual inspection is required.",
+            "manual_required",
+            {**extra, "wait_observation_attempts": attempts, "max_wait_observation_attempts": max_attempts},
+        )
+        return True
+
+    job.status = JobState.WAITING_TRAE
+    if round_:
+        round_.status = JobState.WAITING_TRAE
+    retry_extra = {
+        **extra,
+        "wait_observation_attempts": attempts,
+        "max_wait_observation_attempts": max_attempts,
+        "display_message": (
+            f"Worker 暂时没有读到明确的 Trae CN 完成正文，也没有发现安全可点击的恢复操作，"
+            f"继续观察（第 {attempts}/{max_attempts} 次）。"
+        ),
+    }
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.WAITING_TRAE,
+        message=message,
+        level="info",
+        extra=retry_extra,
+    )
+    wait_command = _enqueue_worker_command(
+        db,
+        source_command,
+        WorkerCommandType.WAIT_COMPLETION,
+        _wait_completion_payload(
+            source_command,
+            round_,
+            {
+                "wait_observation_attempts": attempts,
+                "max_wait_observation_attempts": max_attempts,
+                "continue_attempts": source_command.payload.get("continue_attempts", 0),
+                "max_continue_attempts": source_command.payload.get("max_continue_attempts", 20),
+            },
+        ),
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.WAITING_TRAE,
+        message="wait_completion worker command requeued for safe Trae observation.",
+        extra={
+            "worker_id": wait_command.worker_id,
+            "command_id": wait_command.id,
+            "wait_observation_attempts": attempts,
+            "max_wait_observation_attempts": max_attempts,
+            "display_message": "已重新安排 Worker 观察 Trae CN 当前状态，本次不会点击恢复按钮。",
+        },
+    )
+    return True
+
+
 def _queue_trace_copy_retry(
     db: Session,
     source_command: WorkerCommand,
@@ -1577,6 +1665,32 @@ def _default_wait_intervention_idle_seconds(round_: TaskRound | None) -> int:
     if round_ and int(round_.round_index or 0) == 1:
         return FIRST_ROUND_INTERVENTION_IDLE_SECONDS
     return FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS
+
+
+def _should_observe_wait_failure_without_recovery(extra: dict) -> bool:
+    reason = _recovery_reason(extra)
+    if reason in {
+        "awaiting_continuation",
+        "awaiting_current_continuation",
+        "service_interrupted",
+        "no_completed_turn_after_prompt_send",
+    } or reason.startswith("trae_turn_not_completed"):
+        return False
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    supervisor_reason = str(supervisor.get("reason") or "").strip()
+    error = str(extra.get("error") or "").strip()
+    if supervisor_reason in {"window_chrome_only", "recent_trae_activity"}:
+        return True
+    if "only window chrome text was detected" in error:
+        return True
+    if "No explicit Trae intervention target was found" in error:
+        return True
+    if "No safe Trae intervention target was found" in error:
+        return True
+    if reason == "worker_command_error":
+        return True
+    return False
 
 
 def _recovery_reason(extra: dict) -> str:
@@ -2055,6 +2169,8 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
     for key in (
         "continue_attempts",
         "max_continue_attempts",
+        "wait_observation_attempts",
+        "max_wait_observation_attempts",
         "wait_timeout_seconds",
         "stable_seconds",
         "poll_interval_seconds",

@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.1-trae-title-fallback"
+WORKER_RUNTIME_VERSION = "0.1.3-trae-watch-parity"
 
 CAPABILITIES = [
     "auto_launch_trae",
@@ -11,6 +11,9 @@ CAPABILITIES = [
     "trae_appactivate_foreground",
     "prompt_submission_unconfirmed_continue",
     "wait_completion",
+    "trae_activity_progress",
+    "trae_safe_observation_retry",
+    "trae_ui_completion_detection",
     "diagnose_ui",
     "click_continue",
     "click_confirm",
