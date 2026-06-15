@@ -8,6 +8,9 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
+WORKER_VERSION = "0.1.4-trae-trace-fallback"
+
+
 class WorkerSettings(BaseSettings):
     model_config = SettingsConfigDict(env_prefix="AGENTOPS_WORKER_", extra="ignore")
 
@@ -16,7 +19,7 @@ class WorkerSettings(BaseSettings):
     worker_id: str = "local-windows-worker"
     display_name: str = ""
     worker_type: str = "windows_trae"
-    version: str = "0.1.4-trae-trace-fallback"
+    version: str = WORKER_VERSION
     trae_exe_path: Path = Path(r"D:\app\Trae CN\Trae CN.exe")
     workspace_root: Path = Path(r"D:\code-space\coding-soler")
     browser_url: str = ""
@@ -38,6 +41,7 @@ def default_config_path() -> Path:
 def load_worker_settings(config_path: Path | str | None = None) -> WorkerSettings:
     path = Path(config_path).expanduser() if config_path else default_config_path()
     data = _read_config_file(path)
+    data.pop("version", None)
     return WorkerSettings(**data)
 
 
