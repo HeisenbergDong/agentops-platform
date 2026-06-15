@@ -49,7 +49,35 @@ Verification passed:
 
 Deployment status:
 
-- Pending commit, push, and production deployment in this same turn.
+- Completed.
+
+Deployment completion:
+
+- Code commit: `6ef327c feat: resume paused trae tasks and strengthen test intent`, full commit `6ef327c6b2dd80b53653b0142006b32829d708a6`.
+- Pushed to GitHub `origin/main`.
+- Uploaded deploy bundle to production:
+  - `/tmp/agentops-deploy-6ef327c/agentops-source-6ef327c.tar`
+  - `/tmp/agentops-deploy-6ef327c/agentops-web-dist-6ef327c.tar`
+  - `/tmp/agentops-deploy-6ef327c/agentops-worker-windows.zip`
+- Production backup dir:
+  - `/opt/agentops-deploy-backups/20260615-222027-6ef327c`
+- Synced API source and Web dist to `/opt/agentops-platform`, explicitly excluding production `.env`, `.venv`, storage, Worker build/dist, and caches.
+- Copied latest Worker package to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `6ef327c6b2dd80b53653b0142006b32829d708a6`.
+
+Production verification:
+
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Homepage `http://115.190.113.8/`: `200`.
+- Production `.env` preserved at `/opt/agentops-platform/.env` with mode `600`.
+- Web assets present:
+  - `index-DUmaFp9c.js`
+  - `index-UTf109PN.css`
+- Worker ZIP SHA256: `2cac8f8bbe39fdb07db86eead55fda2d7abffd37521f2fa999dc57323c265062`.
+- Local Worker restarted from rebuilt package and MR.D preflight is green: `ready=True`, no blocking or warning items.
 
 ## 2026-06-15 Trae Completion Diagnostics and Test Start Button
 
