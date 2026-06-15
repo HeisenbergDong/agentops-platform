@@ -9,12 +9,21 @@ TERMINAL_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
 ACTIVE_COMMAND_STATES = {"queued", "claimed", "running"}
 
 
-def create_job(db: Session, user_id: str, directions: list[str], rule_version_id: str | None) -> Job:
+def create_job(
+    db: Session,
+    user_id: str,
+    directions: list[str],
+    rule_version_id: str | None,
+    scope_text: str = "",
+    intent: dict | None = None,
+) -> Job:
     job = Job(
         user_id=user_id,
         rule_version_id=rule_version_id,
         status=JobState.JOB_STARTING,
+        scope_text=scope_text,
         directions=directions,
+        intent=intent or {},
     )
     db.add(job)
     db.flush()
@@ -106,6 +115,8 @@ def reset_job_for_reopen(
     job: Job,
     directions: list[str],
     rule_version_id: str | None,
+    scope_text: str = "",
+    intent: dict | None = None,
 ) -> tuple[TaskRound, dict]:
     old_round_ids = list(db.scalars(select(TaskRound.id).where(TaskRound.job_id == job.id)).all())
     old_project_ids = list(db.scalars(select(Project.id).where(Project.job_id == job.id)).all())
@@ -139,7 +150,9 @@ def reset_job_for_reopen(
     deleted_projects = db.execute(delete(Project).where(Project.job_id == job.id)).rowcount or 0
 
     job.rule_version_id = rule_version_id
+    job.scope_text = scope_text
     job.directions = directions
+    job.intent = intent or {}
     job.submitted_count = 0
     job.satisfied_count = 0
     job.status = JobState.GENERATING_PROMPT
@@ -159,6 +172,8 @@ def reset_job_for_reopen(
         "deleted_rounds": deleted_rounds,
         "deleted_projects": deleted_projects,
         "directions": directions,
+        "scope_text": scope_text,
+        "intent": intent or {},
     }
 
 

@@ -116,6 +116,8 @@ def build_display_message(
         return "本轮流程已完成。"
     if stage_key == "project_completed":
         return "当前项目已完成，代码、记录和附件流程已收尾。"
+    if stage_key == "paused":
+        return "已收到暂停请求，调度和 Worker 正在停止当前动作，可稍后继续。"
     if stage_key == "stopped":
         return "已收到停止请求，调度和 Worker 正在停止当前动作。"
     if stage_key == "manual_required":

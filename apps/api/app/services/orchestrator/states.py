@@ -26,5 +26,6 @@ class JobState(StrEnum):
     FEISHU_FAILED_ABORT = "feishu_failed_abort"
     ROUND_COMPLETED = "round_completed"
     PROJECT_COMPLETED = "project_completed"
+    PAUSED = "paused"
     STOPPED = "stopped"
     MANUAL_REQUIRED = "manual_required"

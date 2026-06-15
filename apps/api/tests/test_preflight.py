@@ -162,6 +162,7 @@ def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch)
     command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
     fallback_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "prompt_generation_fallback"))
     assert result["status"] == JobState.SENDING_TO_WORKER
+    assert result["job"]["scope_text"] == "做一个订单看板"
     assert command is not None
     assert command.status == "queued"
     prompt = command.payload["prompt"]
@@ -372,11 +373,50 @@ def test_stop_job_queues_workspace_cleanup_payload():
     result = stop_job(user=user, db=db)
 
     stop_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value))
-    assert result["job"]["status"] == JobState.STOPPED
+    assert result["job"]["status"] == JobState.PAUSED
     assert stop_command is not None
     assert stop_command.payload["reason"] == "user_stop"
     assert stop_command.payload["project_name"] == "roles-dashboard"
     assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
+
+
+def test_continue_paused_job_requeues_cancelled_worker_command():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.PAUSED, directions=["demo"], scope_text="demo")
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PAUSED, prompt="demo prompt")
+    previous = WorkerCommand(
+        id="cmd1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"workspace_path": "D:/old/demo"},
+        status="cancelled",
+        message="Cancelled by user stop.",
+    )
+    db.add_all([job, round_, previous])
+    db.commit()
+
+    result = jobs_api.continue_job(user=user, db=db)
+
+    new_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.id != previous.id)
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    assert result["job"]["status"] == JobState.WAITING_TRAE
+    assert new_command is not None
+    assert new_command.command_type == WorkerCommandType.WAIT_COMPLETION.value
+    assert new_command.status == "queued"
+    assert new_command.payload["retry_of_command_id"] == previous.id
+    assert new_command.payload["workspace_path"] == "D:/mr-d"
+    db.refresh(round_)
+    assert round_.status == JobState.WAITING_TRAE
 
 
 def test_reopen_job_with_background_task_returns_before_prompt_generation(monkeypatch):
@@ -431,6 +471,7 @@ def test_reopen_job_with_background_task_returns_before_prompt_generation(monkey
     assert background.tasks[0][1] == (user.id, job.id, new_round.id)
     assert result["status"] == JobState.GENERATING_PROMPT
     assert result["message"] == "Reopen reset complete; prompt generation is running in the background."
+    assert result["job"]["scope_text"] == "new scope"
     assert new_round.prompt == ""
 
 

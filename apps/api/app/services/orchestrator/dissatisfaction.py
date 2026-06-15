@@ -38,6 +38,7 @@ class DissatisfactionEvidence:
     screenshot_path: str = ""
     runtime_log_text: str = ""
     data: dict[str, Any] = field(default_factory=dict)
+    orchestrator_intent: dict[str, Any] = field(default_factory=dict)
 
 
 def generate_dissatisfaction_reason(
@@ -47,6 +48,9 @@ def generate_dissatisfaction_reason(
     user: User | None = None,
     previous_reason: str = "",
 ) -> dict[str, Any]:
+    forced = _forced_test_unsatisfied(evidence)
+    if forced:
+        return _finalize_reason(forced, evidence, previous_reason=previous_reason)
     product = _product_reason(evidence)
     process = _process_reason(evidence)
     rule_result = _finalize_reason(
@@ -67,6 +71,26 @@ def generate_dissatisfaction_reason(
     if llm_result:
         return llm_result
     return rule_result
+
+
+def _forced_test_unsatisfied(evidence: DissatisfactionEvidence) -> dict[str, Any] | None:
+    intent = evidence.orchestrator_intent if isinstance(evidence.orchestrator_intent, dict) else {}
+    if intent.get("run_mode") != "test" or intent.get("dissatisfaction_policy") != "force_test_unsatisfied":
+        return None
+    product = "本轮是链路验证测试，即使产物结果可接受，也按用户要求标记为不满意，用于验证后续 GitHub 和飞书记录链路，不能当作正式业务验收结论。"
+    process = "本轮重点不是评估真实业务产物质量，而是确认提示发送、执行观察、提交和写入等自动化流程是否能被完整记录。"
+    return {
+        "status": "generated",
+        "reason": f"{PRODUCT_LABEL}{product}\n{PROCESS_LABEL}{process}",
+        "product_reason": product,
+        "process_reason": process,
+        "task_done": TASK_DONE_INCOMPLETE,
+        "satisfaction": "不满意",
+        "failure_stage": evidence.failure_stage,
+        "evidence_summary": _evidence_summary(evidence),
+        "orchestrator_intent": intent,
+        "test_mode": True,
+    }
 
 
 def _reviewer_reason(
@@ -94,6 +118,7 @@ def _reviewer_reason(
                         "must_not_use_local_recovery_as_log_trace": True,
                         "must_reference_existing_evidence_only": True,
                         "formal_write_requires_real_trace": True,
+                        "test_mode_must_be_labeled": True,
                     },
                     "context": _compact_evidence_for_reviewer(evidence, rule_result, previous_reason),
                 },
@@ -374,6 +399,7 @@ def _domain_hint(prompt: str) -> str:
 
 def _compact_evidence_for_reviewer(evidence: DissatisfactionEvidence, rule_result: dict[str, Any], previous_reason: str) -> dict[str, Any]:
     return {
+        "orchestrator_intent": evidence.orchestrator_intent or {},
         "mapped_before_llm": {
             "任务是否完成": TASK_DONE_INCOMPLETE,
             "产物及过程是否满意": "不满意",

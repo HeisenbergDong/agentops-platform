@@ -117,6 +117,7 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
                     "state": state,
                     "current": current,
                     "meta": meta,
+                    "orchestrator_intent": job.intent or {},
                     "user_rules": rules,
                     "current_direction": current_direction or _directions_text(job.directions),
                     "directions": job.directions or [],
@@ -516,6 +517,7 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
         "now": datetime.now().isoformat(),
         "round_index": round_.round_index,
         "current_task": _current_task(job, round_, previous_reason),
+        "orchestrator_intent": job.intent or {},
         "daily_counts": {"submitted": job.submitted_count or 0, "satisfied": job.satisfied_count or 0},
         "recent_history": [
             {
@@ -537,6 +539,10 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
 
 def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
     direction = _current_direction(job) or _directions_text(job.directions)
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    prompt_brief = str(intent.get("prompt_brief") or "").strip()
+    if prompt_brief:
+        direction = prompt_brief
     previous_prompts = []
     if round_.job_id:
         # The caller's DB session is not available here, so generate_round_prompt passes detailed state separately.
@@ -553,12 +559,15 @@ def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
 
 
 def _prompt_meta(job: Job, round_: TaskRound) -> dict:
+    intent = job.intent if isinstance(job.intent, dict) else {}
     return {
         "kind": "new" if round_.round_index <= 1 else "followup",
         "round": "第一轮" if round_.round_index <= 1 else f"第{round_.round_index}轮",
         "topic": _direction_topic(_current_direction(job) or _directions_text(job.directions)),
         "project_slug": _project_slug_from_direction(_current_direction(job) or _directions_text(job.directions)),
         "first_round_gate": round_.round_index <= 1,
+        "run_mode": intent.get("run_mode") or "normal",
+        "intent_summary": intent.get("intent_summary") or "",
     }
 
 

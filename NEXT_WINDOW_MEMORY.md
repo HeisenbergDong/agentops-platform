@@ -1,5 +1,62 @@
 # AgentOps Platform Next Window Memory
 
+## 2026-06-15 Pause, Scope, Intent, Test Mode, and Notification Fix
+
+User request addressed in order:
+
+1. After Stop, Continue could not be clicked.
+2. The job scope textarea kept changing to an internal expanded direction queue.
+3. Task Details and Exception Center were only placeholder pages.
+4. Scheduling should understand and pass user intent to LLM roles such as prompt writer and dissatisfaction writer.
+5. Scheduling should understand test-mode instructions and may continue GitHub/Feishu chain validation with explicit test labeling when Trae is abnormal.
+6. If Trae takes more than 30 minutes, send a Feishu webhook notification telling the user Trae is slow and manual pause/intervention is available.
+
+Implemented locally:
+
+- Added `JobState.PAUSED`.
+- Dashboard Stop button is now a Pause action:
+  - `/jobs/stop` sets job/round to `paused`, queues Worker `stop_current_task`, and keeps the job resumable.
+  - `Continue` is enabled for `paused`.
+  - Continuing a paused job first requeues the latest cancelled/manual/failed resumable Worker command for the paused stage; if none exists, it falls back to the existing prompt dispatch flow.
+  - Late Worker results after pause are ignored and logged as stale so paused state is preserved.
+- Added `jobs.scope_text` and `jobs.intent`:
+  - `scope_text` stores the original user textarea input.
+  - `directions` remains the normalized/expanded internal queue.
+  - Dashboard now displays/syncs `scope_text`, so the textarea no longer changes to unknown expanded items.
+  - Migration: `apps/api/migrations/versions/0011_job_scope_text.py`.
+  - Bootstrap extension also adds missing `scope_text` and `intent` columns for existing simple deployments.
+- Task Details page is no longer a placeholder:
+  - Shows current job, round, prompt, trace/GitHub/Feishu statuses, worker command, attachments, recent logs.
+  - Shows a job list from new `GET /api/jobs`.
+- Exception Center is no longer a placeholder:
+  - Shows user-scoped automation errors from `/api/errors` with details expansion.
+- Added `orchestrator_intent` role template and `services/orchestrator/intent.py`:
+  - Rule fallback plus optional LLM parsing.
+  - Produces structured intent: `run_mode`, `prompt_brief`, `dissatisfaction_policy`, `downstream_policy`, `trace_gate_policy`, flags, notification policy.
+  - Prompt writer receives `orchestrator_intent` and uses `prompt_brief`.
+  - Dissatisfaction writer receives `orchestrator_intent`.
+- Added labeled test-mode behavior:
+  - If user intent is test mode and explicitly allows chain validation on Trae abnormality, trace gate can create a clearly labeled `TEST MODE TRACE EXCEPTION` attachment.
+  - This sets `trace_status=test_exception` and a fake-but-labeled `test-exception-*` session id, records forced test dissatisfaction when requested, sends a webhook notification, and continues downstream chain validation.
+  - Formal mode remains strict: missing verified Trae trace still aborts before downstream writes.
+  - Test-mode Git commit messages are prefixed with `TEST AgentOps:`.
+  - Test-mode Feishu records add `测试-` to task type and append a note saying the record is for AgentOps GitHub/Feishu chain validation, not formal business acceptance.
+- Added slow Trae notification:
+  - `wait_completion` checks elapsed time from `sent_at_epoch` / command creation.
+  - Default threshold is 30 minutes (`DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 1800`).
+  - Sends Feishu webhook text once per round at `trae_slow_notification`.
+
+Verification passed:
+
+- API full suite: `111 passed, 3 warnings`.
+- Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
+- `py_compile` for changed API modules passed.
+- `git diff --check` passed; only Windows CRLF warning for `apps/web/src/styles/app.css`.
+
+Deployment status:
+
+- Pending commit/push/deploy at the time this note was written.
+
 ## 2026-06-15 Trae Worker Observation Fix
 
 - Latest code commit pushed to GitHub: `b2c88577be55dedca17cd935cd9634492ede7d80`.

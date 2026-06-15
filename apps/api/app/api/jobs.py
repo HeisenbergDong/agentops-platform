@@ -3,11 +3,11 @@ from datetime import timedelta
 from fastapi import APIRouter, BackgroundTasks, HTTPException
 from fastapi import Depends
 from pydantic import BaseModel
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.api.deps import current_user
-from app.db.models import Attachment, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
+from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories.jobs import (
     add_log,
@@ -25,6 +25,7 @@ from app.db.repositories.workers import create_worker_command, expire_worker_com
 from app.db.session import SessionLocal, get_db
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator.directions import DEFAULT_DAILY_TARGET, normalize_job_directions
+from app.services.orchestrator.intent import resolve_job_intent
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
     generate_round_prompt,
@@ -63,6 +64,7 @@ class StartJobRequest(BaseModel):
 @router.post("/start")
 def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: Session = Depends(get_db)) -> dict:
     raw_directions = [item.strip() for item in payload.directions if item.strip()]
+    scope_text = "\n".join(raw_directions)
     directions = normalize_job_directions(raw_directions, daily_target=DEFAULT_DAILY_TARGET)
     if not directions:
         raise HTTPException(status_code=400, detail="At least one direction is required")
@@ -74,11 +76,14 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
         )
     cleanup = cleanup_user_runtime_state(db, user.id)
     rule_version = active_rule_version(db)
+    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions)
     job = create_job(
         db,
         user_id=user.id,
         directions=directions,
         rule_version_id=rule_version.id if rule_version else None,
+        scope_text=scope_text,
+        intent=intent,
     )
     round_ = latest_round(db, job.id)
     preflight_level = "warning" if preflight["warnings"] else "info"
@@ -156,6 +161,7 @@ def reopen_job(
     db: Session = Depends(get_db),
 ) -> dict:
     raw_directions = [item.strip() for item in payload.directions if item.strip()]
+    scope_text = "\n".join(raw_directions)
     directions = normalize_job_directions(raw_directions, daily_target=DEFAULT_DAILY_TARGET)
     if not directions:
         raise HTTPException(status_code=400, detail="At least one direction is required")
@@ -172,11 +178,14 @@ def reopen_job(
     old_runtime_context = current_job_runtime_context(db, job)
 
     rule_version = active_rule_version(db)
+    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions)
     round_, reset = reset_job_for_reopen(
         db,
         job,
         directions=directions,
         rule_version_id=rule_version.id if rule_version else None,
+        scope_text=scope_text,
+        intent=intent,
     )
     add_log(
         db,
@@ -313,6 +322,19 @@ def continue_job(
     round_ = latest_round(db, job.id)
     if job.status == JobState.STOPPED:
         return {"status": "no_job", "message": "Stopped jobs cannot be continued; start a new job."}
+    if job.status == JobState.PAUSED:
+        active_command = latest_active_worker_command(db, job.id, round_.id if round_ else None)
+        if active_command:
+            raise HTTPException(
+                status_code=400,
+                detail=f"Worker command is still active: {active_command.command_type} / {active_command.status}",
+            )
+        previous = latest_resumable_worker_command(db, job.id, round_.id if round_ else None)
+        if previous:
+            _resume_worker_command(db, user, job, round_, previous)
+            db.commit()
+            db.refresh(job)
+            return serialize_job(db, job)
     add_log(
         db,
         job_id=job.id,
@@ -440,16 +462,22 @@ def stop_job(
     job = current_active_job(db, user.id)
     if not job:
         return {"status": "no_job", "message": "No existing job to stop."}
-    job.status = JobState.STOPPED
+    previous_job_status = str(job.status)
+    job.status = JobState.PAUSED
     round_ = latest_round(db, job.id)
+    previous_round_status = str(round_.status) if round_ else ""
     if round_:
-        round_.status = JobState.STOPPED
+        round_.status = JobState.PAUSED
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id if round_ else None,
-        stage=JobState.STOPPED,
-        message="Stop requested; scheduler and worker should stop current activity.",
+        stage=JobState.PAUSED,
+        message="Pause requested; scheduler and worker should stop current activity, and the job can be continued later.",
+        extra={
+            "previous_job_status": previous_job_status,
+            "previous_round_status": previous_round_status,
+        },
     )
     cancelled_commands = cancel_job_worker_commands(db, job.id)
     if cancelled_commands:
@@ -501,6 +529,17 @@ def get_current_job(user: User = Depends(current_user), db: Session = Depends(ge
     return serialize_job(db, job)
 
 
+@router.get("")
+def list_jobs(limit: int = 20, user: User = Depends(current_user), db: Session = Depends(get_db)) -> list[dict]:
+    rows = db.scalars(
+        select(Job)
+        .where(Job.user_id == user.id)
+        .order_by(Job.created_at.desc())
+        .limit(max(1, min(limit, 100)))
+    ).all()
+    return [serialize_job_summary(db, item) for item in rows]
+
+
 @router.get("/{job_id}/logs")
 def get_job_logs(
     job_id: str,
@@ -514,6 +553,35 @@ def get_job_logs(
     return [serialize_log(item) for item in list_logs(db, job_id=job_id, limit=limit)]
 
 
+def serialize_job_summary(db: Session, job: Job) -> dict:
+    round_ = latest_round(db, job.id)
+    latest_command = latest_worker_command(db, job.id, round_.id if round_ else None)
+    error_count = db.scalar(select(func.count(AutomationError.id)).where(AutomationError.job_id == job.id))
+    return {
+        "id": job.id,
+        "status": job.status,
+        "scope_text": job.scope_text,
+        "directions": job.directions,
+        "daily_target": job.daily_target,
+        "submitted_count": job.submitted_count,
+        "satisfied_count": job.satisfied_count,
+        "round": {
+            "id": round_.id,
+            "round_index": round_.round_index,
+            "status": round_.status,
+            "trace_status": round_.trace_status,
+            "github_status": round_.github_status,
+            "feishu_status": round_.feishu_status,
+        }
+        if round_
+        else None,
+        "worker_command": serialize_worker_command(latest_command),
+        "error_count": int(error_count or 0),
+        "created_at": job.created_at.isoformat(),
+        "updated_at": job.updated_at.isoformat(),
+    }
+
+
 def serialize_job(db: Session, job) -> dict:
     round_ = latest_round(db, job.id)
     logs = list_logs(db, job_id=job.id, limit=50)
@@ -523,7 +591,9 @@ def serialize_job(db: Session, job) -> dict:
         "job": {
             "id": job.id,
             "status": job.status,
+            "scope_text": job.scope_text,
             "directions": job.directions,
+            "intent": job.intent or {},
             "daily_target": job.daily_target,
             "submitted_count": job.submitted_count,
             "satisfied_count": job.satisfied_count,
@@ -616,6 +686,65 @@ def latest_active_worker_command(db: Session, job_id: str, round_id: str | None)
     if round_id:
         query = query.where(WorkerCommand.round_id == round_id)
     return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def latest_resumable_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
+    query = select(WorkerCommand).where(
+        WorkerCommand.job_id == job_id,
+        WorkerCommand.status.in_(RETRYABLE_COMMAND_STATES),
+        WorkerCommand.command_type.in_(set(RETRY_STAGE_BY_COMMAND_TYPE.keys())),
+    )
+    if round_id:
+        query = query.where(WorkerCommand.round_id == round_id)
+    return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def _resume_worker_command(
+    db: Session,
+    user: User,
+    job: Job,
+    round_: TaskRound | None,
+    previous: WorkerCommand,
+) -> WorkerCommand:
+    settings = load_user_settings(db, user.id)
+    worker_settings = settings.get("worker", {})
+    worker_id = str(worker_settings.get("worker_id") or "").strip()
+    worker = get_worker_by_worker_id(db, worker_id)
+    if not worker or worker.user_id != user.id:
+        raise HTTPException(status_code=400, detail="Configured worker is not available for continue.")
+    retry_payload = refreshed_retry_payload(previous.payload, worker_settings, previous.id)
+    command = create_worker_command(
+        db,
+        worker_id=worker.worker_id,
+        user_id=user.id,
+        payload=CreateWorkerCommandRequest(
+            type=WorkerCommandType(previous.command_type),
+            job_id=job.id,
+            round_id=round_.id if round_ else previous.round_id,
+            payload=retry_payload,
+        ),
+    )
+    retry_stage = RETRY_STAGE_BY_COMMAND_TYPE[previous.command_type]
+    job.status = retry_stage
+    if round_:
+        round_.status = retry_stage
+        if previous.command_type == WorkerCommandType.GIT_SUBMIT.value:
+            round_.github_status = "submitting"
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else previous.round_id,
+        stage="worker_command_retry",
+        message="Continue requested after pause; worker command was requeued for the paused stage.",
+        level="warning",
+        extra={
+            "previous_command_id": previous.id,
+            "new_command_id": command.id,
+            "command_type": previous.command_type,
+            "worker_id": worker.worker_id,
+        },
+    )
+    return command
 
 
 def serialize_worker_command(item) -> dict | None:

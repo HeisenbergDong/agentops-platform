@@ -29,6 +29,7 @@ type CurrentJobResponse = {
   job?: {
     id: string;
     status: string;
+    scope_text?: string;
     directions: string[];
     daily_target: number;
     submitted_count: number;
@@ -107,7 +108,7 @@ export function DashboardPage() {
   const logs = current.data?.logs || [];
   const latestLogId = logs.length ? logs[logs.length - 1].id : "";
   const status = job?.status || current.data?.status || "idle";
-  const currentJobDirections = job?.directions?.join("\n") || "";
+  const currentJobScopeText = job?.scope_text || "";
   const preflightData = preflight.data;
   const directionsList = parseDirections(directions);
   const hasCurrentJob = Boolean(job);
@@ -122,14 +123,14 @@ export function DashboardPage() {
     hasCurrentJob &&
     RESUMABLE_STATES.has(status) &&
     !hasActiveWorkerCommand;
-  const canStop = hasCurrentJob && !isTerminalStatus(status);
+  const canStop = hasCurrentJob && !isTerminalStatus(status) && status !== "paused";
   const canReopen = !preflight.isLoading && preflightReady && hasCurrentJob && directionsList.length > 0;
 
   useEffect(() => {
-    if (!directionsTouched && currentJobDirections) {
-      setDirections(currentJobDirections);
+    if (!directionsTouched && currentJobScopeText) {
+      setDirections(currentJobScopeText);
     }
-  }, [directionsTouched, currentJobDirections]);
+  }, [directionsTouched, currentJobScopeText]);
 
   useEffect(() => {
     const panel = logPanelRef.current;
@@ -162,7 +163,7 @@ export function DashboardPage() {
       }
       if (action === "stop") {
         const response = await api.post<CurrentJobResponse>("/jobs/stop");
-        message.success(response.data.message || "已请求停止");
+        message.success(response.data.message || "已请求暂停");
       }
       await current.refetch();
     } catch (error: any) {
@@ -262,7 +263,7 @@ export function DashboardPage() {
                   disabled={!canStop}
                   onClick={() => void runAction("stop")}
                 >
-                  停止
+                  暂停
                 </Button>
               </span>
             </Tooltip>
@@ -312,6 +313,7 @@ export function DashboardPage() {
 }
 
 const RESUMABLE_STATES = new Set([
+  "paused",
   "prompt_ready",
   "manual_required",
   "trace_missing_abort",
@@ -453,6 +455,7 @@ function continueDisabledReason(
 
 function stopDisabledReason(status: string, hasCurrentJob: boolean): string {
   if (!hasCurrentJob) return "当前没有运行中的作业";
+  if (status === "paused") return "当前作业已暂停";
   if (isTerminalStatus(status)) return "当前作业已停止或已结束";
   return "";
 }
@@ -477,6 +480,7 @@ function formatTime(value: string): string {
 
 function statusColor(status: string): string {
   if (status === "idle") return "default";
+  if (status === "paused") return "orange";
   if (status === "stopped") return "red";
   if (status.includes("failed") || status.includes("abort") || status === "manual_required") return "orange";
   if (status === "project_completed" || status === "round_completed") return "green";
@@ -508,6 +512,7 @@ function statusLabel(status: string): string {
     feishu_failed_abort: "飞书失败",
     round_completed: "本轮完成",
     project_completed: "项目完成",
+    paused: "已暂停",
     stopped: "已停止",
     manual_required: "需人工处理"
   };

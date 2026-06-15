@@ -58,6 +58,12 @@ def ensure_schema_extensions() -> None:
             statements.append("alter table worker_commands add column lease_id varchar(64) not null default ''")
         if "lease_expires_at" not in command_columns:
             statements.append("alter table worker_commands add column lease_expires_at timestamp with time zone null")
+    if "jobs" in inspector.get_table_names():
+        job_columns = {item["name"] for item in inspector.get_columns("jobs")}
+        if "scope_text" not in job_columns:
+            statements.append("alter table jobs add column scope_text text not null default ''")
+        if "intent" not in job_columns:
+            statements.append("alter table jobs add column intent json not null default '{}'::json")
     if not statements:
         return
     with engine.begin() as connection:

@@ -22,6 +22,12 @@ ROLE_REGISTRY: list[RoleDefinition] = [
         purpose="负责状态流转、任务拆解，并决定下一步调用哪个角色或 Worker。",
     ),
     RoleDefinition(
+        key="orchestrator_intent",
+        name="调度意图解析角色",
+        rules=["01_global_rules.md", "02_orchestrator_rules.md"],
+        purpose="把用户原始作业范围和补充说明解析成结构化调度意图，传给提示词、不满意原因和下游链路角色。",
+    ),
+    RoleDefinition(
         key="rule_collector",
         name="规则采集角色",
         rules=["00_framework_capabilities.md", "03_rule_collector_rules.md"],

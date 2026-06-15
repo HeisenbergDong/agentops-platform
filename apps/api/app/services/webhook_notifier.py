@@ -44,6 +44,25 @@ def notify_manual_required(
     return {"status": "sent", "http_status": response.status_code}
 
 
+def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
+    url = str(webhook_config.get("url") or "").strip()
+    if not url:
+        return {"status": "skipped", "reason": "missing_webhook_url"}
+    payload: dict[str, Any] = {"msg_type": "text", "content": {"text": str(text or "").strip()}}
+    secret = safe_open_secret(webhook_config.get("secret"))
+    if secret:
+        timestamp = str(int(time.time()))
+        payload["timestamp"] = timestamp
+        payload["sign"] = _feishu_sign(secret, timestamp)
+    try:
+        response = httpx.post(url, json=payload, timeout=6)
+    except httpx.HTTPError as exc:
+        raise WebhookNotifyError(f"Webhook notification failed: {exc.__class__.__name__}") from exc
+    if response.status_code >= 400:
+        raise WebhookNotifyError(f"Webhook notification failed with status {response.status_code}: {response.text[:200]}")
+    return {"status": "sent", "http_status": response.status_code}
+
+
 def _manual_required_text(*, job_id: str, round_id: str | None, message: str, details: dict[str, Any]) -> str:
     lines = [
         "AgentOps 需要人工介入",

@@ -77,3 +77,21 @@ def test_dissatisfaction_reason_tmc_does_not_cross_domain_to_community_or_logist
     assert "举报入口" not in reason
     assert "帖子/消息" not in reason
     assert "装车失败" not in reason
+
+
+def test_dissatisfaction_reason_can_force_labeled_test_unsatisfied():
+    result = generate_dissatisfaction_reason(
+        DissatisfactionEvidence(
+            failure_stage="browser_accepting",
+            failure_message="Browser acceptance passed, but user asked for a test dissatisfaction record.",
+            prompt="本轮是测试，满意也写成不满意",
+            orchestrator_intent={
+                "run_mode": "test",
+                "dissatisfaction_policy": "force_test_unsatisfied",
+            },
+        )
+    )
+
+    assert result["test_mode"] is True
+    assert "链路验证测试" in result["reason"]
+    assert "正式业务验收" in result["reason"]

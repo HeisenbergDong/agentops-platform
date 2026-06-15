@@ -25,7 +25,7 @@ class OrchestratorService:
 
     def stop_job(self, job_id: str | None = None) -> dict:
         return runtime_event(
-            JobState.STOPPED,
-            "Stop requested; scheduler and worker should stop current activity.",
+            JobState.PAUSED,
+            "Pause requested; scheduler and worker should stop current activity.",
             job_id=job_id,
         )

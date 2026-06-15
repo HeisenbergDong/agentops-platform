@@ -1544,6 +1544,58 @@ def test_downstream_command_without_verified_trace_aborts_before_dissatisfaction
     assert _latest_dissatisfaction_reason(db) is None
 
 
+def test_test_mode_trace_exception_continues_downstream_and_notifies(monkeypatch):
+    db = _test_session()
+    job, round_, command = _create_run_command_rows(db, with_trace=False)
+    job.intent = {
+        "run_mode": "test",
+        "dissatisfaction_policy": "force_test_unsatisfied",
+        "downstream_policy": "test_chain_allowed",
+        "trace_gate_policy": "test_exception",
+        "flags": ["test_run", "continue_chain_on_trae_error", "force_unsatisfied"],
+    }
+    db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/webhook/test"}))
+    db.commit()
+    sent = {}
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+
+        class Response:
+            status_code = 200
+            text = "ok"
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"returncode": 0, "stdout": "ok", "product_review": {"issues": []}},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value))
+    trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "test_chain_exception"))
+    assert job.status == JobState.BROWSER_ACCEPTING
+    assert round_.trace_status == "test_exception"
+    assert round_.trae_session_id.startswith("test-exception-")
+    assert next_command is not None
+    assert trace is not None
+    assert log is not None
+    assert sent["url"] == "https://open.feishu.cn/webhook/test"
+    assert "测试模式" in sent["json"]["content"]["text"]
+
+
 def test_send_prompt_manual_required_marks_job_manual_required():
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
@@ -1654,6 +1706,38 @@ def test_late_cancelled_command_result_is_ignored():
     assert job.status == JobState.WAITING_TRAE
     assert round_.status == JobState.WAITING_TRAE
     assert next_command is None
+    assert log is not None
+
+
+def test_wait_completion_over_30_minutes_sends_slow_notification(monkeypatch):
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {"sent_at_epoch": 1, "slow_notify_seconds": 30}
+    db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/webhook/test"}))
+    db.commit()
+    sent = {}
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+
+        class Response:
+            status_code = 200
+            text = "ok"
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="failed", error="still waiting"),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "trae_slow_notification"))
+    assert sent["url"] == "https://open.feishu.cn/webhook/test"
+    assert "慢任务提醒" in sent["json"]["content"]["text"]
     assert log is not None
 
 

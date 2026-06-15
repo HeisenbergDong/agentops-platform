@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 
 from sqlalchemy import select
@@ -21,7 +22,7 @@ from app.services.orchestrator.prompt_writer import (
 from app.services.orchestrator.states import JobState
 from app.services.trace.validator import is_recoverable_trace_reason, validate_full_trace
 from app.services.user_settings import load_user_settings, save_user_settings
-from app.services.webhook_notifier import WebhookNotifyError, notify_manual_required
+from app.services.webhook_notifier import WebhookNotifyError, notify_manual_required, notify_text
 from app.services.orchestrator.worker_dispatch import (
     WorkerDispatchError,
     dispatch_prompt_to_worker,
@@ -36,6 +37,7 @@ MAX_ROUNDS_PER_PROJECT = 5
 MAX_SATISFIED_RATIO = 0.20
 TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
 TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
+PAUSED_STATES = {JobState.PAUSED}
 IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
 RECOVERABLE_COPY_GATE_REASONS = {
     "awaiting_continuation",
@@ -55,6 +57,7 @@ DEFAULT_MAX_TRACE_COPY_ATTEMPTS = 5
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
+DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -108,6 +111,7 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
         return
 
     extra = _result_extra(command, result)
+    _maybe_notify_slow_trae(db, job, round_, command, result)
     if result.status in {"ok", "success", "completed"}:
         unconfirmed_reason = _prompt_submission_unconfirmed_reason(result.data)
         if unconfirmed_reason:
@@ -192,6 +196,7 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         return
 
     extra = _result_extra(command, result)
+    _maybe_notify_slow_trae(db, job, round_, command, result)
     if result.status in {"ok", "success", "completed"}:
         _queue_trace_collection_after_wait(db, command, job, round_, extra, result.data)
         return
@@ -1342,6 +1347,7 @@ def _dissatisfaction_evidence(
         screenshot_path=screenshot.path if screenshot else "",
         runtime_log_text=_runtime_log_text(db, job.id, round_.id),
         data=data,
+        orchestrator_intent=job.intent or {},
     )
 
 
@@ -1866,6 +1872,9 @@ def _ensure_trace_gate(
     trace_text = _latest_trace_text(db, job.id, round_.id)
     if round_.trace_status == "valid" and trace_text.strip():
         return True
+    if _test_chain_allowed(job):
+        _apply_test_trace_exception(db, job, round_, command, trace_text)
+        return True
     _mark_trace_missing_abort(
         db,
         job,
@@ -1966,6 +1975,170 @@ def _mark_trace_missing_abort(
         level="error",
         extra=extra,
     )
+
+
+def _test_chain_allowed(job: Job) -> bool:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    return (
+        intent.get("run_mode") == "test"
+        and intent.get("downstream_policy") == "test_chain_allowed"
+        and intent.get("trace_gate_policy") == "test_exception"
+    )
+
+
+def _apply_test_trace_exception(
+    db: Session,
+    job: Job,
+    round_: TaskRound,
+    command: WorkerCommand,
+    trace_text: str,
+) -> None:
+    if round_.trace_status == "test_exception" and _latest_trace_text(db, job.id, round_.id).strip():
+        return
+    text = (
+        "TEST MODE TRACE EXCEPTION\n"
+        "This attachment is not a verified raw Trae assistant trace.\n"
+        "The user requested a test-chain run to verify GitHub and Feishu automation even when Trae is abnormal.\n\n"
+        f"Job: {job.id}\n"
+        f"Round: {round_.id}\n"
+        f"Blocked command: {command.command_type}\n"
+        f"Previous trace status: {round_.trace_status}\n"
+        f"Runtime logs:\n{_runtime_log_text(db, job.id, round_.id)}\n"
+    )
+    _record_trace_attachment(db, command, text)
+    round_.trace_status = "test_exception"
+    round_.trae_session_id = round_.trae_session_id or f"test-exception-{job.id}-{round_.id}"
+    round_.trae_trace_id = round_.trae_trace_id or "test-exception"
+    _record_dissatisfaction_from_context(
+        db,
+        job,
+        round_,
+        JobState.TRACE_MISSING_ABORT,
+        "Trae trace was missing, but this run is marked as a test-chain exception.",
+        {
+            "command_type": command.command_type,
+            "result_status": "test_exception",
+            "trace_status": "test_exception",
+            "data": {"test_mode": True, "intent": job.intent or {}, "trace_chars_before_exception": len(trace_text or "")},
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="test_chain_exception",
+        message="Trae trace gate was bypassed only for a labeled test-chain run; downstream records must be treated as test data.",
+        level="warning",
+        extra={"command_id": command.id, "command_type": command.command_type, "intent": job.intent or {}},
+    )
+    _notify_test_chain_exception(db, job, round_, command)
+
+
+def _notify_test_chain_exception(db: Session, job: Job, round_: TaskRound, command: WorkerCommand) -> None:
+    config = load_user_settings(db, job.user_id).get("webhook", {})
+    text = (
+        "AgentOps 测试链路通知\n"
+        f"Job: {job.id}\n"
+        f"Round: {round_.id}\n"
+        f"命令: {command.command_type}\n"
+        "Trae 没有提供可验证的完整轨迹，但当前作业被识别为测试模式。\n"
+        "系统将继续验证 GitHub 和飞书链路，后续记录会标记为测试例外，不作为正式验收结论。"
+    )
+    try:
+        result = notify_text(config, text)
+    except WebhookNotifyError as exc:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="test_chain_notification",
+            message=str(exc),
+            level="warning",
+            extra={"status": "failed"},
+        )
+        return
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="test_chain_notification",
+        message="Test-chain exception notification sent.",
+        level="warning",
+        extra=result,
+    )
+
+
+def _maybe_notify_slow_trae(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    command: WorkerCommand,
+    result: WorkerResult,
+) -> None:
+    if not round_:
+        return
+    threshold = int(command.payload.get("slow_notify_seconds") or DEFAULT_TRAE_SLOW_NOTIFY_SECONDS)
+    elapsed = _wait_elapsed_seconds(command)
+    if elapsed < threshold:
+        return
+    already_sent = db.scalar(
+        select(RuntimeLog)
+        .where(
+            RuntimeLog.job_id == job.id,
+            RuntimeLog.round_id == round_.id,
+            RuntimeLog.stage == "trae_slow_notification",
+        )
+        .limit(1)
+    )
+    if already_sent:
+        return
+    config = load_user_settings(db, job.user_id).get("webhook", {})
+    text = (
+        "AgentOps 慢任务提醒\n"
+        f"Job: {job.id}\n"
+        f"Round: {round_.id}\n"
+        f"已等待: {elapsed // 60} 分钟\n"
+        f"当前状态: {job.status}\n"
+        "Trae 超过 30 分钟还没有完成当前任务，人工可以进入控制台暂停本轮任务或接管处理。"
+    )
+    try:
+        notify_result = notify_text(config, text)
+    except WebhookNotifyError as exc:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="trae_slow_notification",
+            message=str(exc),
+            level="warning",
+            extra={"status": "failed", "elapsed_seconds": elapsed, "threshold_seconds": threshold},
+        )
+        return
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="trae_slow_notification",
+        message="Trae has been running slowly; a Feishu webhook notification was sent.",
+        level="warning",
+        extra={"elapsed_seconds": elapsed, "threshold_seconds": threshold, **notify_result},
+    )
+
+
+def _wait_elapsed_seconds(command: WorkerCommand) -> int:
+    start_epoch = command.payload.get("sent_at_epoch") or command.payload.get("prompt_sent_at_epoch")
+    if start_epoch:
+        try:
+            return max(0, int(datetime.now(timezone.utc).timestamp() - float(start_epoch)))
+        except (TypeError, ValueError):
+            pass
+    created = command.created_at
+    if not created:
+        return 0
+    current = datetime.now(timezone.utc)
+    if created.tzinfo is None:
+        current = current.replace(tzinfo=None)
+    return max(0, int((current - created).total_seconds()))
 
 
 def _mark_manual_required(
@@ -2103,7 +2276,7 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
         db,
         job_id=job.id,
         round_id=round_.id if round_ else None,
-        stage=JobState.STOPPED,
+        stage=JobState.PAUSED if str(job.status) == str(JobState.PAUSED) else JobState.STOPPED,
         message="Worker stop command finished.",
         level="info" if result.status in {"ok", "success", "completed"} else "warning",
         extra=_result_extra(command, result),
@@ -2134,6 +2307,16 @@ def _should_ignore_worker_result(db: Session, command: WorkerCommand, result: Wo
             job,
             round_,
             "Worker result arrived after the job was already terminal; no follow-up command was queued.",
+        )
+        return True
+    if str(job.status) in {str(item) for item in PAUSED_STATES}:
+        _record_stale_worker_result(
+            db,
+            command,
+            result,
+            job,
+            round_,
+            "Worker result arrived after the job was paused; scheduler state was preserved.",
         )
         return True
     if round_ and str(round_.status) in {str(item) for item in TERMINAL_ROUND_STATES}:
@@ -2358,6 +2541,13 @@ def _prepare_feishu_fields(
         "分支/文件夹": branch_or_files,
         "日志轨迹": log_trace,
     }
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    if intent.get("run_mode") == "test":
+        fields["任务类型"] = f"测试-{fields['任务类型']}"
+        fields["不满意原因"] = (
+            f"{fields['不满意原因']}\n"
+            "测试说明：本条记录来自测试模式，用于验证 AgentOps 的 GitHub/飞书链路，不作为正式业务验收结论。"
+        ).strip()
     if attachment_paths:
         fields[FEISHU_ATTACHMENT_FIELD] = attachment_paths
     return fields
@@ -2572,9 +2762,10 @@ def _commit_message(job: Job, round_: TaskRound | None) -> str:
     if isinstance(job.directions, list) and job.directions:
         direction = str(job.directions[0]).strip()
     round_label = f"round {round_.round_index}" if round_ else "round"
+    prefix = "TEST AgentOps: " if isinstance(job.intent, dict) and job.intent.get("run_mode") == "test" else "AgentOps: "
     if direction:
-        return f"AgentOps: {direction[:80]} ({round_label})"
-    return f"AgentOps automated update ({round_label})"
+        return f"{prefix}{direction[:80]} ({round_label})"
+    return f"{prefix}automated update ({round_label})"
 
 
 def _workspace_path(command: WorkerCommand, data: dict) -> str:
