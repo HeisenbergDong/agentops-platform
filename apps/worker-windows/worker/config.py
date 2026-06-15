@@ -89,7 +89,7 @@ def _read_config_file(path: Path) -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        data = json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8-sig"))
     except json.JSONDecodeError as exc:
         raise ValueError(f"Worker config is not valid JSON: {path}") from exc
     if not isinstance(data, dict):

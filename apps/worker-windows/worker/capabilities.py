@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.3-trae-watch-parity"
+WORKER_RUNTIME_VERSION = "0.1.4-trae-trace-fallback"
 
 CAPABILITIES = [
     "auto_launch_trae",
@@ -18,6 +18,7 @@ CAPABILITIES = [
     "click_continue",
     "click_confirm",
     "copy_latest_reply",
+    "trae_local_trace_fallback",
     "capture_screenshot",
     "scan_project",
     "run_command",
