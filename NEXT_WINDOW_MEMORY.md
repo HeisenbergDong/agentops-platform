@@ -55,7 +55,35 @@ Verification passed:
 
 Deployment status:
 
-- Pending commit/push/deploy at the time this note was written.
+- Completed.
+
+Deployment completion:
+
+- Code commit: `2d6cb9b feat: add resumable pause and intent-aware test mode`, full commit `2d6cb9b14215ea007a5b1c1d66f1c01594f21cbf`.
+- Pushed to GitHub `origin/main`.
+- Uploaded deploy bundle to production:
+  - `/tmp/agentops-deploy-2d6cb9b/agentops-source-2d6cb9b.tar`
+  - `/tmp/agentops-deploy-2d6cb9b/agentops-web-dist-2d6cb9b.tar`
+- Production backup dir:
+  - `/opt/agentops-deploy-backups/20260615-184324-2d6cb9b`
+- Synced API source, rules, `NEXT_WINDOW_MEMORY.md`, and Web dist to `/opt/agentops-platform`.
+- Migration note:
+  - Production DB already had `worker_commands.lease_id` and `lease_expires_at` from bootstrap, but Alembic version was still `0009_task_round_trae_metadata`.
+  - First `alembic upgrade head` hit duplicate column on migration `0010_worker_command_leases`.
+  - Fixed by `alembic stamp 0010_worker_command_leases`, then ran `alembic upgrade head`.
+  - Final Alembic version: `0011_job_scope_text`.
+  - Confirmed production `jobs` columns include `scope_text` and `intent`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `2d6cb9b14215ea007a5b1c1d66f1c01594f21cbf`.
+
+Production verification:
+
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Homepage `http://115.190.113.8/`: `200`.
+- Web assets present:
+  - `index-CcZpy2TZ.js`
+  - `index-UTf109PN.css`
 
 ## 2026-06-15 Trae Worker Observation Fix
 
