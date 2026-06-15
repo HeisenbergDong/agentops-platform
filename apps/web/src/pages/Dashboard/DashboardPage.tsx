@@ -91,7 +91,7 @@ export function DashboardPage() {
   const logPanelRef = useRef<HTMLDivElement | null>(null);
   const [directions, setDirections] = useState("AgentOps 自动作业平台");
   const [directionsTouched, setDirectionsTouched] = useState(false);
-  const [busy, setBusy] = useState<"start" | "continue" | "stop" | "reopen" | "">("");
+  const [busy, setBusy] = useState<"start" | "testStart" | "continue" | "stop" | "reopen" | "">("");
   const current = useQuery({
     queryKey: ["current-job"],
     queryFn: async () => (await api.get<CurrentJobResponse>("/jobs/current")).data,
@@ -140,15 +140,16 @@ export function DashboardPage() {
     });
   }, [latestLogId, logs.length]);
 
-  async function runAction(action: "start" | "continue" | "stop" | "reopen") {
+  async function runAction(action: "start" | "testStart" | "continue" | "stop" | "reopen") {
     setBusy(action);
     try {
-      if (action === "start") {
+      if (action === "start" || action === "testStart") {
         const payload = {
-          directions: parseDirections(directions)
+          directions: parseDirections(directions),
+          run_mode: action === "testStart" ? "test" : "normal"
         };
         await api.post("/jobs/start", payload);
-        message.success("作业已开始");
+        message.success(action === "testStart" ? "测试作业已开始" : "作业已开始");
       }
       if (action === "reopen") {
         const payload = {
@@ -185,6 +186,16 @@ export function DashboardPage() {
       return;
     }
     void runAction("start");
+  }
+
+  function handleTestStartClick() {
+    Modal.confirm({
+      title: "测试开始？",
+      content: "本轮会按测试链路运行：提示词会收小，调度会尽量跳过 Trae 自己的耗时测试/构建，并把 GitHub、飞书记录标记为测试。",
+      okText: "测试开始",
+      cancelText: "取消",
+      onOk: () => runAction("testStart")
+    });
   }
 
   function handleReopenClick() {
@@ -233,6 +244,18 @@ export function DashboardPage() {
                   onClick={handleStartClick}
                 >
                   开始
+                </Button>
+              </span>
+            </Tooltip>
+            <Tooltip title={canStart ? "" : startDisabledReason(preflight.isLoading, preflightData, directionsList)}>
+              <span>
+                <Button
+                  icon={<PlayCircleOutlined />}
+                  loading={busy === "testStart"}
+                  disabled={!canStart}
+                  onClick={handleTestStartClick}
+                >
+                  测试开始
                 </Button>
               </span>
             </Tooltip>

@@ -186,6 +186,31 @@ def test_start_job_fallback_prompt_dispatches_worker_when_llm_fails(monkeypatch)
     assert fallback_log.level == "warning"
 
 
+def test_start_job_test_mode_forces_test_intent_and_short_prompt_policy(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class FailingLLMClient:
+        def complete(self, *_args, **_kwargs):
+            raise LLMError("LLM unavailable")
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", FailingLLMClient)
+
+    result = start_job(StartJobRequest(directions=["small hiring prototype"], run_mode="test"), user=user, db=db)
+
+    job = db.scalar(select(Job))
+    command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    assert result["job"]["intent"]["run_mode"] == "test"
+    assert job.intent["dissatisfaction_policy"] == "force_test_unsatisfied"
+    assert job.intent["downstream_policy"] == "test_chain_allowed"
+    assert job.intent["trace_gate_policy"] == "test_exception"
+    assert "skip_trae_self_tests" in job.intent["flags"]
+    assert command is not None
+    assert "不要主动执行耗时自测" in command.payload["prompt"]
+
+
 def test_job_directions_split_and_expand_to_100_round_target():
     raw = "1. 订单管理平台：客户、订单、售后\n2. 本地招聘平台：岗位、简历、服务中心"
 

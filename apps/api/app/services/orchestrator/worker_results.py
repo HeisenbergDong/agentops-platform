@@ -631,7 +631,21 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
             extra={"product_review": product_review},
         )
 
-    recommended_commands = _recommended_commands(result.data)
+    recommended_commands = [] if _test_mode_skips_trae_self_tests(job) else _recommended_commands(result.data)
+    if _test_mode_skips_trae_self_tests(job):
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.PRODUCT_REVIEWING,
+            message="Test mode skipped project self-test/build commands so the chain can validate GitHub and Feishu faster.",
+            level="info",
+            extra={
+                "run_mode": "test",
+                "skipped_recommended_commands": _recommended_commands(result.data),
+                "policy": "skip_trae_self_tests",
+            },
+        )
     if recommended_commands:
         review_command = _enqueue_worker_command(
             db,
@@ -1984,6 +1998,11 @@ def _test_chain_allowed(job: Job) -> bool:
         and intent.get("downstream_policy") == "test_chain_allowed"
         and intent.get("trace_gate_policy") == "test_exception"
     )
+
+
+def _test_mode_skips_trae_self_tests(job: Job) -> bool:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    return intent.get("run_mode") == "test" and "skip_trae_self_tests" in set(intent.get("flags") or [])
 
 
 def _apply_test_trace_exception(

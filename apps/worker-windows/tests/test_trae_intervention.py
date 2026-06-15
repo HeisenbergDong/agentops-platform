@@ -260,7 +260,7 @@ def test_click_continue_reports_typed_continue_when_no_button(monkeypatch: pytes
     monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
     monkeypatch.setattr(
         "worker.trae.intervene.diagnose_ui",
-        lambda timeout_seconds, scroll_bottom: {
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
             "state": "awaiting_continue",
             "suggested_intervention": {"mode": "continue-text", "text": "\u7ee7\u7eed"},
         },
@@ -288,7 +288,7 @@ def test_click_continue_types_continue_for_service_interruption_reason(monkeypat
     monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
     monkeypatch.setattr(
         "worker.trae.intervene.diagnose_ui",
-        lambda timeout_seconds, scroll_bottom: {
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
             "state": "idle_or_running",
             "suggested_intervention": {},
             "output_probe": {"reason": "missing_tool_trace_markers"},
@@ -317,7 +317,7 @@ def test_click_continue_rejects_idle_state_without_explicit_target(monkeypatch: 
     monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
     monkeypatch.setattr(
         "worker.trae.intervene.diagnose_ui",
-        lambda timeout_seconds, scroll_bottom: {
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
             "state": "idle_or_running",
             "suggested_intervention": {},
             "output_probe": {"reason": "missing_tool_trace_markers"},
@@ -368,7 +368,7 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
     monkeypatch.setattr(
         wait_module,
         "diagnose_ui",
-        lambda timeout_seconds, scroll_bottom: {
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
             "state": "awaiting_continue",
             "suggested_intervention": {"mode": "continue-text", "text": "\u7ee7\u7eed"},
         },
@@ -421,7 +421,7 @@ def test_wait_completion_intervenes_on_pending_ui_before_local_turn_completes(mo
 
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
 
-    def fake_diagnose(timeout_seconds, scroll_bottom):
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
         diagnosis_calls["count"] += 1
         if diagnosis_calls["count"] <= 2:
             return {
@@ -475,7 +475,7 @@ def test_wait_completion_accepts_completed_turn_with_pending_keep_text(monkeypat
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
 
-    def fake_diagnose(timeout_seconds, scroll_bottom):
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
         diagnosis_calls["count"] += 1
         return {"state": "awaiting_keep", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
 
@@ -520,7 +520,7 @@ def test_wait_completion_prioritizes_service_interruption_before_visible_buttons
 
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
 
-    def fake_diagnose(timeout_seconds, scroll_bottom):
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
         diagnosis_calls["count"] += 1
         return {"state": "awaiting_keep", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
 
@@ -562,7 +562,7 @@ def test_wait_completion_keeps_observing_window_chrome_only_text(monkeypatch: py
         now["value"] += max(seconds, 0.1)
 
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
-    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom, **_kwargs: {"state": "idle_or_running"})
 
     with pytest.raises(wait_module.TraeAutomationError) as exc:
         wait_module.wait_completion(
@@ -593,7 +593,7 @@ def test_wait_completion_keeps_observing_restored_window_chrome_text(monkeypatch
         now["value"] += max(seconds, 0.1)
 
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
-    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom, **_kwargs: {"state": "idle_or_running"})
 
     with pytest.raises(wait_module.TraeAutomationError) as exc:
         wait_module.wait_completion(
@@ -632,7 +632,7 @@ def test_wait_completion_accepts_visible_task_complete_text(monkeypatch: pytest.
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
 
-    def fake_diagnose(timeout_seconds, scroll_bottom):
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
         diagnosis_calls["count"] += 1
         return {"state": "idle_or_running", "suggested_intervention": {}}
 
@@ -681,7 +681,7 @@ def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch:
         now["value"] += max(seconds, 0.1)
 
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
-    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom: {"state": "idle_or_running"})
+    monkeypatch.setattr(wait_module, "diagnose_ui", lambda timeout_seconds, scroll_bottom, **_kwargs: {"state": "idle_or_running"})
 
     with pytest.raises(wait_module.TraeAutomationError) as exc:
         wait_module.wait_completion(
@@ -719,7 +719,7 @@ def test_wait_completion_diagnoses_pending_ui_before_recent_activity_when_idle_r
     def fake_sleep(seconds, cancellation_check):
         now["value"] += max(seconds, 0.1)
 
-    def fake_diagnose(timeout_seconds, scroll_bottom):
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
         diagnosis_calls["count"] += 1
         return {"state": "awaiting_execute", "suggested_intervention": {"mode": "click-point", "x": 1, "y": 2}}
 

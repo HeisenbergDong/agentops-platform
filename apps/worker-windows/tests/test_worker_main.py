@@ -188,6 +188,61 @@ def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):
     assert client.results[0]["lease_id"] == "run-1"
 
 
+def test_run_once_uploads_wait_completion_diagnostic_screenshot(tmp_path: Path):
+    screenshot = tmp_path / "diagnostic.png"
+    screenshot.write_bytes(b"png")
+    command = {
+        "command_id": "cmd1",
+        "job_id": "job1",
+        "round_id": "round1",
+        "type": "wait_completion",
+        "lease_id": "claim-1",
+        "payload": {},
+    }
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
+
+    class WaitRunner(FakeRunner):
+        def run(self, command):
+            self.ran = True
+            return {
+                "command_id": command["command_id"],
+                "worker_id": "worker-test",
+                "status": "success",
+                "message": "completed",
+                "data": {
+                    "status": "completed",
+                    "supervisor_decision": {
+                        "action": "collect_trace",
+                        "reason": "visual_completion_detected",
+                        "diagnosis": {
+                            "visual": {
+                                "screenshot": {
+                                    "path": str(screenshot),
+                                    "filename": screenshot.name,
+                                    "content_type": "image/png",
+                                }
+                            }
+                        },
+                    },
+                },
+            }
+
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=WaitRunner(), worker_settings=settings)
+
+    assert processed == 1
+    data = client.results[0]["data"]
+    assert data["diagnostic_upload_status"] == "uploaded"
+    assert data["diagnostic_server_attachment"]["kind"] == "diagnostic_screenshot"
+    assert data["supervisor_decision"]["diagnosis"]["visual"]["screenshot"]["server_attachment"]["id"] == "att1"
+
+
 def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
     assigned_root = tmp_path / "assigned-root"
     client = FakeClient(

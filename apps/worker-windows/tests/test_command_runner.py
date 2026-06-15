@@ -443,6 +443,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         workspace_path: str = "",
         sent_at_epoch: float | None = None,
         sent_at: str = "",
+        ui_analyst=None,
     ):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
@@ -456,6 +457,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         received["workspace_path"] = workspace_path
         received["sent_at_epoch"] = sent_at_epoch
         received["sent_at"] = sent_at
+        received["ui_analyst"] = callable(ui_analyst)
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
@@ -494,6 +496,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "workspace_path": str(Path("D:/work/current")),
         "sent_at_epoch": 123.5,
         "sent_at": "2026-06-13T00:00:00Z",
+        "ui_analyst": True,
     }
 
 

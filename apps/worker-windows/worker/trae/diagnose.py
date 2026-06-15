@@ -2,10 +2,11 @@ from __future__ import annotations
 
 import ctypes
 from datetime import datetime
-from typing import Any
+from typing import Any, Callable
 
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
+from worker.trae.supervisor import has_ui_completion_text
 from worker.trae.ui_locator import locate_visible_action_targets, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
@@ -62,7 +63,12 @@ TERMINAL_DEFAULT_INPUT = "y"
 SERVICE_RECOVERY_REASONS = {"awaiting_continuation", "service_interrupted"}
 
 
-def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> dict:
+def diagnose_ui(
+    timeout_seconds: float = 10.0,
+    scroll_bottom: bool = True,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    task: str = "find_reply_action_button",
+) -> dict:
     focus_trae(timeout_seconds=timeout_seconds)
     window = find_trae_window(timeout_seconds=timeout_seconds)
     scroll_result = scroll_assistant_to_bottom(window) if scroll_bottom else {}
@@ -87,7 +93,7 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
         )
     visual = {}
     if not matches and _should_try_local_visual(text, buttons):
-        visual = _diagnose_local_visual(window_rect)
+        visual = _diagnose_local_visual(window_rect, ui_analyst=ui_analyst, task=task, window_title=window.window_text())
     output_probe = probe_trace(text)
     terminal_prompt = detect_terminal_prompt(text)
 
@@ -95,7 +101,11 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
     suggested = {}
     confidence = 0.0
     reason = ""
-    if output_probe.get("reason") == "service_interrupted":
+    if has_ui_completion_text(text) or _visual_completion_detected(visual):
+        state = "completed"
+        confidence = _completion_confidence(text, visual)
+        reason = "ui_completion_detected" if has_ui_completion_text(text) else "visual_completion_detected"
+    elif output_probe.get("reason") == "service_interrupted":
         state = "service_interrupted"
         confidence = 0.9
         suggested = {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
@@ -133,7 +143,7 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
         reason = str(output_probe.get("reason") or "")
 
     return {
-        "ok": bool(suggested),
+        "ok": bool(suggested) or state == "completed",
         "state": state,
         "confidence": confidence,
         "time": datetime.now().isoformat(),
@@ -250,7 +260,13 @@ def _should_try_local_visual(text: str, buttons: list[dict[str, Any]]) -> bool:
     return len(str(text or "").strip()) < 120
 
 
-def _diagnose_local_visual(window_rect: dict | None) -> dict[str, Any]:
+def _diagnose_local_visual(
+    window_rect: dict | None,
+    *,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    task: str = "find_reply_action_button",
+    window_title: str = "",
+) -> dict[str, Any]:
     if not window_rect:
         return {"status": "not_found", "reason": "missing_window_rect"}
     tuple_rect = (
@@ -263,10 +279,38 @@ def _diagnose_local_visual(window_rect: dict | None) -> dict[str, Any]:
         screenshot = capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
     except Exception as exc:
         return {"status": "not_found", "reason": "screenshot_failed", "error": str(exc)}
+    ai_analysis = {}
+    ai_error = ""
+    if ui_analyst and screenshot.get("path"):
+        try:
+            response = ui_analyst(
+                str(screenshot["path"]),
+                _visual_diagnosis_context(tuple_rect, window_title=window_title, task=task),
+            )
+            ai_analysis = response.get("analysis") if isinstance(response, dict) else response
+            if not isinstance(ai_analysis, dict):
+                ai_analysis = {}
+        except Exception as exc:
+            ai_error = str(exc)
+    if _analysis_is_completed(ai_analysis):
+        return {
+            "status": "completed",
+            "reason": "ai_visual_completion_detected",
+            "screenshot": screenshot,
+            "ai_analysis": ai_analysis,
+            "ai_error": ai_error,
+        }
     analysis = locate_visible_action_targets(str(screenshot.get("path") or ""), tuple_rect)
     target = target_for_action(analysis, "run_button", min_confidence=0.72)
     if not target:
-        return {"status": "not_found", "reason": analysis.get("reason") or "no_local_visual_target", "screenshot": screenshot, "analysis": analysis}
+        return {
+            "status": "not_found",
+            "reason": analysis.get("reason") or ai_error or "no_local_visual_target",
+            "screenshot": screenshot,
+            "analysis": analysis,
+            "ai_analysis": ai_analysis,
+            "ai_error": ai_error,
+        }
     ok, reason = validate_target(target, "run_button", tuple_rect, min_confidence=0.72)
     if not ok:
         return {"status": "not_found", "reason": reason, "screenshot": screenshot, "analysis": analysis}
@@ -276,6 +320,8 @@ def _diagnose_local_visual(window_rect: dict | None) -> dict[str, Any]:
         "reason": str(target.get("reason") or "local_visual_run_button"),
         "screenshot": screenshot,
         "analysis": analysis,
+        "ai_analysis": ai_analysis,
+        "ai_error": ai_error,
         "suggested_intervention": {
             "mode": "click-point",
             "action": "run",
@@ -286,6 +332,66 @@ def _diagnose_local_visual(window_rect: dict | None) -> dict[str, Any]:
             "label": target.get("label") or "",
         },
     }
+
+
+def _visual_diagnosis_context(
+    rect: tuple[int, int, int, int],
+    *,
+    window_title: str,
+    task: str,
+) -> dict[str, Any]:
+    left, top, right, bottom = rect
+    return {
+        "task": task,
+        "window": {
+            "title": window_title,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "width": max(1, right - left),
+                "height": max(1, bottom - top),
+            },
+        },
+        "allowed_completion_evidence": [
+            "left task card says task completed",
+            "assistant reply footer indicates the current turn is done",
+            "code changes tab shows a finished task with no generating indicator",
+        ],
+        "instructions": "Decide whether the current Trae task is completed, still generating, or waiting for a safe action. Return JSON only.",
+    }
+
+
+def _analysis_is_completed(analysis: dict[str, Any]) -> bool:
+    if not isinstance(analysis, dict):
+        return False
+    state = str(analysis.get("screen_state") or analysis.get("state") or "").strip()
+    action = str(analysis.get("recommended_action") or "").strip()
+    try:
+        confidence = float(analysis.get("confidence") or 0.0)
+    except (TypeError, ValueError):
+        confidence = 0.0
+    return state == "completed" and action == "collect_trace_candidate" and confidence >= 0.7
+
+
+def _visual_completion_detected(visual: dict[str, Any]) -> bool:
+    if not isinstance(visual, dict):
+        return False
+    if visual.get("status") == "completed":
+        return True
+    analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    return _analysis_is_completed(analysis)
+
+
+def _completion_confidence(text: str, visual: dict[str, Any]) -> float:
+    if has_ui_completion_text(text):
+        return 0.88
+    analysis = visual.get("ai_analysis") if isinstance(visual, dict) and isinstance(visual.get("ai_analysis"), dict) else {}
+    try:
+        return max(0.7, min(1.0, float(analysis.get("confidence") or 0.82)))
+    except (TypeError, ValueError):
+        return 0.82
 
 
 def _contains_marker(normalized: str, marker: str) -> bool:

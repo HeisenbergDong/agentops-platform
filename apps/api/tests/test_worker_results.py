@@ -682,6 +682,45 @@ def test_scan_project_with_recommended_command_queues_product_review_command():
     assert next_command.payload["remaining_commands"] == [["npm", "run", "build"]]
 
 
+def test_scan_project_test_mode_skips_recommended_self_test_commands():
+    db = _test_session()
+    job, round_, command = _create_scan_project_rows(db)
+    job.intent = {"run_mode": "test", "flags": ["skip_trae_self_tests"]}
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "status": "scanned",
+                "root": "D:/work/project",
+                "recommended_commands": [["npm", "test"], ["npm", "run", "build"]],
+                "product_review": {},
+            },
+        ),
+    )
+
+    run_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.RUN_COMMAND.value))
+    browser_command = db.scalar(
+        select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value)
+    )
+    skip_log = db.scalar(
+        select(RuntimeLog).where(
+            RuntimeLog.stage == JobState.PRODUCT_REVIEWING,
+            RuntimeLog.message.like("Test mode skipped%"),
+        )
+    )
+
+    assert run_command is None
+    assert browser_command is not None
+    assert skip_log is not None
+    assert skip_log.extra["skipped_recommended_commands"] == [["npm", "test"], ["npm", "run", "build"]]
+
+
 def test_scan_project_without_commands_advances_to_browser_accepting():
     db = _test_session()
     job, round_, command = _create_scan_project_rows(db)

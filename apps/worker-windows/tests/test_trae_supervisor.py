@@ -142,7 +142,7 @@ def test_supervisor_diagnoses_idle_after_configured_quiet_period():
     assert decision["reason"] == "no_completed_turn_after_prompt_send"
 
 
-def test_supervisor_rejects_chrome_only_even_when_old_turn_completed():
+def test_supervisor_collects_trace_when_turn_completed_even_if_uia_reads_chrome_only():
     decision = decide_next_action(
         SupervisorObservation(
             latest_text="\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed",
@@ -155,8 +155,8 @@ def test_supervisor_rejects_chrome_only_even_when_old_turn_completed():
         )
     )
 
-    assert decision["action"] == "fail"
-    assert decision["reason"] == "window_chrome_only"
+    assert decision["action"] == "collect_trace"
+    assert decision["reason"] == "trae_turn_completed"
 
 
 def test_supervisor_waits_on_chrome_only_when_current_turn_not_confirmed():

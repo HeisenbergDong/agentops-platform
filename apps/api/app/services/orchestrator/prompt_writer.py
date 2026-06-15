@@ -205,7 +205,9 @@ def build_fallback_prompt(
     directions = [_current_direction(job)] if _current_direction(job) else []
     if round_.round_index > 1:
         return build_followup_fallback_prompt(job, round_, fallback_reason)
-    direction = directions[0] if directions else "做一个方便后续继续迭代的业务系统。"
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    prompt_brief = str(intent.get("prompt_brief") or "").strip()
+    direction = prompt_brief or (directions[0] if directions else "做一个方便后续继续迭代的业务系统。")
     task = _build_direction_task(direction, _select_stack(job, round_))
     prompt = _naturalize_prompt(str(task["base"]))
     quality_error = prompt_quality_error(None, job, round_, prompt)

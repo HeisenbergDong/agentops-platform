@@ -18,6 +18,8 @@ Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bott
 Dangerous actions such as delete, remove, clear, reset, discard, cancel, abandon must have risk "blocked" and recommended_action "do_not_click".
 If the model request failed with 3003 or service interruption, prefer recommended_action "type_continue" with risk "safe".
 If the assistant appears to still be generating or tools are running, use recommended_action "wait".
+If the left task card or assistant area visibly says the task is complete, and there is no visible generating spinner, terminal prompt, service error, continue prompt, or pending run/keep confirmation, classify screen_state "completed" and recommended_action "collect_trace_candidate".
+When task context asks for wait_completion_state, prefer deciding completed vs blocked vs still working over finding a click target.
 """.strip()
 
 

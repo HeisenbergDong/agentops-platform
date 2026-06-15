@@ -224,6 +224,7 @@ class CommandRunner:
             workspace_path=str(workspace_path or self.settings.workspace_root),
             sent_at_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
         )
 
     def _post_wait_progress(self, command_id: str, payload: dict[str, Any], event: dict[str, Any]) -> None:

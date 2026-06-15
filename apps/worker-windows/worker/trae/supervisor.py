@@ -85,13 +85,6 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
     ui_completion_visible = has_ui_completion_text(observation.latest_text)
 
     if gate["passed"]:
-        if observation.window_chrome_only:
-            return {
-                "action": "fail",
-                "reason": "window_chrome_only",
-                "recoverable": False,
-                **context,
-            }
         return {
             "action": "collect_trace",
             "reason": "trae_turn_completed",

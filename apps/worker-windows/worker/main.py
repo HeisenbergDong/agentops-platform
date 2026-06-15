@@ -365,7 +365,11 @@ def attach_worker_uploads(
 ) -> dict:
     command_type = str(command.get("type") or "")
     data = result.get("data") if isinstance(result, dict) else None
-    if command_type != "capture_screenshot" or not isinstance(data, dict):
+    if not isinstance(data, dict):
+        return result
+    if command_type == "wait_completion":
+        return attach_wait_diagnostic_upload(client, worker_id, command, result, data)
+    if command_type != "capture_screenshot":
         return result
     path = Path(str(data.get("path") or ""))
     if not path:
@@ -383,6 +387,57 @@ def attach_worker_uploads(
         return result
     result["data"] = {**data, "upload_status": "uploaded", "server_attachment": attachment}
     return result
+
+
+def attach_wait_diagnostic_upload(
+    client: WorkerClient,
+    worker_id: str,
+    command: dict,
+    result: dict,
+    data: dict,
+) -> dict:
+    screenshot = diagnostic_screenshot_from_wait_data(data)
+    path_text = str(screenshot.get("path") or "").strip()
+    if not path_text:
+        return result
+    path = Path(path_text)
+    try:
+        attachment = AttachmentUploader(client, worker_id).upload(
+            path,
+            "diagnostic_screenshot",
+            job_id=str(command.get("job_id") or ""),
+            round_id=str(command.get("round_id") or ""),
+            content_type=str(screenshot.get("content_type") or "image/png"),
+        )
+    except Exception as exc:
+        result["data"] = {**data, "diagnostic_upload_status": "failed", "diagnostic_upload_error": str(exc)}
+        return result
+    result["data"] = _set_diagnostic_server_attachment(data, attachment)
+    result["data"]["diagnostic_upload_status"] = "uploaded"
+    return result
+
+
+def diagnostic_screenshot_from_wait_data(data: dict) -> dict:
+    decision = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    diagnosis = decision.get("diagnosis") if isinstance(decision.get("diagnosis"), dict) else {}
+    visual = diagnosis.get("visual") if isinstance(diagnosis.get("visual"), dict) else {}
+    screenshot = visual.get("screenshot") if isinstance(visual.get("screenshot"), dict) else {}
+    return screenshot
+
+
+def _set_diagnostic_server_attachment(data: dict, attachment: dict) -> dict:
+    updated = dict(data)
+    decision = dict(updated.get("supervisor_decision") or {})
+    diagnosis = dict(decision.get("diagnosis") or {})
+    visual = dict(diagnosis.get("visual") or {})
+    screenshot = dict(visual.get("screenshot") or {})
+    screenshot["server_attachment"] = attachment
+    visual["screenshot"] = screenshot
+    diagnosis["visual"] = visual
+    decision["diagnosis"] = diagnosis
+    updated["supervisor_decision"] = decision
+    updated["diagnostic_server_attachment"] = attachment
+    return updated
 
 
 def try_auto_launch_trae(runner: Any) -> None:

@@ -59,6 +59,7 @@ RETRY_STAGE_BY_COMMAND_TYPE = {
 
 class StartJobRequest(BaseModel):
     directions: list[str]
+    run_mode: str = "normal"
 
 
 @router.post("/start")
@@ -76,7 +77,8 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
         )
     cleanup = cleanup_user_runtime_state(db, user.id)
     rule_version = active_rule_version(db)
-    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions)
+    run_mode = "test" if payload.run_mode == "test" else "normal"
+    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions, run_mode=run_mode)
     job = create_job(
         db,
         user_id=user.id,
@@ -178,7 +180,8 @@ def reopen_job(
     old_runtime_context = current_job_runtime_context(db, job)
 
     rule_version = active_rule_version(db)
-    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions)
+    run_mode = "test" if payload.run_mode == "test" else "normal"
+    intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions, run_mode=run_mode)
     round_, reset = reset_job_for_reopen(
         db,
         job,

@@ -1,5 +1,54 @@
 # AgentOps Platform Next Window Memory
 
+## 2026-06-15 Trae Completion Diagnostics and Test Start Button
+
+User request addressed in order:
+
+1. Trae visibly replied and task card showed completed, but AgentOps still could not decide the job should finish.
+2. In test flow, Trae should not be encouraged to run slow self-tests; add a dedicated test start button.
+
+Implemented locally:
+
+- Worker completion detection now accepts stronger UI evidence:
+  - `wait_completion` can pass the API visual UI analyst into local Trae diagnosis.
+  - `diagnose_ui` now treats explicit completion markers from UIA text or visual analysis as `state=completed`.
+  - Visual diagnosis includes screenshot context for `wait_completion_state` and can return `completed` with `collect_trace_candidate`.
+  - When completion is detected during supervisor intervention checks, Worker converts the decision to `collect_trace` instead of continuing to observe forever.
+- Worker diagnostic uploads:
+  - `wait_completion` diagnostic screenshot can be uploaded as `diagnostic_screenshot`.
+  - The uploaded attachment is written back into `diagnostic_server_attachment` and nested screenshot metadata for API-side review.
+- Supervisor trace collection:
+  - If the current Trae turn is locally judged completed, supervisor can collect trace even when UIA only reads window chrome; trace validation still runs later.
+- API visual analyst prompt:
+  - For Trae screenshots, if the left task card or assistant footer clearly says the task is complete and no spinner/prompt/error/continue/run state is visible, classify as `completed` with `collect_trace_candidate`.
+- Added test flow entry:
+  - Dashboard now has `测试开始`.
+  - It posts `/jobs/start` with `run_mode=test`.
+  - API `StartJobRequest` and `reopen_job` accept `run_mode`.
+  - `force_test_mode_intent` forces:
+    - `run_mode=test`
+    - `dissatisfaction_policy=force_test_unsatisfied`
+    - `downstream_policy=test_chain_allowed`
+    - `trace_gate_policy=test_exception`
+    - flags including `skip_trae_self_tests`.
+  - Prompt fallback now uses `job.intent.prompt_brief`, so test-mode short prompt survives even if the LLM prompt writer is unavailable.
+  - In test mode, scan-project handling skips Trae-recommended slow self-test/build commands and goes to lightweight browser/GitHub/Feishu chain validation.
+
+Verification passed:
+
+- API full suite: `113 passed, 3 warnings`.
+- Windows Worker full suite: `126 passed, 4 warnings`.
+- Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
+- Worker package build: `apps/worker-windows/scripts/build_worker.ps1` passed and produced:
+  - `apps/worker-windows/dist/agentops-worker.exe`
+  - `apps/worker-windows/dist/agentops-worker-windows/agentops-worker.exe`
+  - `apps/worker-windows/dist/agentops-worker-windows.zip`
+- Note: first Worker package build with `-Clean` was blocked by two old local `agentops-worker.exe` processes holding `dist`; stopped those processes and rebuilt without `-Clean` successfully.
+
+Deployment status:
+
+- Pending commit, push, and production deployment in this same turn.
+
 ## 2026-06-15 Pause, Scope, Intent, Test Mode, and Notification Fix
 
 User request addressed in order:

@@ -49,6 +49,7 @@ def wait_completion(
     workspace_path: str = "",
     sent_at_epoch: float | None = None,
     sent_at: str = "",
+    ui_analyst: Callable[[str, dict], dict] | None = None,
 ) -> dict:
     focus_trae(timeout_seconds=min(10.0, timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
@@ -99,6 +100,7 @@ def wait_completion(
                     latest_text=latest_text,
                     interventions=interventions,
                     timeout_seconds=timeout_seconds,
+                    ui_analyst=ui_analyst,
                 )
                 if outcome.get("status") == "completed":
                     return outcome
@@ -176,6 +178,7 @@ def wait_completion(
                 latest_text=latest_text,
                 interventions=interventions,
                 timeout_seconds=timeout_seconds,
+                ui_analyst=ui_analyst,
             )
             if outcome.get("status") == "completed":
                 return outcome
@@ -392,6 +395,7 @@ def _handle_supervisor_decision(
     latest_text: str,
     interventions: list[dict],
     timeout_seconds: float,
+    ui_analyst: Callable[[str, dict], dict] | None = None,
 ) -> dict:
     action = str(decision.get("action") or "wait")
     if action == "collect_trace":
@@ -420,9 +424,26 @@ def _handle_supervisor_decision(
         intervention = _try_auto_intervention(
             reason=reason,
             timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+            ui_analyst=ui_analyst,
         )
         intervention["supervisor_action"] = action
         intervention["supervisor_reason"] = str(decision.get("reason") or "")
+        if intervention.get("status") == "completed":
+            completion_decision = {
+                **decision,
+                "action": "collect_trace",
+                "reason": str(intervention.get("reason") or "visual_completion_detected"),
+                "diagnosis": intervention.get("diagnosis") or {},
+            }
+            return _completed_result(
+                stable_seconds=stable_seconds,
+                latest_text=latest_text,
+                output_probe=decision.get("output_probe") or {},
+                turn_probe=decision.get("turn_probe") or {},
+                gate=decision.get("completion_gate") or {},
+                interventions=interventions,
+                supervisor_decision=completion_decision,
+            )
         if intervention.get("status") == "skipped":
             return {
                 "status": "waiting",
@@ -499,15 +520,31 @@ def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], No
     cancellation_check()
 
 
-def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
+def _try_auto_intervention(
+    reason: str,
+    timeout_seconds: float,
+    ui_analyst: Callable[[str, dict], dict] | None = None,
+) -> dict:
     try:
-        diagnosis = diagnose_ui(timeout_seconds=timeout_seconds, scroll_bottom=True)
+        diagnosis = diagnose_ui(
+            timeout_seconds=timeout_seconds,
+            scroll_bottom=True,
+            ui_analyst=ui_analyst,
+            task="wait_completion_state",
+        )
     except Exception as exc:
         return {
             "status": "failed",
             "reason": reason,
             "error": str(exc),
             "diagnosis_state": "",
+        }
+    if isinstance(diagnosis, dict) and diagnosis.get("state") == "completed":
+        return {
+            "status": "completed",
+            "reason": str(diagnosis.get("reason") or "visual_completion_detected"),
+            "diagnosis_state": "completed",
+            "diagnosis": _compact_diagnosis(diagnosis),
         }
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
     if reason == "service_interrupted":
@@ -519,6 +556,7 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
             "status": "skipped",
             "reason": reason,
             "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
+            "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
         }
     try:
         result = apply_intervention(suggested, timeout_seconds=timeout_seconds)
@@ -529,6 +567,7 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
             "suggested_intervention": suggested,
             "error": str(exc),
             "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
+            "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
         }
     return {
         "status": result.get("status") or "attempted",
@@ -536,4 +575,30 @@ def _try_auto_intervention(reason: str, timeout_seconds: float) -> dict:
         "suggested_intervention": suggested,
         "result": result,
         "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
+        "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
     }
+
+
+def _compact_diagnosis(diagnosis: dict[str, object]) -> dict[str, object]:
+    visual = diagnosis.get("visual") if isinstance(diagnosis.get("visual"), dict) else {}
+    screenshot = visual.get("screenshot") if isinstance(visual.get("screenshot"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    result = {
+        "ok": bool(diagnosis.get("ok")),
+        "state": str(diagnosis.get("state") or ""),
+        "confidence": diagnosis.get("confidence") or 0.0,
+        "reason": str(diagnosis.get("reason") or ""),
+        "text_chars": diagnosis.get("text_chars") or 0,
+        "button_count": diagnosis.get("button_count") or 0,
+        "output_probe": diagnosis.get("output_probe") or {},
+        "terminal_prompt": diagnosis.get("terminal_prompt") or {},
+        "suggested_intervention": diagnosis.get("suggested_intervention") or {},
+        "visual": {
+            "status": visual.get("status") or "",
+            "reason": visual.get("reason") or "",
+            "screenshot": screenshot,
+            "ai_analysis": ai_analysis,
+            "ai_error": visual.get("ai_error") or "",
+        },
+    }
+    return result
