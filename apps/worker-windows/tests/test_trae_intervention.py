@@ -1,8 +1,10 @@
 import pytest
+from PIL import Image, ImageDraw
 
 from worker.trae import wait as wait_module
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.intervene import TraeAutomationError, apply_intervention, click_continue
+from worker.trae.ui_locator import locate_visible_action_targets, target_for_action
 
 
 def _watcher_observation(recent: bool = False) -> dict:
@@ -157,6 +159,76 @@ def test_diagnose_ui_detects_terminal_prompt(monkeypatch: pytest.MonkeyPatch):
 
     assert result["state"] == "awaiting_terminal_input"
     assert result["suggested_intervention"]["text"] == "y"
+
+
+def test_local_vision_finds_high_risk_run_button(tmp_path):
+    path = tmp_path / "trae-risk-card.png"
+    image = Image.new("RGB", (1920, 1032), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rounded_rectangle((300, 356, 722, 608), radius=8, fill=(48, 49, 52), outline=(120, 120, 126))
+    draw.rounded_rectangle((300, 528, 722, 608), radius=8, fill=(80, 58, 35))
+    draw.rounded_rectangle((380, 498, 430, 528), radius=4, fill=(226, 228, 232))
+    draw.rounded_rectangle((442, 498, 650, 528), radius=4, fill=(226, 228, 232))
+    draw.rounded_rectangle((662, 498, 709, 528), radius=4, fill=(240, 243, 248))
+    image.save(path)
+
+    analysis = locate_visible_action_targets(path, (0, 0, 1920, 1032))
+    target = target_for_action(analysis, "run_button", min_confidence=0.72)
+
+    assert analysis["status"] == "found"
+    assert target is not None
+    assert target["center"]["x"] > 640
+    assert 490 <= target["center"]["y"] <= 540
+
+
+def test_diagnose_ui_uses_local_visual_when_webview_buttons_are_hidden(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    screenshot = tmp_path / "trae-risk-card.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "\u6700\u5c0f\u5316\n\u5173\u95ed")
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.locate_visible_action_targets",
+        lambda path, rect: {
+            "status": "found",
+            "targets": [
+                {
+                    "action": "run_button",
+                    "center": {"x": 685, "y": 512},
+                    "ratio": {"x": 0.3568, "y": 0.4961},
+                    "confidence": 0.86,
+                    "risk": "safe",
+                    "reason": "high-risk command confirmation card",
+                }
+            ],
+        },
+    )
+
+    result = diagnose_ui()
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_run"
+    assert result["suggested_intervention"]["mode"] == "click-point"
+    assert result["suggested_intervention"]["action"] == "run"
 
 
 def test_apply_intervention_rejects_unknown_mode():
@@ -626,7 +698,7 @@ def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch:
     assert "did not become stable" in str(exc.value)
 
 
-def test_wait_completion_does_not_diagnose_pending_ui_while_recent_activity(monkeypatch: pytest.MonkeyPatch):
+def test_wait_completion_diagnoses_pending_ui_before_recent_activity_when_idle_ready(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass
 
@@ -654,13 +726,18 @@ def test_wait_completion_does_not_diagnose_pending_ui_while_recent_activity(monk
     monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
     monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
 
+    def fake_apply(intervention, timeout_seconds):
+        return {"status": "applied"}
+
+    monkeypatch.setattr(wait_module, "apply_intervention", fake_apply)
+
     with pytest.raises(wait_module.TraeAutomationError):
         wait_module.wait_completion(
             timeout_seconds=2,
             stable_seconds=0.5,
             poll_interval_seconds=0.5,
-            intervention_idle_seconds=100,
+            intervention_idle_seconds=0.5,
             max_interventions=1,
         )
 
-    assert diagnosis_calls["count"] == 0
+    assert diagnosis_calls["count"] == 1

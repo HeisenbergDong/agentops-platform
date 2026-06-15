@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import os
+import re
 import time
 from datetime import datetime
 from pathlib import Path
@@ -45,10 +46,21 @@ MEANINGFUL_LOG_MARKERS = (
 )
 NOISY_LOG_MARKERS = (
     "checkRunCommandStatus",
+    "ckg",
     "getDynamicConfig",
     "getExperiment",
+    "get_detail_param",
+    "model info",
+    "model_list",
+    "model list",
+    "model_list_by_function",
+    "refresh_token",
+    "successfully synced model info",
+    "sync model",
+    "syncwait",
     "telemetry",
 )
+TIMESTAMP_PATTERN = re.compile(r"(?P<ts>\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}:\d{2}(?:\.\d+)?(?:Z|[+-]\d{2}:?\d{2})?)")
 
 
 def activity_snapshot(
@@ -57,12 +69,12 @@ def activity_snapshot(
     quiet_seconds: float,
 ) -> dict[str, Any]:
     project_mtime, project_file = newest_mtime_under(project_path)
-    log_mtime, log_file = newest_agent_log_mtime()
+    log_tail = filtered_agent_log_tail()
     return _activity_from_sources(
         project_mtime=project_mtime,
         project_file=project_file,
-        log_mtime=log_mtime,
-        log_file=log_file,
+        log_mtime=float(log_tail.get("activity_mtime") or 0.0),
+        log_file=str(log_tail.get("path") or ""),
         started_at_epoch=started_at_epoch,
         quiet_seconds=quiet_seconds,
     )
@@ -139,17 +151,27 @@ def filtered_agent_log_tail(max_lines: int = 160) -> dict[str, Any]:
             "error": str(exc),
         }
 
+    raw_lines = text.splitlines()[-4000:]
     lines: list[str] = []
-    for line in text.splitlines()[-4000:]:
-        if any(marker in line for marker in NOISY_LOG_MARKERS):
+    latest_meaningful_epoch = 0.0
+    latest_meaningful_index = -1
+    for index, line in enumerate(raw_lines):
+        if _is_noisy_log_line(line):
             continue
-        if any(marker in line for marker in MEANINGFUL_LOG_MARKERS):
+        if _is_meaningful_log_line(line):
             lines.append(line[-900:])
+            latest_meaningful_index = index
+            latest_meaningful_epoch = _timestamp_from_log_line(line) or latest_meaningful_epoch
     lines = lines[-max(1, int(max_lines or 1)) :]
     digest = hashlib.sha256("\n".join(lines).encode("utf-8", errors="replace")).hexdigest()[:16] if lines else ""
+    file_mtime = stat.st_mtime if stat else 0.0
+    activity_mtime = latest_meaningful_epoch
+    if lines and not activity_mtime and latest_meaningful_index == len(raw_lines) - 1:
+        activity_mtime = file_mtime
     return {
         "path": str(path),
-        "mtime": stat.st_mtime if stat else 0.0,
+        "mtime": file_mtime,
+        "activity_mtime": activity_mtime,
         "tail_hash": digest,
         "lines": lines,
     }
@@ -170,7 +192,7 @@ def build_trae_observation(
     activity = _activity_from_sources(
         project_mtime=project_mtime,
         project_file=project_file,
-        log_mtime=float(log_tail.get("mtime") or 0.0),
+        log_mtime=float(log_tail.get("activity_mtime") or 0.0),
         log_file=str(log_tail.get("path") or ""),
         started_at_epoch=started_at_epoch,
         quiet_seconds=quiet_seconds,
@@ -254,6 +276,29 @@ def _read_tail_text(path: Path, max_bytes: int = 1_200_000) -> str:
         handle.seek(max(0, size - max_bytes), os.SEEK_SET)
         data = handle.read()
     return data.decode("utf-8", errors="replace")
+
+
+def _is_noisy_log_line(line: str) -> bool:
+    lowered = str(line or "").lower()
+    return any(marker.lower() in lowered for marker in NOISY_LOG_MARKERS)
+
+
+def _is_meaningful_log_line(line: str) -> bool:
+    lowered = str(line or "").lower()
+    return any(marker.lower() in lowered for marker in MEANINGFUL_LOG_MARKERS)
+
+
+def _timestamp_from_log_line(line: str) -> float:
+    match = TIMESTAMP_PATTERN.search(str(line or ""))
+    if not match:
+        return 0.0
+    raw = match.group("ts").replace("Z", "+00:00")
+    if re.search(r"[+-]\d{4}$", raw):
+        raw = f"{raw[:-2]}:{raw[-2:]}"
+    try:
+        return datetime.fromisoformat(raw).timestamp()
+    except ValueError:
+        return 0.0
 
 
 def _text_hash(text: str) -> str:

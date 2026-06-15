@@ -4,7 +4,9 @@ import ctypes
 from datetime import datetime
 from typing import Any
 
+from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
+from worker.trae.ui_locator import locate_visible_action_targets, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
 ACTION_BUTTON_MARKERS = {
@@ -83,6 +85,9 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
         diagnosis_attempts.append(
             {"button_count": len(buttons), "match_count": len(matches), "scroll": extra_scroll},
         )
+    visual = {}
+    if not matches and _should_try_local_visual(text, buttons):
+        visual = _diagnose_local_visual(window_rect)
     output_probe = probe_trace(text)
     terminal_prompt = detect_terminal_prompt(text)
 
@@ -106,6 +111,12 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
             "y": best["button"].get("center_y"),
             "button": best["button"].get("name") or "",
         }
+    elif visual.get("suggested_intervention"):
+        target = visual["suggested_intervention"]
+        state = "awaiting_run"
+        confidence = float(target.get("confidence") or 0.0)
+        suggested = target
+        reason = str(visual.get("reason") or "local_visual_action_target")
     elif terminal_prompt:
         state = "awaiting_terminal_input"
         confidence = terminal_prompt["confidence"]
@@ -134,6 +145,7 @@ def diagnose_ui(timeout_seconds: float = 10.0, scroll_bottom: bool = True) -> di
         "button_count": len(buttons),
         "buttons": buttons[:40],
         "matches": matches[:8],
+        "visual": visual,
         "diagnosis_attempts": diagnosis_attempts,
         "terminal_prompt": terminal_prompt,
         "scroll_bottom": scroll_result,
@@ -232,6 +244,48 @@ def _action_matches(buttons: list[dict[str, Any]], window_rect: dict | None) -> 
         matches.append(match)
     matches.sort(key=lambda item: (item["priority"], item["confidence"], int(item["button"].get("center_y") or 0)), reverse=True)
     return matches
+
+
+def _should_try_local_visual(text: str, buttons: list[dict[str, Any]]) -> bool:
+    return len(str(text or "").strip()) < 120
+
+
+def _diagnose_local_visual(window_rect: dict | None) -> dict[str, Any]:
+    if not window_rect:
+        return {"status": "not_found", "reason": "missing_window_rect"}
+    tuple_rect = (
+        int(window_rect.get("left") or 0),
+        int(window_rect.get("top") or 0),
+        int(window_rect.get("right") or 0),
+        int(window_rect.get("bottom") or 0),
+    )
+    try:
+        screenshot = capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
+    except Exception as exc:
+        return {"status": "not_found", "reason": "screenshot_failed", "error": str(exc)}
+    analysis = locate_visible_action_targets(str(screenshot.get("path") or ""), tuple_rect)
+    target = target_for_action(analysis, "run_button", min_confidence=0.72)
+    if not target:
+        return {"status": "not_found", "reason": analysis.get("reason") or "no_local_visual_target", "screenshot": screenshot, "analysis": analysis}
+    ok, reason = validate_target(target, "run_button", tuple_rect, min_confidence=0.72)
+    if not ok:
+        return {"status": "not_found", "reason": reason, "screenshot": screenshot, "analysis": analysis}
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    return {
+        "status": "found",
+        "reason": str(target.get("reason") or "local_visual_run_button"),
+        "screenshot": screenshot,
+        "analysis": analysis,
+        "suggested_intervention": {
+            "mode": "click-point",
+            "action": "run",
+            "x": center.get("x"),
+            "y": center.get("y"),
+            "confidence": target.get("confidence"),
+            "source": "local_vision",
+            "label": target.get("label") or "",
+        },
+    }
 
 
 def _contains_marker(normalized: str, marker: str) -> bool:

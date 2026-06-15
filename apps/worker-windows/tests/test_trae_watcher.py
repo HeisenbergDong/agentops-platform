@@ -27,9 +27,9 @@ def test_newest_mtime_under_ignores_build_artifacts(tmp_path):
 
 def test_activity_snapshot_uses_recent_agent_log(monkeypatch, tmp_path):
     log = tmp_path / "ai-agent_1_stdout.log"
-    log.write_text("main_routine completed", encoding="utf-8")
     now = 2000.0
     log_mtime = now - 4.0
+    log.write_text("1970-01-01T00:33:16+00:00 INFO main_routine completed", encoding="utf-8")
     os.utime(log, (log_mtime, log_mtime))
 
     monkeypatch.setattr(watcher.time, "time", lambda: now)
@@ -43,6 +43,31 @@ def test_activity_snapshot_uses_recent_agent_log(monkeypatch, tmp_path):
     assert result["path"] == str(log)
 
 
+def test_activity_snapshot_ignores_recent_noisy_agent_log(monkeypatch, tmp_path):
+    log = tmp_path / "ai-agent_1_stdout.log"
+    now = 2000.0
+    log.write_text(
+        "\n".join(
+            [
+                "1970-01-01T00:30:04+00:00 INFO main_routine completed",
+                "1970-01-01T00:33:16+00:00 INFO ckg refresh_token successfully synced model info",
+                "1970-01-01T00:33:17+00:00 INFO model_list_by_function forced refresh",
+            ]
+        ),
+        encoding="utf-8",
+    )
+    os.utime(log, (now - 1.0, now - 1.0))
+
+    monkeypatch.setattr(watcher.time, "time", lambda: now)
+    monkeypatch.setattr(watcher, "latest_agent_log_path", lambda: log)
+
+    result = watcher.activity_snapshot(None, started_at_epoch=now - 300.0, quiet_seconds=30)
+
+    assert result["recent"] is False
+    assert result["source"] == "agent_log"
+    assert result["quiet_seconds"] == 196.0
+
+
 def test_filtered_agent_log_tail_keeps_meaningful_lines(monkeypatch, tmp_path):
     log = tmp_path / "ai-agent_1_stdout.log"
     log.write_text(
@@ -50,6 +75,7 @@ def test_filtered_agent_log_tail_keeps_meaningful_lines(monkeypatch, tmp_path):
             [
                 "checkRunCommandStatus noisy",
                 "toolcall_name: edit status: success",
+                "model_list_by_function noisy",
                 "plain heartbeat",
                 "chat_turn_finish completed",
             ]

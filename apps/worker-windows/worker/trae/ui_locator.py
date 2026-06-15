@@ -132,7 +132,33 @@ def validate_target(
             return False, "prompt_input_outside_expected_region"
         if action == "send_button" and not (0.20 <= rx <= 0.55 and 0.75 <= ry <= 0.99):
             return False, "send_button_outside_expected_region"
+        if action in {"run_button", "confirm_button", "continue_button"} and not (0.0 <= rx <= 0.45 and 0.12 <= ry <= 0.92):
+            return False, "assistant_action_outside_expected_region"
     return True, "ok"
+
+
+def locate_visible_action_targets(
+    screenshot_path: str | Path,
+    window_rect: tuple[int, int, int, int] | None,
+) -> dict[str, Any]:
+    targets: list[dict[str, Any]] = []
+    if not window_rect:
+        return {"status": "not_found", "method": "local_vision", "targets": targets, "reason": "missing_window_rect"}
+    try:
+        image = Image.open(screenshot_path).convert("RGB")
+    except Exception as exc:
+        return {"status": "not_found", "method": "local_vision", "targets": targets, "reason": f"unreadable_image:{exc}"}
+
+    run_target = _find_run_confirmation_button(image, window_rect)
+    if run_target:
+        targets.append(run_target)
+    status = "found" if targets else "not_found"
+    return {
+        "status": status,
+        "method": "local_vision",
+        "targets": targets,
+        "reason": "ok" if targets else "no_action_targets_detected",
+    }
 
 
 def _find_prompt_input_area(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any]:
@@ -183,6 +209,110 @@ def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int
         "local_vision",
         "green send button cluster in composer area",
     )
+
+
+def _find_run_confirmation_button(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any] | None:
+    left, top, right, bottom = window_rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    chat_left = 0
+    chat_right = min(image.width, int(width * 0.45))
+    scan_top = int(height * 0.24)
+    scan_bottom = min(image.height, int(height * 0.74))
+    if chat_right - chat_left < 120 or scan_bottom - scan_top < 80:
+        return None
+
+    pixels = image.load()
+    brown_pixels = 0
+    button_pixels: list[tuple[int, int]] = []
+    for y in range(scan_top, scan_bottom, 2):
+        for x in range(chat_left, chat_right, 2):
+            red, green, blue = pixels[x, y]
+            if 55 <= red <= 115 and 38 <= green <= 85 and 20 <= blue <= 65 and red > blue + 15:
+                brown_pixels += 1
+            if _looks_like_light_button_pixel(red, green, blue):
+                button_pixels.append((x, y))
+    if brown_pixels < 30:
+        return None
+
+    clusters = _light_button_clusters(button_pixels, min_points=18)
+    if not clusters:
+        return None
+    rightmost = max(clusters, key=lambda item: (item["cx"], item["points"]))
+    if rightmost["max_x"] - rightmost["min_x"] > 90:
+        right_edge = _cluster_summary(
+            [(x, y) for x, y in button_pixels if rightmost["max_x"] - 58 <= x <= rightmost["max_x"]],
+            min_points=12,
+        )
+        if right_edge:
+            rightmost = right_edge
+    cluster_width = rightmost["max_x"] - rightmost["min_x"]
+    cluster_height = rightmost["max_y"] - rightmost["min_y"]
+    if cluster_width < 24 or cluster_height < 16:
+        return None
+    x = left + int(rightmost["cx"])
+    y = top + int(rightmost["cy"])
+    confidence = 0.78
+    if brown_pixels >= 90 and cluster_width >= 38:
+        confidence = 0.86
+    return _target(
+        "run_button",
+        x,
+        y,
+        window_rect,
+        confidence,
+        "local_vision",
+        "high-risk command confirmation card with rightmost light action button",
+    )
+
+
+def _looks_like_light_button_pixel(red: int, green: int, blue: int) -> bool:
+    avg = (red + green + blue) / 3
+    spread = max(red, green, blue) - min(red, green, blue)
+    return 198 <= avg <= 248 and spread <= 35
+
+
+def _light_button_clusters(points: list[tuple[int, int]], min_points: int) -> list[dict[str, Any]]:
+    if not points:
+        return []
+    clusters: list[dict[str, Any]] = []
+    current: list[tuple[int, int]] = []
+    last_x = -9999
+    for x, y in sorted(points):
+        if current and x - last_x > 8:
+            cluster = _cluster_summary(current, min_points)
+            if cluster:
+                clusters.append(cluster)
+            current = []
+        current.append((x, y))
+        last_x = x
+    if current:
+        cluster = _cluster_summary(current, min_points)
+        if cluster:
+            clusters.append(cluster)
+    return clusters
+
+
+def _cluster_summary(points: list[tuple[int, int]], min_points: int) -> dict[str, Any] | None:
+    if len(points) < min_points:
+        return None
+    min_x = min(x for x, _y in points)
+    max_x = max(x for x, _y in points)
+    min_y = min(y for _x, y in points)
+    max_y = max(y for _x, y in points)
+    width = max_x - min_x
+    height = max_y - min_y
+    if width < 20 or height < 12:
+        return None
+    return {
+        "min_x": min_x,
+        "max_x": max_x,
+        "min_y": min_y,
+        "max_y": max_y,
+        "cx": sum(x for x, _y in points) / len(points),
+        "cy": sum(y for _x, y in points) / len(points),
+        "points": len(points),
+    }
 
 
 def _ratio_target(

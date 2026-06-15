@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.4-trae-trace-fallback"
+WORKER_VERSION = "0.1.5-trae-run-vision"
 
 
 class WorkerSettings(BaseSettings):

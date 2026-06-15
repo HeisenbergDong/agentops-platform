@@ -13,12 +13,16 @@ RECOVERABLE_TURN_REASONS = {
 PENDING_INTERVENTION_MARKERS = (
     "\u53d8\u66f4\u5df2\u5b8c\u6210",
     "\u8bf7\u786e\u8ba4\u662f\u5426",
+    "\u68c0\u6d4b\u5230\u9ad8\u98ce\u9669\u547d\u4ee4",
     "\u4fdd\u7559",
     "\u4fdd\u7559\u53d8\u66f4",
     "\u4fdd\u5b58",
     "\u786e\u8ba4\u6267\u884c",
     "\u7ee7\u7eed\u6267\u884c",
     "\u4ecd\u8981\u8fd0\u884c",
+    "\u8fd0\u884c\u547d\u4ee4\u53ef\u80fd\u4f1a\u5e26\u6765\u4e25\u91cd\u540e\u679c",
+    "\u662f\u5426\u4ecd\u8981\u5728\u6c99\u7bb1\u4e2d\u8fd0\u884c",
+    "\u662f\u5426\u4ecd\u8981\u8fd0\u884c",
     "\u662f\u5426\u7ee7\u7eed",
     "Keep",
     "Keep Changes",
@@ -135,29 +139,8 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             **context,
         }
 
-    if observation.recent_activity:
-        return {
-            "action": "wait",
-            "reason": "recent_trae_activity",
-            "recoverable": True,
-            **context,
-        }
-
-    if observation.window_chrome_only:
-        return {
-            "action": "wait",
-            "reason": "window_chrome_only",
-            "recoverable": True,
-            **context,
-        }
-
     if gate.get("reason") == "pending_intervention_visible":
-        idle_ready = (
-            observation.intervention_idle_seconds > 0
-            and observation.idle_seconds >= observation.intervention_idle_seconds
-            and observation.intervention_count < observation.max_interventions
-            and not observation.busy
-        )
+        idle_ready = _idle_ready(observation)
         if not idle_ready:
             return {
                 "action": "wait",
@@ -179,13 +162,31 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             **context,
         }
 
+    if observation.window_chrome_only:
+        if _idle_ready(observation):
+            return {
+                "action": "diagnose_idle",
+                "reason": "window_chrome_only",
+                "recoverable": True,
+                **context,
+            }
+        return {
+            "action": "wait",
+            "reason": "window_chrome_only",
+            "recoverable": True,
+            **context,
+        }
+
+    if observation.recent_activity:
+        return {
+            "action": "wait",
+            "reason": "recent_trae_activity",
+            "recoverable": True,
+            **context,
+        }
+
     if gate.get("recoverable"):
-        idle_ready = (
-            observation.intervention_idle_seconds > 0
-            and observation.idle_seconds >= observation.intervention_idle_seconds
-            and observation.intervention_count < observation.max_interventions
-            and not observation.busy
-        )
+        idle_ready = _idle_ready(observation)
         if idle_ready:
             return {
                 "action": "diagnose_idle",
@@ -258,3 +259,12 @@ def has_pending_intervention_text(text: str) -> bool:
 def has_ui_completion_text(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(marker.lower() in lowered for marker in UI_COMPLETION_MARKERS)
+
+
+def _idle_ready(observation: SupervisorObservation) -> bool:
+    return (
+        observation.intervention_idle_seconds > 0
+        and observation.idle_seconds >= observation.intervention_idle_seconds
+        and observation.intervention_count < observation.max_interventions
+        and not observation.busy
+    )

@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.4-trae-trace-fallback"
+WORKER_RUNTIME_VERSION = "0.1.5-trae-run-vision"
 
 CAPABILITIES = [
     "auto_launch_trae",

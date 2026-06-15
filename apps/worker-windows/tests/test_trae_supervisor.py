@@ -49,14 +49,36 @@ def test_supervisor_applies_pending_ui_only_when_turn_is_not_completed():
     assert decision["completion_gate"]["reason"] == "pending_intervention_visible"
 
 
-def test_supervisor_waits_on_recent_activity_before_pending_ui():
+def test_supervisor_pending_ui_beats_recent_activity_when_idle_ready():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+            idle_seconds=31,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            recent_activity=True,
+            activity_source="agent_log",
+            activity_quiet_seconds=2.4,
+            log_tail_hash="abc123",
+        )
+    )
+
+    assert decision["action"] == "apply_pending_ui"
+    assert decision["reason"] == "pending_intervention_visible"
+    assert decision["activity_summary"]["recent"] is True
+    assert decision["activity_summary"]["source"] == "agent_log"
+
+
+def test_supervisor_waits_on_pending_ui_until_idle_ready_even_with_recent_activity():
     decision = decide_next_action(
         SupervisorObservation(
             latest_text="\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation",
             output_probe={"reason": "missing_tool_trace_markers"},
             turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
             idle_seconds=15,
-            intervention_idle_seconds=300,
+            intervention_idle_seconds=30,
             max_interventions=3,
             recent_activity=True,
             activity_source="agent_log",
@@ -66,9 +88,7 @@ def test_supervisor_waits_on_recent_activity_before_pending_ui():
     )
 
     assert decision["action"] == "wait"
-    assert decision["reason"] == "recent_trae_activity"
-    assert decision["activity_summary"]["recent"] is True
-    assert decision["activity_summary"]["source"] == "agent_log"
+    assert decision["reason"] == "pending_intervention_visible"
 
 
 def test_supervisor_recovers_3003_even_with_recent_activity():
@@ -146,13 +166,30 @@ def test_supervisor_waits_on_chrome_only_when_current_turn_not_confirmed():
             output_probe={"reason": "missing_tool_trace_markers"},
             turn_probe={"status": "missing", "reason": "current_turn_missing"},
             window_chrome_only=True,
-            idle_seconds=31,
+            idle_seconds=15,
             intervention_idle_seconds=30,
             max_interventions=3,
         )
     )
 
     assert decision["action"] == "wait"
+    assert decision["reason"] == "window_chrome_only"
+
+
+def test_supervisor_diagnoses_chrome_only_after_idle_threshold():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "awaiting_current_continuation"},
+            window_chrome_only=True,
+            idle_seconds=31,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+        )
+    )
+
+    assert decision["action"] == "diagnose_idle"
     assert decision["reason"] == "window_chrome_only"
 
 
