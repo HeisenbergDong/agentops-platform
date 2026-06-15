@@ -35,6 +35,9 @@ def test_stop_current_task_cleans_workspace_processes(monkeypatch: pytest.Monkey
 
     monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
     monkeypatch.setattr(command_runner, "cleanup_local_activity", fake_cleanup)
+    monkeypatch.setattr(command_runner, "_try_click_trae_stop", lambda **_kwargs: {"status": "clicked"})
+    monkeypatch.setattr(command_runner, "_stop_verification_snapshot", lambda _workspace: {"project": {"path": "a", "mtime": 1}})
+    monkeypatch.setattr(command_runner.time, "sleep", lambda _seconds: None)
 
     runner = CommandRunner(worker_id="worker-test")
     result = runner.run(
@@ -51,6 +54,10 @@ def test_stop_current_task_cleans_workspace_processes(monkeypatch: pytest.Monkey
     assert result["status"] == "success"
     assert result["data"]["stopped"] is True
     assert result["data"]["cleanup"]["killed"][0]["pid"] == 1234
+    assert result["data"]["stop_report"]["trae_stop_clicked"] is True
+    assert result["data"]["stop_report"]["requires_resume_prompt"] is True
+    assert result["data"]["stop_report"]["sandbox_killed"] == 1
+    assert result["data"]["stop_report"]["trae_ui_stopped_verified"] is True
     assert cleaned == {"workspace_path": workspace, "project_name": "demo-project", "kill_trae": False}
 
 

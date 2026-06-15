@@ -36,6 +36,7 @@ from app.services.user_settings import load_user_settings
 from app.services.orchestrator.worker_dispatch import (
     WorkerDispatchError,
     dispatch_prompt_to_worker,
+    ensure_round_project_context,
     mark_worker_dispatch_failed,
 )
 from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType
@@ -334,6 +335,12 @@ def continue_job(
             )
         previous = latest_resumable_worker_command(db, job.id, round_.id if round_ else None)
         if previous:
+            stop_command = latest_stop_worker_command(db, job.id, round_.id if round_ else None)
+            if _stop_requires_resume_prompt(stop_command):
+                _queue_resume_after_trae_stop(db, user, job, round_, previous, stop_command)
+                db.commit()
+                db.refresh(job)
+                return serialize_job(db, job)
             _resume_worker_command(db, user, job, round_, previous)
             db.commit()
             db.refresh(job)
@@ -700,6 +707,109 @@ def latest_resumable_worker_command(db: Session, job_id: str, round_id: str | No
     if round_id:
         query = query.where(WorkerCommand.round_id == round_id)
     return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def latest_stop_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
+    query = select(WorkerCommand).where(
+        WorkerCommand.job_id == job_id,
+        WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value,
+    )
+    if round_id:
+        query = query.where(WorkerCommand.round_id == round_id)
+    return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def _stop_requires_resume_prompt(command: WorkerCommand | None) -> bool:
+    if not command or command.status != "completed":
+        return False
+    result = command.result if isinstance(command.result, dict) else {}
+    data = result.get("data") if isinstance(result.get("data"), dict) else {}
+    report = data.get("stop_report") if isinstance(data.get("stop_report"), dict) else {}
+    return bool(report.get("requires_resume_prompt") or report.get("trae_stop_clicked"))
+
+
+def _queue_resume_after_trae_stop(
+    db: Session,
+    user: User,
+    job: Job,
+    round_: TaskRound | None,
+    previous: WorkerCommand,
+    stop_command: WorkerCommand | None,
+) -> WorkerCommand:
+    if not round_:
+        raise HTTPException(status_code=400, detail="No round is available for continue.")
+    settings = load_user_settings(db, user.id)
+    worker_settings = settings.get("worker", {})
+    worker_id = str(worker_settings.get("worker_id") or "").strip()
+    worker = get_worker_by_worker_id(db, worker_id)
+    if not worker or worker.user_id != user.id:
+        raise HTTPException(status_code=400, detail="Configured worker is not available for continue.")
+    project_context = ensure_round_project_context(db, job, round_, worker_settings, settings.get("github", {}))
+    prompt = _resume_after_stop_prompt(job)
+    command = create_worker_command(
+        db,
+        worker_id=worker.worker_id,
+        user_id=user.id,
+        payload=CreateWorkerCommandRequest(
+            type=WorkerCommandType.SEND_PROMPT,
+            job_id=job.id,
+            round_id=round_.id,
+            payload={
+                "prompt": prompt,
+                "trae_workspace_path": project_context["workspace_path"],
+                "workspace_path": project_context["workspace_path"],
+                "workspace_root": project_context["workspace_root"],
+                "project_name": project_context["project_name"],
+                "project_slug": project_context["project_name"],
+                "browser_url": worker_settings.get("browser_url", ""),
+                "job_id": job.id,
+                "round_id": round_.id,
+                "round_index": round_.round_index,
+                "directions": job.directions,
+                "github_remote_url": project_context.get("github_remote_url", ""),
+                "github_repo_name": project_context["project_name"],
+                "github_branch": str(worker_settings.get("github_branch") or "main"),
+                "verify_submission": True,
+                "strict_submission_verification": True,
+                "submission_timeout_seconds": 30,
+                "resume_after_stop": True,
+                "retry_of_command_id": previous.id,
+                "stop_command_id": stop_command.id if stop_command else "",
+            },
+        ),
+    )
+    job.status = JobState.SENDING_TO_WORKER
+    round_.status = JobState.SENDING_TO_WORKER
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="resume_after_trae_stop",
+        message="Continue requested after Worker stopped Trae generation; a resume prompt was queued first.",
+        level="warning",
+        extra={
+            "previous_command_id": previous.id,
+            "stop_command_id": stop_command.id if stop_command else "",
+            "new_command_id": command.id,
+            "worker_id": worker.worker_id,
+            "prompt_preview": prompt[:160],
+        },
+    )
+    return command
+
+
+def _resume_after_stop_prompt(job: Job) -> str:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    if intent.get("run_mode") == "test":
+        return (
+            "继续刚才被暂停的测试任务，从中断处往下完成。不要重建项目，保留已有文件和结构；"
+            "本轮重点是快速完成可复查的最小结果，方便平台继续验证日志轨迹、GitHub 提交和飞书写入。"
+            "不要主动执行耗时自测、长时间构建或完整浏览器验收，完成后简短说明即可。"
+        )
+    return (
+        "继续刚才被暂停的任务，从中断处往下完成。不要重建项目，保留已有文件和结构；"
+        "补完剩余工作后简短说明完成内容、关键文件和最小验证情况。"
+    )
 
 
 def _resume_worker_command(

@@ -13,7 +13,7 @@ from worker.runtime.state import WorkerRuntimeState
 from worker.runtime.stop_cleanup import cleanup_local_activity
 from worker.safety.path_guard import assert_within_root
 from worker.trae.diagnose import diagnose_ui
-from worker.trae.intervene import click_confirm, click_continue
+from worker.trae.intervene import click_confirm, click_continue, click_stop_generation
 from worker.trae.prompt import PromptSendError, send_prompt
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.session_probe import probe_latest_trae_turn
@@ -200,14 +200,32 @@ class CommandRunner:
                 workspace_path = self._workspace_path(raw_workspace_path)
             except Exception as exc:
                 workspace_error = str(exc)
+        before = _stop_verification_snapshot(workspace_path)
+        stop_click = _try_click_trae_stop(
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None
+        )
         cleanup = cleanup_local_activity(
             workspace_path=workspace_path,
             project_name=str(payload.get("project_name") or payload.get("project_slug") or ""),
             kill_trae=bool(payload.get("kill_trae", False)),
         )
+        time.sleep(float(payload.get("stop_verify_delay_seconds") or 3.0))
+        after = _stop_verification_snapshot(workspace_path)
         if workspace_error:
             cleanup["workspace_path_error"] = workspace_error
-        return {"stopped": True, "cleanup": cleanup}
+        verification = _stop_verification_result(before, after)
+        stop_report = {
+            "worker_command_cancelled": True,
+            "trae_stop_clicked": _stop_click_applied(stop_click),
+            "trae_stop_click": stop_click,
+            "sandbox_killed": len(cleanup.get("killed") or []),
+            "cleanup_status": cleanup.get("status") or "",
+            "trae_ui_stopped_verified": verification.get("trae_ui_stopped_verified", False),
+            "still_generating_suspected": verification.get("still_generating_suspected", False),
+            "requires_resume_prompt": _stop_click_applied(stop_click),
+            "verification": verification,
+        }
+        return {"stopped": True, "cleanup": cleanup, "stop_report": stop_report}
 
     def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken, command_id: str = "") -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
@@ -420,6 +438,87 @@ def _float_or_none(value: Any) -> float | None:
         return float(value)
     except (TypeError, ValueError):
         return None
+
+
+def _try_click_trae_stop(ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
+    try:
+        return click_stop_generation(timeout_seconds=5.0, ui_analyst=ui_analyst)
+    except Exception as exc:
+        return {"status": "not_clicked", "reason": "stop_click_failed", "error": str(exc)}
+
+
+def _stop_click_applied(result: dict[str, Any]) -> bool:
+    return str(result.get("status") or "") in {"clicked", "applied"} or str(result.get("action_taken") or "").startswith("clicked")
+
+
+def _stop_verification_snapshot(workspace_path: Path | None) -> dict[str, Any]:
+    return {
+        "time": time.time(),
+        "trae_log": _latest_trae_log_snapshot(),
+        "project": _latest_project_write_snapshot(workspace_path),
+    }
+
+
+def _stop_verification_result(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
+    log_changed = _snapshot_changed(before.get("trae_log"), after.get("trae_log"))
+    project_changed = _snapshot_changed(before.get("project"), after.get("project"))
+    still_generating = bool(log_changed or project_changed)
+    return {
+        "before": before,
+        "after": after,
+        "log_tail_changed": log_changed,
+        "project_write_changed": project_changed,
+        "trae_ui_stopped_verified": not still_generating,
+        "still_generating_suspected": still_generating,
+    }
+
+
+def _snapshot_changed(before: object, after: object) -> bool:
+    if not isinstance(before, dict) or not isinstance(after, dict):
+        return False
+    before_path = str(before.get("path") or "")
+    after_path = str(after.get("path") or "")
+    if not before_path and after_path:
+        return True
+    if before_path != after_path:
+        return bool(after_path)
+    return before.get("mtime") != after.get("mtime") or before.get("size") != after.get("size")
+
+
+def _latest_trae_log_snapshot() -> dict[str, Any]:
+    root = Path.home() / "AppData" / "Roaming" / "Trae CN" / "logs"
+    try:
+        candidates = [item for item in root.rglob("*.log") if item.is_file()]
+    except Exception as exc:
+        return {"status": "unavailable", "reason": str(exc)}
+    if not candidates:
+        return {"status": "missing"}
+    latest = max(candidates, key=lambda item: item.stat().st_mtime)
+    stat = latest.stat()
+    return {"status": "found", "path": str(latest), "mtime": stat.st_mtime, "size": stat.st_size}
+
+
+def _latest_project_write_snapshot(workspace_path: Path | None) -> dict[str, Any]:
+    if not workspace_path or not workspace_path.exists():
+        return {"status": "missing"}
+    ignored = {".git", "node_modules", ".venv", "dist", "build", "__pycache__"}
+    latest_path = None
+    latest_mtime = 0.0
+    try:
+        for item in workspace_path.rglob("*"):
+            if any(part in ignored for part in item.parts):
+                continue
+            if not item.is_file():
+                continue
+            mtime = item.stat().st_mtime
+            if mtime > latest_mtime:
+                latest_mtime = mtime
+                latest_path = item
+    except Exception as exc:
+        return {"status": "unavailable", "reason": str(exc)}
+    if not latest_path:
+        return {"status": "missing"}
+    return {"status": "found", "path": str(latest_path), "mtime": latest_mtime}
 
 
 def _current_turn_gate(turn: object, trace_probe: object = None) -> dict:

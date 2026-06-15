@@ -1,5 +1,56 @@
 # AgentOps Platform Next Window Memory
 
+## 2026-06-15 Pause Resume Semantics and Test Intent Strengthening
+
+User request addressed in order:
+
+1. If Worker automatically clicks Trae stop during pause, Continue must know to tell Trae to continue the interrupted task.
+2. User will click `测试开始` and describe how to test in the textarea; scheduler LLM should understand that intent and pass it correctly to prompt/dissatisfaction/downstream roles.
+
+Implemented locally:
+
+- Worker `stop_current_task` now reports structured pause semantics:
+  - `worker_command_cancelled`
+  - `trae_stop_clicked`
+  - `trae_stop_click`
+  - `sandbox_killed`
+  - `cleanup_status`
+  - `trae_ui_stopped_verified`
+  - `still_generating_suspected`
+  - `requires_resume_prompt`
+  - `verification.before/after` snapshots for latest Trae log and latest project write.
+- Worker stop flow now tries a conservative Trae stop action before local cleanup:
+  - Uses explicit UIA button text such as `停止生成` / `Stop generating`.
+  - Can ask visual UI analyst for `stop_button`.
+  - Does not use risky primary fallback if no explicit stop target exists.
+  - Still kills local sandbox/tool processes as before.
+- API stop result logging now summarizes whether Worker clicked Trae stop, verified no further changes, killed sandbox processes, or suspects Trae may still be generating.
+- API Continue now checks the latest completed `stop_current_task` result:
+  - If `requires_resume_prompt` or `trae_stop_clicked` is true, Continue first queues a `send_prompt` resume message:
+    - Normal mode: continue the paused task from the interruption point.
+    - Test mode: continue the paused test task, keep scope small, and continue chain validation.
+  - If Trae was not clicked stopped, Continue preserves the previous behavior and requeues the cancelled worker command.
+- Test intent strengthened:
+  - `测试开始` always forces flags including `test_start_button`, `test_run`, `quick_prompt`, `force_unsatisfied`, `continue_chain_on_trae_error`, `skip_trae_self_tests`, `chain_validation_only`.
+  - Text mentioning single page / quick reply / logs trace / GitHub submit / Feishu write now adds `single_page_quick`, `chain_validation_only`, and `skip_trae_self_tests`.
+  - LLM intent flags are unioned with rule-forced flags so sparse LLM output cannot drop safety/test flags.
+  - Test prompt brief now tells prompt writer to keep a single-page minimal result, avoid full frontend/backend expansion, skip slow self-tests/builds/browser acceptance, and let platform validate logs/GitHub/Feishu.
+
+Verification passed:
+
+- API targeted tests for paused continue and test intent: `4 passed`.
+- Worker targeted tests for stop report: `2 passed`.
+- API full suite: `115 passed, 3 warnings`.
+- Windows Worker full suite: `126 passed, 6 warnings`.
+- Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
+- `git diff --check` passed.
+- Worker package build: `apps/worker-windows/scripts/build_worker.ps1` passed and produced updated `apps/worker-windows/dist/agentops-worker-windows.zip`.
+- Local Worker was restarted from the rebuilt package, and extra duplicate Worker processes were removed.
+
+Deployment status:
+
+- Pending commit, push, and production deployment in this same turn.
+
 ## 2026-06-15 Trae Completion Diagnostics and Test Start Button
 
 User request addressed in order:

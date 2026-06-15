@@ -2291,15 +2291,47 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
     job, round_ = _load_job_round(db, command)
     if not job:
         return
+    extra = _result_extra(command, result)
+    stop_report = _stop_report_from_result(result)
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.PAUSED if str(job.status) == str(JobState.PAUSED) else JobState.STOPPED,
-        message="Worker stop command finished.",
+        message=_stop_result_message(stop_report),
         level="info" if result.status in {"ok", "success", "completed"} else "warning",
-        extra=_result_extra(command, result),
+        extra={**extra, "stop_report_summary": _stop_report_summary(stop_report)},
     )
+
+
+def _stop_report_from_result(result: WorkerResult) -> dict:
+    data = result.data if isinstance(result.data, dict) else {}
+    report = data.get("stop_report") if isinstance(data.get("stop_report"), dict) else {}
+    return report
+
+
+def _stop_report_summary(report: dict) -> dict:
+    if not isinstance(report, dict):
+        return {}
+    return {
+        "trae_stop_clicked": bool(report.get("trae_stop_clicked")),
+        "trae_ui_stopped_verified": bool(report.get("trae_ui_stopped_verified")),
+        "still_generating_suspected": bool(report.get("still_generating_suspected")),
+        "requires_resume_prompt": bool(report.get("requires_resume_prompt")),
+        "sandbox_killed": int(report.get("sandbox_killed") or 0),
+        "cleanup_status": str(report.get("cleanup_status") or ""),
+    }
+
+
+def _stop_result_message(report: dict) -> str:
+    summary = _stop_report_summary(report)
+    if summary.get("trae_stop_clicked") and summary.get("trae_ui_stopped_verified"):
+        return "Worker stopped local activity and confirmed Trae generation is no longer changing."
+    if summary.get("trae_stop_clicked"):
+        return "Worker clicked Trae stop and stopped local activity; continue will send a resume prompt first."
+    if summary.get("sandbox_killed"):
+        return "Worker stopped local sandbox activity; Trae UI stop button was not clicked."
+    return "Worker stop command finished."
 
 
 def _should_ignore_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> bool:

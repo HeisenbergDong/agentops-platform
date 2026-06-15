@@ -15,6 +15,7 @@ SAFE_ACTIONS = {
     "prompt_input",
     "send_button",
     "continue_button",
+    "stop_button",
     "run_button",
     "confirm_button",
     "keep_button",
@@ -23,6 +24,8 @@ SAFE_ACTIONS = {
 ACTION_ALIASES = {
     "continue": "continue_button",
     "continue-text": "continue_button",
+    "stop": "stop_button",
+    "cancel_generation": "stop_button",
     "run": "run_button",
     "run_anyway": "run_button",
     "execute": "run_button",
@@ -132,7 +135,7 @@ def validate_target(
             return False, "prompt_input_outside_expected_region"
         if action == "send_button" and not (0.20 <= rx <= 0.55 and 0.75 <= ry <= 0.99):
             return False, "send_button_outside_expected_region"
-        if action in {"run_button", "confirm_button", "continue_button"} and not (0.0 <= rx <= 0.45 and 0.12 <= ry <= 0.92):
+        if action in {"run_button", "confirm_button", "continue_button", "stop_button"} and not (0.0 <= rx <= 0.55 and 0.08 <= ry <= 0.96):
             return False, "assistant_action_outside_expected_region"
     return True, "ok"
 

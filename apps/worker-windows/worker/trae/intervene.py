@@ -32,6 +32,16 @@ CONTINUE_MARKERS = (
     "Keep Changes",
     "Save",
 )
+STOP_GENERATION_MARKERS = (
+    "\u505c\u6b62\u751f\u6210",
+    "\u505c\u6b62\u56de\u7b54",
+    "\u505c\u6b62\u5f53\u524d",
+    "\u4e2d\u6b62\u751f\u6210",
+    "Stop generating",
+    "Stop generation",
+    "Stop response",
+    "Stop",
+)
 UNSAFE_MARKERS = (
     "\u5220\u9664",
     "\u6e05\u7a7a",
@@ -94,6 +104,23 @@ def click_continue(
 
 def click_confirm() -> dict:
     return click_continue()
+
+
+def click_stop_generation(
+    timeout_seconds: float = 5.0,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+) -> dict:
+    focus_trae(timeout_seconds=timeout_seconds)
+    window = find_trae_window(timeout_seconds=timeout_seconds)
+    candidates = _matching_buttons(window, STOP_GENERATION_MARKERS, allow_unsafe_stop=True)
+    if candidates:
+        button_text, button = candidates[0]
+        button.click_input()
+        return {"status": "clicked", "action_taken": "clicked_stop_button", "button_text": button_text}
+    visual = click_visual_intervention("stop_button", timeout_seconds=timeout_seconds, ui_analyst=ui_analyst)
+    if visual.get("status") == "clicked":
+        return {**visual, "action_taken": "clicked_visual_stop_button"}
+    return {"status": "not_clicked", "reason": visual.get("reason") or "no_stop_button", "visual": visual}
 
 
 def apply_intervention(intervention: dict[str, Any], timeout_seconds: float = 10.0) -> dict:
@@ -344,7 +371,7 @@ def _visual_intervention_context(
                 "height": max(1, bottom - top),
             },
         },
-        "allowed_actions": ["continue_button", "run_button", "confirm_button", "keep_button", "save_button"],
+        "allowed_actions": ["continue_button", "run_button", "confirm_button", "keep_button", "save_button", "stop_button"],
         "blocked_actions": ["delete_button", "discard_button", "remove_button", "reset_button", "cancel_button"],
         "instructions": "Find the safe visible button for the requested action in Trae's assistant reply area. Return JSON only.",
     }
@@ -361,7 +388,7 @@ def _action_from_diagnosis(diagnosis: dict) -> str:
     return "continue_button"
 
 
-def _matching_buttons(window, markers: tuple[str, ...]) -> list[tuple[str, object]]:
+def _matching_buttons(window, markers: tuple[str, ...], allow_unsafe_stop: bool = False) -> list[tuple[str, object]]:
     matches: list[tuple[str, object]] = []
     try:
         controls = window.descendants(control_type="Button")
@@ -375,7 +402,7 @@ def _matching_buttons(window, markers: tuple[str, ...]) -> list[tuple[str, objec
         if (
             text
             and any(marker.lower() in text.lower() for marker in markers)
-            and not any(marker.lower() in text.lower() for marker in UNSAFE_MARKERS)
+            and (allow_unsafe_stop or not any(marker.lower() in text.lower() for marker in UNSAFE_MARKERS))
         ):
             matches.append((text, control))
     return sorted(matches, key=_button_sort_key)

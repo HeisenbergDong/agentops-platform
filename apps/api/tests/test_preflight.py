@@ -211,6 +211,46 @@ def test_start_job_test_mode_forces_test_intent_and_short_prompt_policy(monkeypa
     assert "不要主动执行耗时自测" in command.payload["prompt"]
 
 
+def test_start_job_test_button_preserves_chain_validation_flags_when_llm_omits_them(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class SparseLLMClient:
+        def complete(self, _config, _messages, purpose=""):
+            class Result:
+                text = (
+                    '{"run_mode":"test","intent_summary":"测试单页面链路",'
+                    '"prompt_brief":"做单页面快速回复，用来测试日志轨迹、GitHub提交和飞书写入",'
+                    '"dissatisfaction_policy":"force_test_unsatisfied",'
+                    '"downstream_policy":"test_chain_allowed",'
+                    '"trace_gate_policy":"test_exception",'
+                    '"notification_policy":"测试通知",'
+                    '"flags":["test_run"],"risk_notes":[]}'
+                )
+                model = "gpt-test"
+                wire_api = "responses"
+
+            return Result()
+
+    monkeypatch.setattr("app.services.orchestrator.intent.LLMClient", SparseLLMClient)
+
+    result = start_job(
+        StartJobRequest(directions=["弄个单页面，让 Trae 快速回复完毕，我方便测试日志轨迹、GitHub提交和飞书写入"], run_mode="test"),
+        user=user,
+        db=db,
+    )
+
+    intent = result["job"]["intent"]
+    assert intent["run_mode"] == "test"
+    assert "test_start_button" in intent["flags"]
+    assert "skip_trae_self_tests" in intent["flags"]
+    assert "chain_validation_only" in intent["flags"]
+    assert "single_page_quick" in intent["flags"]
+    assert "日志轨迹" in intent["prompt_brief"]
+
+
 def test_job_directions_split_and_expand_to_100_round_target():
     raw = "1. 订单管理平台：客户、订单、售后\n2. 本地招聘平台：岗位、简历、服务中心"
 
@@ -442,6 +482,88 @@ def test_continue_paused_job_requeues_cancelled_worker_command():
     assert new_command.payload["workspace_path"] == "D:/mr-d"
     db.refresh(round_)
     assert round_.status == JobState.WAITING_TRAE
+
+
+def test_continue_after_trae_stop_queues_resume_prompt_before_wait():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    job = Job(
+        id="job1",
+        user_id=user.id,
+        status=JobState.PAUSED,
+        directions=["demo"],
+        scope_text="demo",
+        intent={"run_mode": "test", "flags": ["test_run"]},
+    )
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="demo-project",
+        direction="demo",
+        workspace_path="D:/mr-d/demo-project",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.PAUSED,
+        prompt="demo prompt",
+    )
+    previous = WorkerCommand(
+        id="cmd1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"workspace_path": "D:/old/demo"},
+        status="cancelled",
+        message="Cancelled by user stop.",
+    )
+    stop_command = WorkerCommand(
+        id="stop1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.STOP_CURRENT_TASK.value,
+        payload={"reason": "user_stop"},
+        status="completed",
+        result={
+            "status": "success",
+            "data": {
+                "stop_report": {
+                    "trae_stop_clicked": True,
+                    "requires_resume_prompt": True,
+                    "sandbox_killed": 2,
+                }
+            },
+        },
+    )
+    db.add_all([job, project, round_, previous, stop_command])
+    db.commit()
+
+    result = jobs_api.continue_job(user=user, db=db)
+
+    new_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.id.notin_([previous.id, stop_command.id]))
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    assert result["job"]["status"] == JobState.SENDING_TO_WORKER
+    assert new_command is not None
+    assert new_command.command_type == WorkerCommandType.SEND_PROMPT.value
+    assert new_command.payload["resume_after_stop"] is True
+    assert new_command.payload["retry_of_command_id"] == previous.id
+    assert new_command.payload["stop_command_id"] == stop_command.id
+    assert "继续刚才被暂停的测试任务" in new_command.payload["prompt"]
+    assert new_command.payload["workspace_path"] == "D:/mr-d/demo-project"
+    db.refresh(round_)
+    assert round_.status == JobState.SENDING_TO_WORKER
 
 
 def test_reopen_job_with_background_task_returns_before_prompt_generation(monkeypatch):
