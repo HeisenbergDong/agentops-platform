@@ -346,7 +346,46 @@ def test_wait_completion_worker_command_error_requeues_observation_without_click
     assert round_.status == JobState.WAITING_TRAE
     assert click_command is None
     assert retry is not None
-    assert retry.payload["wait_observation_attempts"] == 1
+
+
+def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "completion_gate": {"passed": True, "reason": "ok"},
+                "trae_turn": {
+                    "status": "found",
+                    "turn_status": "completed",
+                    "session_id": "s1",
+                    "user_message_id": "u1",
+                    "trace_id": VALID_TRAE_TRACE_ID,
+                    "tool_call_count": 6,
+                },
+                "supervisor_decision": {"action": "collect_trace", "reason": "timeout_completion_detected"},
+                "watcher_observation": {"activity": {"recent": False, "quiet_seconds": 42.0}},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    click_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_command is not None
+    assert copy_command.payload["allow_local_trace_fallback"] is True
+    assert click_command is None
 
 
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):

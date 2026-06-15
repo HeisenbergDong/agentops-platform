@@ -251,17 +251,22 @@ class CommandRunner:
             return
 
     def _copy_latest_reply(self, payload: dict[str, Any], cancellation: CancellationToken | None = None) -> dict:
-        result = copy_latest_reply(
-            timeout_seconds=float(payload.get("timeout_seconds", 10)),
-            cancellation_check=cancellation.raise_if_cancelled if cancellation else None,
-        )
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
-        result["trae_turn"] = probe_latest_trae_turn(
+        trae_turn = probe_latest_trae_turn(
             prompt=str(payload.get("prompt") or ""),
             workspace_path=str(workspace_path or self.settings.workspace_root),
             sent_after_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
+        result = copy_latest_reply(
+            timeout_seconds=float(payload.get("timeout_seconds", 10)),
+            cancellation_check=cancellation.raise_if_cancelled if cancellation else None,
+            trae_turn=trae_turn,
+            prompt=str(payload.get("prompt") or ""),
+            workspace_path=str(workspace_path or self.settings.workspace_root),
+            allow_local_fallback=bool(payload.get("allow_local_trace_fallback", True)),
+        )
+        result["trae_turn"] = trae_turn
         result["current_turn_gate"] = _current_turn_gate(result.get("trae_turn"), result.get("trace_probe"))
         result["supervisor_decision"] = _copy_supervisor_decision(result.get("current_turn_gate"), result.get("trace_probe"))
         return result

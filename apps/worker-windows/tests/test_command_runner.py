@@ -615,14 +615,21 @@ def test_capture_screenshot_routes_quality_payload(monkeypatch: pytest.MonkeyPat
 
 
 def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
+    trace = (
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: pytest\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+
     monkeypatch.setattr(
         command_runner,
         "copy_latest_reply",
-        lambda timeout_seconds, cancellation_check=None: {
+        lambda timeout_seconds, cancellation_check=None, **kwargs: {
             "status": "copied",
-            "raw_text": "trace",
+            "raw_text": trace,
+            "trace_probe": probe_trace(trace),
             "timeout_seconds": timeout_seconds,
             "cancellable": callable(cancellation_check),
+            "kwargs": kwargs,
         },
     )
     monkeypatch.setattr(
@@ -636,9 +643,10 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     )
 
     assert result["status"] == "success"
-    assert result["data"]["raw_text"] == "trace"
+    assert result["data"]["raw_text"] == trace
     assert result["data"]["timeout_seconds"] == 7.0
     assert result["data"]["cancellable"] is True
+    assert result["data"]["kwargs"]["allow_local_fallback"] is True
     assert result["data"]["current_turn_gate"]["passed"] is True
     assert result["data"]["supervisor_decision"]["action"] == "collect_trace_candidate"
 
@@ -927,6 +935,46 @@ def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.Monkey
     assert result["trace_probe"]["reason"] == "ok"
     assert result["copy_candidates"][0]["reason"] == "missing_tool_trace_markers"
     assert result["copy_candidates"][1]["reason"] == "ok"
+
+
+def test_copy_latest_reply_uses_local_trace_when_clipboard_is_incomplete(monkeypatch: pytest.MonkeyPatch):
+    class FakeButton:
+        def click_input(self):
+            return None
+
+    class FakeWindow:
+        pass
+
+    local_trace = (
+        "Trae raw execution trace for session s1, user message u1.\n"
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: pytest\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton())])
+    monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
+    monkeypatch.setattr(trace_copy, "_wait_for_clipboard_change", lambda before, timeout_seconds: "summary only")
+    monkeypatch.setattr(
+        trace_copy,
+        "collect_local_trace",
+        lambda trae_turn, prompt, workspace_path: {
+            "status": "collected",
+            "raw_text": local_trace,
+            "chars": len(local_trace),
+            "trace_source": "trae_local_raw_log_trace",
+            "trace_probe": trace_copy.probe_trace(local_trace),
+        },
+    )
+
+    result = trace_copy.copy_latest_reply(timeout_seconds=1, trae_turn={"session_id": "s1"}, prompt="demo", workspace_path="D:/work/demo")
+
+    assert result["copy_method"] == "trae_local_raw_log_trace"
+    assert result["trace_source"] == "trae_local_raw_log_trace"
+    assert result["raw_text"] == local_trace
+    assert result["copy_candidates"][0]["reason"] == "missing_tool_trace_markers"
 
 
 def test_probe_trace_reports_awaiting_continuation():

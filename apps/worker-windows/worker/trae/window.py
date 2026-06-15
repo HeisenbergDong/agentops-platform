@@ -11,7 +11,9 @@ from typing import Any
 
 
 class TraeAutomationError(RuntimeError):
-    pass
+    def __init__(self, message: str, details: dict[str, Any] | None = None) -> None:
+        super().__init__(message)
+        self.details = details or {}
 
 
 SW_MAXIMIZE = 3

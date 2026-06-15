@@ -58,6 +58,7 @@ def wait_completion(
     last_change_at = time.monotonic()
     interventions: list[dict] = []
     last_progress_at: dict[str, float] = {}
+    last_decision: dict = {}
 
     while time.monotonic() < deadline:
         if cancellation_check:
@@ -85,6 +86,7 @@ def wait_completion(
                     interventions=interventions,
                     max_interventions=max_interventions,
                 )
+                last_decision = decision
                 _emit_supervisor_progress(
                     progress_callback,
                     decision,
@@ -161,6 +163,7 @@ def wait_completion(
                 interventions=interventions,
                 max_interventions=max_interventions,
             )
+            last_decision = decision
             _emit_supervisor_progress(
                 progress_callback,
                 decision,
@@ -186,7 +189,74 @@ def wait_completion(
                 stable_since = None
         _sleep_with_cancellation(poll_interval_seconds, cancellation_check)
 
-    raise TraeAutomationError("Trae output did not become stable before wait_completion timeout")
+    timeout_decision = _final_timeout_decision(
+        latest_text=latest_text,
+        busy=any(marker in latest_text for marker in BUSY_MARKERS),
+        prompt=prompt,
+        workspace_path=workspace_path,
+        sent_at_epoch=sent_at_epoch,
+        sent_at=sent_at,
+        idle_seconds=time.monotonic() - last_change_at,
+        intervention_idle_seconds=intervention_idle_seconds,
+        interventions=interventions,
+        max_interventions=max_interventions,
+        fallback_decision=last_decision,
+    )
+    if str(timeout_decision.get("action") or "") == "collect_trace":
+        return _completed_result(
+            stable_seconds=stable_seconds,
+            latest_text=latest_text,
+            output_probe=timeout_decision.get("output_probe") or {},
+            turn_probe=timeout_decision.get("turn_probe") or {},
+            gate=timeout_decision.get("completion_gate") or {},
+            interventions=interventions,
+            supervisor_decision={**timeout_decision, "reason": timeout_decision.get("reason") or "timeout_completion_detected"},
+        )
+    raise TraeAutomationError(
+        "Trae output did not become stable before wait_completion timeout",
+        {
+            "output_probe": timeout_decision.get("output_probe") or {},
+            "trae_turn": timeout_decision.get("turn_probe") or {},
+            "completion_gate": timeout_decision.get("completion_gate") or {},
+            "supervisor_decision": timeout_decision,
+            "watcher_observation": timeout_decision.get("watcher_observation") or {},
+            "activity_summary": timeout_decision.get("activity_summary") or {},
+            "text_chars": len(latest_text),
+            "text_sample": latest_text[-1000:],
+            "interventions": interventions,
+        },
+    )
+
+
+def _final_timeout_decision(
+    *,
+    latest_text: str,
+    busy: bool,
+    prompt: str,
+    workspace_path: str,
+    sent_at_epoch: float | None,
+    sent_at: str,
+    idle_seconds: float,
+    intervention_idle_seconds: float,
+    interventions: list[dict],
+    max_interventions: int,
+    fallback_decision: dict,
+) -> dict:
+    try:
+        return _supervisor_decision(
+            latest_text=latest_text,
+            busy=busy,
+            prompt=prompt,
+            workspace_path=workspace_path,
+            sent_at_epoch=sent_at_epoch,
+            sent_at=sent_at,
+            idle_seconds=idle_seconds,
+            intervention_idle_seconds=intervention_idle_seconds,
+            interventions=interventions,
+            max_interventions=max_interventions,
+        )
+    except Exception:
+        return fallback_decision or {"action": "wait", "reason": "timeout_without_supervisor_decision"}
 
 
 def _emit_progress(

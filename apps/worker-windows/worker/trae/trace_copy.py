@@ -3,6 +3,7 @@ import time
 from typing import Callable
 
 from worker.system.clipboard import ClipboardError, get_clipboard_text, set_clipboard_text
+from worker.trae.local_trace import collect_local_trace
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 COPY_BUTTON_MARKERS = ("\u590d\u5236", "Copy", "copy")
@@ -46,16 +47,27 @@ SERVICE_INTERRUPTION_MARKERS = (
 SCROLL_CONTROL_TYPES = ("Document", "Pane", "List", "Group", "Custom")
 
 
-def copy_latest_reply(timeout_seconds: float = 10.0, cancellation_check: Callable[[], None] | None = None) -> dict:
+def copy_latest_reply(
+    timeout_seconds: float = 10.0,
+    cancellation_check: Callable[[], None] | None = None,
+    trae_turn: dict | None = None,
+    prompt: str = "",
+    workspace_path: str = "",
+    allow_local_fallback: bool = True,
+) -> dict:
     _raise_if_cancelled(cancellation_check)
     focus_trae(timeout_seconds=timeout_seconds)
     _raise_if_cancelled(cancellation_check)
     window = find_trae_window(timeout_seconds=timeout_seconds)
     scroll_result = scroll_assistant_to_bottom(window)
     sentinel = f"agentops-copy-sentinel-{time.time_ns()}"
-    buttons = _copy_buttons(window)
     failures: list[dict] = []
     candidates: list[dict] = []
+    try:
+        buttons = _copy_buttons(window)
+    except Exception as exc:
+        buttons = []
+        failures.append({"stage": "find_copy_buttons", "error": str(exc)})
     for button_text, button in buttons:
         _raise_if_cancelled(cancellation_check)
         try:
@@ -87,8 +99,35 @@ def copy_latest_reply(timeout_seconds: float = 10.0, cancellation_check: Callabl
                 "copy_candidates": _candidate_summaries(candidates),
             }
 
-    if candidates:
-        best = _best_copy_candidate(candidates)
+    best = _best_copy_candidate(candidates) if candidates else {}
+    if allow_local_fallback:
+        local = collect_local_trace(trae_turn, prompt=prompt, workspace_path=workspace_path)
+        if _is_preferred_trace(local.get("trace_probe") if isinstance(local, dict) else {}):
+            local_result = {
+                "status": "copied",
+                "raw_text": local["raw_text"],
+                "chars": local["chars"],
+                "copy_method": str(local.get("trace_source") or "trae_local_trace"),
+                "trace_source": str(local.get("trace_source") or "trae_local_trace"),
+                "trace_probe": local["trace_probe"],
+                "scroll": scroll_result,
+                "copy_candidates": _candidate_summaries(candidates),
+                "copy_failures": failures[-5:],
+            }
+            if best:
+                local_result["best_clipboard_candidate"] = _candidate_summary(best)
+            return local_result
+        if isinstance(local, dict):
+            failures.append(
+                {
+                    "stage": "local_trace_fallback",
+                    "trace_source": str(local.get("trace_source") or ""),
+                    "reason": str((local.get("trace_probe") or {}).get("reason") or ""),
+                    "chars": int(local.get("chars") or 0),
+                }
+            )
+
+    if best:
         return {
             "status": "copied",
             "raw_text": best["raw_text"],
@@ -98,6 +137,7 @@ def copy_latest_reply(timeout_seconds: float = 10.0, cancellation_check: Callabl
             "trace_probe": best["trace_probe"],
             "scroll": scroll_result,
             "copy_candidates": _candidate_summaries(candidates),
+            "copy_failures": failures[-5:],
         }
 
     raise TraeAutomationError(f"No Trae assistant reply copy button produced clipboard text. failures={failures[-3:]}")
@@ -410,17 +450,19 @@ def _best_copy_candidate(candidates: list[dict]) -> dict:
 def _candidate_summaries(candidates: list[dict]) -> list[dict]:
     result = []
     for candidate in candidates[:12]:
-        probe = candidate.get("trace_probe") if isinstance(candidate.get("trace_probe"), dict) else {}
-        result.append(
-            {
-                "button_text": str(candidate.get("button_text") or ""),
-                "chars": int(candidate.get("chars") or 0),
-                "reason": str(probe.get("reason") or ""),
-                "complete_like": bool(probe.get("complete_like")),
-                "marker_count": int(probe.get("marker_count") or 0),
-            }
-        )
+        result.append(_candidate_summary(candidate))
     return result
+
+
+def _candidate_summary(candidate: dict) -> dict:
+    probe = candidate.get("trace_probe") if isinstance(candidate.get("trace_probe"), dict) else {}
+    return {
+        "button_text": str(candidate.get("button_text") or ""),
+        "chars": int(candidate.get("chars") or 0),
+        "reason": str(probe.get("reason") or ""),
+        "complete_like": bool(probe.get("complete_like")),
+        "marker_count": int(probe.get("marker_count") or 0),
+    }
 
 
 def _raise_if_cancelled(cancellation_check: Callable[[], None] | None) -> None:

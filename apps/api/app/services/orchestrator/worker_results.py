@@ -193,36 +193,18 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
 
     extra = _result_extra(command, result)
     if result.status in {"ok", "success", "completed"}:
-        job.status = JobState.COLLECTING_TRACE
-        if round_:
-            round_.status = JobState.COLLECTING_TRACE
-        wait_extra = _wait_completion_supervisor_extra(extra, result.data)
-        add_log(
-            db,
-            job_id=job.id,
-            round_id=round_.id if round_ else None,
-            stage=JobState.COLLECTING_TRACE,
-            message="Trae output appears stable; collecting the full assistant trace.",
-            extra=wait_extra,
-        )
-        copy_command = _enqueue_worker_command(
+        _queue_trace_collection_after_wait(db, command, job, round_, extra, result.data)
+        return
+
+    if _wait_failure_can_collect_trace(extra):
+        _queue_trace_collection_after_wait(
             db,
             command,
-            WorkerCommandType.COPY_LATEST_REPLY,
-            {
-                "timeout_seconds": command.payload.get("copy_timeout_seconds", 10),
-                "prompt": round_.prompt if round_ and round_.prompt else command.payload.get("prompt", ""),
-                "trace_copy_attempts": command.payload.get("trace_copy_attempts", 0),
-                "max_trace_copy_attempts": command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
-            },
-        )
-        add_log(
-            db,
-            job_id=job.id,
-            round_id=round_.id if round_ else None,
-            stage=JobState.COLLECTING_TRACE,
-            message="copy_latest_reply worker command queued.",
-            extra={"worker_id": copy_command.worker_id, "command_id": copy_command.id},
+            job,
+            round_,
+            extra,
+            extra.get("data") if isinstance(extra.get("data"), dict) else {},
+            message="Trae appears complete after wait timeout; collecting trace before attempting any recovery click.",
         )
         return
 
@@ -244,6 +226,49 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         round_,
         "Worker has not confirmed the current Trae reply is complete; recovery will continue before trace collection.",
         extra,
+    )
+
+
+def _queue_trace_collection_after_wait(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    extra: dict,
+    data: dict | None,
+    message: str = "Trae output appears stable; collecting the full assistant trace.",
+) -> None:
+    job.status = JobState.COLLECTING_TRACE
+    if round_:
+        round_.status = JobState.COLLECTING_TRACE
+    wait_extra = _wait_completion_supervisor_extra(extra, data or {})
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.COLLECTING_TRACE,
+        message=message,
+        extra=wait_extra,
+    )
+    copy_command = _enqueue_worker_command(
+        db,
+        command,
+        WorkerCommandType.COPY_LATEST_REPLY,
+        {
+            "timeout_seconds": command.payload.get("copy_timeout_seconds", 10),
+            "prompt": round_.prompt if round_ and round_.prompt else command.payload.get("prompt", ""),
+            "trace_copy_attempts": command.payload.get("trace_copy_attempts", 0),
+            "max_trace_copy_attempts": command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
+            "allow_local_trace_fallback": True,
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.COLLECTING_TRACE,
+        message="copy_latest_reply worker command queued.",
+        extra={"worker_id": copy_command.worker_id, "command_id": copy_command.id},
     )
 
 
@@ -1595,6 +1620,8 @@ def _queue_trace_copy_retry(
             "timeout_seconds": source_command.payload.get("copy_timeout_seconds", source_command.payload.get("timeout_seconds", 10)),
             "trace_copy_attempts": trace_copy_attempts,
             "max_trace_copy_attempts": max_trace_copy_attempts,
+            "prompt": round_.prompt if round_ and round_.prompt else source_command.payload.get("prompt", ""),
+            "allow_local_trace_fallback": True,
         },
     )
     add_log(
@@ -1669,6 +1696,8 @@ def _default_wait_intervention_idle_seconds(round_: TaskRound | None) -> int:
 
 def _should_observe_wait_failure_without_recovery(extra: dict) -> bool:
     reason = _recovery_reason(extra)
+    if reason == "wait_completion_timeout":
+        return True
     if reason in {
         "awaiting_continuation",
         "awaiting_current_continuation",
@@ -1690,6 +1719,37 @@ def _should_observe_wait_failure_without_recovery(extra: dict) -> bool:
         return True
     if reason == "worker_command_error":
         return True
+    return False
+
+
+def _wait_failure_can_collect_trace(extra: dict) -> bool:
+    if _recovery_reason(extra) != "wait_completion_timeout":
+        return False
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    if str(supervisor.get("action") or "") == "collect_trace":
+        return True
+    if str(supervisor.get("reason") or "") in {"ui_completion_detected", "trae_turn_completed", "timeout_completion_detected"}:
+        return True
+    gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
+    if gate.get("passed") is True:
+        return True
+    turn = data.get("trae_turn") if isinstance(data.get("trae_turn"), dict) else {}
+    if turn.get("status") == "found" and str(turn.get("turn_status") or "") == "completed":
+        return True
+    if turn.get("status") == "found":
+        tool_count = int(turn.get("tool_call_count") or 0)
+        trace_id = str(turn.get("trace_id") or "")
+        watcher = data.get("watcher_observation") if isinstance(data.get("watcher_observation"), dict) else {}
+        activity = watcher.get("activity") if isinstance(watcher.get("activity"), dict) else {}
+        recent = bool(activity.get("recent"))
+        quiet = activity.get("quiet_seconds")
+        try:
+            quiet_value = float(quiet)
+        except (TypeError, ValueError):
+            quiet_value = 0.0
+        if tool_count > 0 and trace_id and not recent and quiet_value >= 30.0:
+            return True
     return False
 
 
