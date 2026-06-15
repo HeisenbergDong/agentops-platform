@@ -47,7 +47,33 @@ Verification passed:
 
 Deployment status:
 
-- Pending commit, push, and production deployment in this same turn.
+- Completed.
+
+Deployment completion:
+
+- Code commit: `7789900 feat: improve trae completion diagnostics and test start`, full commit `7789900c79fdc1a68c1b545ce76560a683469bd3`.
+- Pushed to GitHub `origin/main`.
+- Uploaded deploy bundle to production:
+  - `/tmp/agentops-deploy-7789900/agentops-source-7789900.tar`
+  - `/tmp/agentops-deploy-7789900/agentops-web-dist-7789900.tar`
+  - `/tmp/agentops-deploy-7789900/agentops-worker-windows.zip`
+- Production backup dir:
+  - `/opt/agentops-deploy-backups/20260615-204128-7789900`
+- Synced API source and Web dist to `/opt/agentops-platform`, excluding production `.venv`, `storage`, Worker build/dist, and other generated caches.
+- Copied latest Worker package to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `7789900c79fdc1a68c1b545ce76560a683469bd3`.
+
+Production verification:
+
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Homepage `http://115.190.113.8/`: `200`.
+- Web assets present:
+  - `index-DUmaFp9c.js`
+  - `index-UTf109PN.css`
+- Worker ZIP SHA256: `ae6858403f240d155302259e698a11588d16f85bf1b34d55ccd1b863c5bbf191`.
 
 ## 2026-06-15 Pause, Scope, Intent, Test Mode, and Notification Fix
 
