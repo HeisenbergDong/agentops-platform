@@ -1,5 +1,43 @@
 # AgentOps Platform Next Window Memory
 
+## 2026-06-15 Trae Worker Observation Fix
+
+- Latest code commit pushed to GitHub: `b2c88577be55dedca17cd935cd9634492ede7d80`.
+- Production `/opt/agentops-platform` was updated and `agentops-api.service` restarted healthy.
+- Local Windows Worker package was rebuilt with `apps/worker-windows/scripts/build_worker.ps1 -Clean`.
+- Local Worker is running from `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows\agentops-worker.exe`.
+- Production DB heartbeat confirmed `local-windows-worker` version `0.1.3-trae-watch-parity`.
+- The local Trae UI visual cache file was deleted: `%APPDATA%\AgentOps\trae-ui-cache.json`.
+
+Root causes fixed:
+
+- `click_continue` previously used cached visual targets and a primary fallback even when UI diagnosis had no explicit safe target.
+- `wait_completion` treated `window_chrome_only` as a hard Worker failure, so the API could queue continue recovery for a Worker command error.
+- First-round wait idle threshold was 300 seconds and follow-up was 90 seconds; user requested 30 seconds.
+- Visible Trae task-complete UI was not accepted as a completion signal when local turn probing missed it.
+
+Behavior after fix:
+
+- API default `intervention_idle_seconds` is now 30 seconds for both first and follow-up rounds.
+- Worker sends progress logs while Trae is normally active: UI text changes, recent agent log/project activity, and 30-second idle checks.
+- Worker only clicks or types recovery when there is explicit evidence: suggested intervention, visible button, terminal prompt, or clear continuation/service-interruption reason.
+- If Worker only sees window chrome text or has no explicit safe recovery target, API requeues `wait_completion` observation instead of `click_continue`.
+- Observation retry is capped by `DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10`; after that it goes manual instead of blindly clicking.
+- Supervisor can collect trace when the current Trae UI visibly contains task-complete markers even if log turn probing missed the completion.
+
+Verification already passed:
+
+- `apps/api/tests`: 106 passed.
+- `apps/worker-windows/tests`: 119 passed.
+- Ruff passed for changed API and Worker files.
+
+Deployment notes:
+
+- Production API health: `{"status":"ok","service":"agentops-api","database":true}` after restart.
+- Production Worker package path: `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Current production API is systemd, not docker app container: `agentops-api.service` runs `/opt/agentops-platform/apps/api/.venv/bin/uvicorn`.
+- Production source sync was done by `git archive` upload and server-side `rsync`; local Windows has no `rsync` command.
+
 更新时间：2026-06-12
 
 ## 项目目标
