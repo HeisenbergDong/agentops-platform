@@ -25,9 +25,12 @@ def get_feishu_access_token(feishu_config: dict[str, Any]) -> tuple[str, dict[st
     refresh_token = _cached_secret(token_cache, "refresh_token")
     refresh_expires_at = _cached_expires_at(token_cache, "refresh_expires_at")
     if refresh_token and (not refresh_expires_at or refresh_expires_at > int(time.time()) + TOKEN_REFRESH_SKEW_SECONDS):
-        refreshed = refresh_user_token(feishu_config, refresh_token)
-        refreshed_cache = _cache_user_token(token_cache, refreshed, refresh_token)
-        return _oauth_data_token(refreshed), refreshed_cache, "user_oauth"
+        try:
+            refreshed = refresh_user_token(feishu_config, refresh_token)
+            refreshed_cache = _cache_user_token(token_cache, refreshed, refresh_token)
+            return _oauth_data_token(refreshed), refreshed_cache, "user_oauth"
+        except (FeishuAuthError, httpx.HTTPError):
+            pass
 
     cached_tenant_token = _cached_secret(token_cache, "tenant_access_token")
     tenant_expires_at = _cached_expires_at(token_cache, "tenant_expires_at", "expires_at")

@@ -65,3 +65,32 @@ def test_refresh_token_updates_user_cache(monkeypatch):
     assert safe_open_secret(refreshed_cache["refresh_token"]) == "fresh-refresh-token"
     assert refreshed_cache["scope"] == "offline_access base:record:create"
     assert auth_mode == "user_oauth"
+
+
+def test_failed_user_refresh_falls_back_to_tenant_token(monkeypatch):
+    def fail_refresh(*_args, **_kwargs):
+        raise feishu_auth.FeishuAuthError("refresh token invalid")
+
+    def tenant_token(app_id, app_secret):
+        assert app_id == "cli_test"
+        assert app_secret == "secret"
+        return {"code": 0, "tenant_access_token": "tenant-token", "expire": 7200}
+
+    monkeypatch.setattr(feishu_auth, "refresh_user_token", fail_refresh)
+    monkeypatch.setattr(feishu_auth, "tenant_access_token", tenant_token)
+
+    token, refreshed_cache, auth_mode = get_feishu_access_token(
+        {
+            "app_id": "cli_test",
+            "app_secret": seal_secret("secret"),
+            "token_cache": {
+                "refresh_token": seal_secret("bad-refresh-token"),
+                "refresh_expires_at": int(time.time()) + 604800,
+            },
+        }
+    )
+
+    assert token == "tenant-token"
+    assert refreshed_cache is not None
+    assert safe_open_secret(refreshed_cache["tenant_access_token"]) == "tenant-token"
+    assert auth_mode == "tenant"
