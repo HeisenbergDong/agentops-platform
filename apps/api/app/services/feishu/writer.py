@@ -377,57 +377,23 @@ def _find_duplicate_record_for_search(
     target_record_id: str,
     mapped: dict[str, Any],
 ) -> dict[str, Any]:
-    field_names = ["UID", SESSION_FIELD, "User Prompt", "杞", "浠诲姟绫诲瀷", "涓氬姟棰嗗煙"]
     session = str(mapped.get(SESSION_FIELD) or "").strip()
-    if session:
-        duplicate = _first_matching_record(
-            _search_records(
-                access_token,
-                app_token,
-                table_id,
-                field_names=field_names,
-                conditions=[{"field_name": SESSION_FIELD, "operator": "is", "value": [session]}],
-                page_size=20,
-            ),
-            target_record_id,
-            lambda fields: str(fields.get(SESSION_FIELD) or "").strip() == session,
-        )
-        if duplicate:
-            return duplicate
-
-    prompt = _normalized_duplicate_text(mapped.get("User Prompt"))
-    round_label = _normalized_duplicate_text(mapped.get("杞"))
-    if not prompt or not round_label:
+    if not session:
         return {}
-    task_type = _normalized_duplicate_text(mapped.get("浠诲姟绫诲瀷"))
-    domain = _normalized_duplicate_text(mapped.get("涓氬姟棰嗗煙"))
+
     return _first_matching_record(
         _search_records(
             access_token,
             app_token,
             table_id,
-            field_names=field_names,
+            field_names=["UID", SESSION_FIELD],
             conditions=[
-                {"field_name": "User Prompt", "operator": "is", "value": [str(mapped.get("User Prompt") or "")]},
-                {"field_name": "杞", "operator": "is", "value": [str(mapped.get("杞") or "")]},
+                {"field_name": SESSION_FIELD, "operator": "is", "value": [session]},
             ],
-            page_size=50,
+            page_size=20,
         ),
         target_record_id,
-        lambda fields: (
-            _normalized_duplicate_text(fields.get("User Prompt")) == prompt
-            and _normalized_duplicate_text(fields.get("杞")) == round_label
-            and (
-                not task_type
-                or not _normalized_duplicate_text(fields.get("浠诲姟绫诲瀷"))
-                or _normalized_duplicate_text(fields.get("浠诲姟绫诲瀷")) == task_type
-            )
-            and (
-                not domain
-                or not _normalized_duplicate_text(fields.get("涓氬姟棰嗗煙"))
-                or _normalized_duplicate_text(fields.get("涓氬姟棰嗗煙")) == domain
-            )
-        ),
+        lambda fields: str(fields.get(SESSION_FIELD) or "").strip() == session,
     )
 
 
@@ -598,6 +564,8 @@ def _operation_from_url(method: str, url: str) -> str:
         return "list_fields"
     if "/views" in url:
         return "list_views"
+    if "/records/search" in url and method == "POST":
+        return "search_records"
     if "/records" in url and method == "GET":
         return "list_records"
     if "/records" in url and method == "POST":

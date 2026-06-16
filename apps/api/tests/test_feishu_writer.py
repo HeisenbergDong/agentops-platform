@@ -160,6 +160,9 @@ def test_write_feishu_record_uses_search_instead_of_listing_all_records(monkeypa
     assert result["status"] == "written"
     assert any(method == "POST" and url.endswith("/records/search") for method, url, _json in calls)
     assert not any(method == "GET" and url.endswith("/records") for method, url, _json in calls)
+    search_bodies = [body for method, url, body in calls if method == "POST" and url.endswith("/records/search")]
+    assert search_bodies
+    assert all(body.get("field_names") == ["UID", writer.SESSION_FIELD] for body in search_bodies)
 
 
 def test_feishu_error_message_identifies_permission_and_field_mapping():
@@ -184,6 +187,16 @@ def test_request_error_captures_bitable_operation():
     assert exc.operation == "list_fields"
     assert exc.status_code == 403
     assert exc.code == 91403
+
+    search_exc = writer._feishu_request_error(
+        200,
+        {"code": 1254007, "msg": "field_name is invalid"},
+        "",
+        "POST",
+        "https://open.feishu.cn/open-apis/bitable/v1/apps/app-token/tables/table-id/records/search",
+    )
+
+    assert search_exc.operation == "search_records"
 
 
 def test_discovery_uses_permission_help_message(monkeypatch):
