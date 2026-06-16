@@ -54,7 +54,22 @@ TARGET_UID_KEYS = ("target_uid", "row_number", "uid", "feishu_uid")
 
 
 class FeishuWriteError(RuntimeError):
-    pass
+    def __init__(
+        self,
+        message: str,
+        *,
+        token_cache: dict[str, Any] | None = None,
+        auth_mode: str = "",
+        status_code: int | None = None,
+        code: Any = None,
+        operation: str = "",
+    ) -> None:
+        super().__init__(message)
+        self.token_cache = token_cache
+        self.auth_mode = auth_mode
+        self.status_code = status_code
+        self.code = code
+        self.operation = operation
 
 
 def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -> dict[str, Any]:
@@ -70,10 +85,17 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
         raise FeishuWriteError("Feishu app_token and table_id are required.")
 
     access_token, refreshed_cache, auth_mode = get_feishu_access_token(feishu_config)
-    field_meta = _list_fields(access_token, app_token, table_id)
+    try:
+        field_meta = _list_fields(access_token, app_token, table_id)
+        records = _list_records(access_token, app_token, table_id)
+    except FeishuWriteError as exc:
+        if refreshed_cache and exc.token_cache is None:
+            exc.token_cache = refreshed_cache
+        if auth_mode and not exc.auth_mode:
+            exc.auth_mode = auth_mode
+        raise
     available_fields = {item.get("field_name", "") for item in field_meta if item.get("field_name")}
     options = _option_names(field_meta)
-    records = _list_records(access_token, app_token, table_id)
     explicit_target = _find_explicit_target_record(records, feishu_config)
     if explicit_target is None and _explicit_target_requested(feishu_config):
         raise FeishuWriteError("Explicit Feishu target row was not found.")
@@ -86,7 +108,14 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
             + ", ".join(field_report["missing_required_fields"])
         )
     mapped = _filter_allowed_fields(fields, available_fields)
-    mapped = _prepare_attachment_field(access_token, app_token, mapped, available_fields)
+    try:
+        mapped = _prepare_attachment_field(access_token, app_token, mapped, available_fields)
+    except FeishuWriteError as exc:
+        if refreshed_cache and exc.token_cache is None:
+            exc.token_cache = refreshed_cache
+        if auth_mode and not exc.auth_mode:
+            exc.auth_mode = auth_mode
+        raise
     duplicate = _find_duplicate_record(records, target_record_id, mapped)
     if duplicate:
         return {
@@ -121,22 +150,29 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
             "response": {},
         }
 
-    if target_record_id:
-        data = _request_json(
-            "PUT",
-            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{target_record_id}",
-            access_token,
-            json={"fields": updates},
-        )
-        operation = "updated"
-    else:
-        data = _request_json(
-            "POST",
-            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records",
-            access_token,
-            json={"fields": updates},
-        )
-        operation = "created"
+    try:
+        if target_record_id:
+            data = _request_json(
+                "PUT",
+                f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{target_record_id}",
+                access_token,
+                json={"fields": updates},
+            )
+            operation = "updated"
+        else:
+            data = _request_json(
+                "POST",
+                f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+                access_token,
+                json={"fields": updates},
+            )
+            operation = "created"
+    except FeishuWriteError as exc:
+        if refreshed_cache and exc.token_cache is None:
+            exc.token_cache = refreshed_cache
+        if auth_mode and not exc.auth_mode:
+            exc.auth_mode = auth_mode
+        raise
 
     record = data.get("data", {}).get("record", {}) if isinstance(data.get("data"), dict) else {}
     return {
@@ -387,23 +423,55 @@ def _request_json(
     except Exception as exc:
         raise FeishuWriteError(f"Feishu returned non-JSON response: HTTP {response.status_code}") from exc
     if response.status_code >= 400:
-        raise FeishuWriteError(
-            _format_feishu_error(response.status_code, data, response.text)
-        )
+        raise _feishu_request_error(response.status_code, data, response.text, method, url)
     if data.get("code") != 0:
-        raise FeishuWriteError(_format_feishu_error(response.status_code, data, response.text))
+        raise _feishu_request_error(response.status_code, data, response.text, method, url)
     return data
+
+
+def _feishu_request_error(
+    status_code: int,
+    data: dict[str, Any],
+    response_text: str,
+    method: str,
+    url: str,
+) -> FeishuWriteError:
+    return FeishuWriteError(
+        _format_feishu_error(status_code, data, response_text),
+        status_code=status_code,
+        code=data.get("code"),
+        operation=_operation_from_url(method, url),
+    )
 
 
 def _format_feishu_error(status_code: int, data: dict[str, Any], response_text: str = "") -> str:
     code = data.get("code")
     msg = str(data.get("msg") or response_text[:200] or "Feishu request failed.")
     prefix = f"HTTP {status_code}: " if status_code >= 400 else ""
-    if status_code == 403 or str(code) == "99991663":
-        return f"{prefix}Feishu permission denied: code={code}, msg={msg}"
+    if status_code == 403 or str(code) in {"91403", "99991663"}:
+        return (
+            f"{prefix}Feishu permission denied: code={code}, msg={msg}. "
+            "Please reauthorize Feishu user OAuth or add the app as a collaborator "
+            "with readable/writable access to this Bitable base/table."
+        )
     if "field" in msg.lower() or "字段" in msg:
         return f"{prefix}Feishu field mapping failed: code={code}, msg={msg}"
     return f"{prefix}code={code}, msg={msg}"
+
+
+def _operation_from_url(method: str, url: str) -> str:
+    method = method.upper()
+    if "/fields" in url:
+        return "list_fields"
+    if "/views" in url:
+        return "list_views"
+    if "/records" in url and method == "GET":
+        return "list_records"
+    if "/records" in url and method == "POST":
+        return "create_record"
+    if "/records" in url and method == "PUT":
+        return "update_record"
+    return method.lower()
 
 
 def _prepare_attachment_field(

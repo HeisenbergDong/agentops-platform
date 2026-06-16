@@ -1156,6 +1156,53 @@ def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
     assert written["fields"]["github地址"] == "https://github.com/acme/repo.git"
 
 
+def test_git_submit_feishu_failure_persists_refreshed_token_cache(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+
+    def fail_write(_feishu_config, _fields):
+        raise worker_results.FeishuWriteError(
+            "HTTP 403: Feishu permission denied: code=91403, msg=Forbidden.",
+            token_cache={"tenant_access_token": "fresh-tenant-token", "tenant_expires_at": 4102444800},
+            auth_mode="tenant",
+            status_code=403,
+            code=91403,
+            operation="list_fields",
+        )
+
+    monkeypatch.setattr(worker_results, "write_feishu_record", fail_write)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    config = db.scalar(select(UserConfig).where(UserConfig.user_id == job.user_id, UserConfig.category == "feishu"))
+    log = db.scalar(
+        select(RuntimeLog)
+        .where(RuntimeLog.job_id == job.id, RuntimeLog.stage == JobState.FEISHU_FAILED_ABORT)
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
+    )
+    assert job.status == JobState.FEISHU_FAILED_ABORT
+    assert round_.feishu_status == "failed"
+    assert config.data["token_cache"]["tenant_access_token"] == "fresh-tenant-token"
+    assert log.extra["auth_mode"] == "tenant"
+    assert log.extra["feishu_code"] == 91403
+    assert log.extra["operation"] == "list_fields"
+    assert log.extra["token_cache_refreshed_before_failure"] is True
+
+
 def test_git_submit_unsatisfied_feishu_success_prepares_next_round(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)

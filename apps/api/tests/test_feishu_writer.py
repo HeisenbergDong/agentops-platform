@@ -123,10 +123,46 @@ def test_write_feishu_record_fails_when_required_payload_field_is_missing_from_t
 
 def test_feishu_error_message_identifies_permission_and_field_mapping():
     permission = writer._format_feishu_error(403, {"code": 99991663, "msg": "Forbidden"}, "")
+    bitable_permission = writer._format_feishu_error(403, {"code": 91403, "msg": "Forbidden"}, "")
     field_error = writer._format_feishu_error(200, {"code": 1254007, "msg": "field_name is invalid"}, "")
 
     assert "permission denied" in permission
+    assert "reauthorize Feishu user OAuth" in bitable_permission
     assert "field mapping failed" in field_error
+
+
+def test_request_error_captures_bitable_operation():
+    exc = writer._feishu_request_error(
+        403,
+        {"code": 91403, "msg": "Forbidden"},
+        "",
+        "GET",
+        "https://open.feishu.cn/open-apis/bitable/v1/apps/app-token/tables/table-id/fields",
+    )
+
+    assert exc.operation == "list_fields"
+    assert exc.status_code == 403
+    assert exc.code == 91403
+
+
+def test_discovery_uses_permission_help_message(monkeypatch):
+    from app.services.feishu import discovery
+
+    class Response:
+        status_code = 403
+        text = '{"code":91403,"msg":"Forbidden"}'
+
+        def json(self):
+            return {"code": 91403, "msg": "Forbidden"}
+
+    monkeypatch.setattr(discovery.httpx, "get", lambda *_args, **_kwargs: Response())
+
+    try:
+        discovery._get_items("https://open.feishu.cn/open-apis/bitable/v1/apps/app/tables", "token", {})
+    except discovery.FeishuDiscoveryError as exc:
+        assert "reauthorize Feishu user OAuth" in str(exc)
+    else:
+        raise AssertionError("discovery should fail on Feishu 403")
 
 
 def test_prepare_attachment_field_uploads_local_paths(monkeypatch, tmp_path):

@@ -3,6 +3,7 @@ from typing import Any
 import httpx
 
 from app.services.feishu.auth import FEISHU_BASE_URL, get_feishu_access_token, tenant_access_token
+from app.services.feishu.writer import _format_feishu_error
 
 
 class FeishuDiscoveryError(RuntimeError):
@@ -61,10 +62,8 @@ def _get_items(url: str, access_token: str, params: dict[str, str]) -> list[dict
     except Exception as exc:
         raise FeishuDiscoveryError(f"Feishu returned non-JSON response: HTTP {response.status_code}") from exc
     if response.status_code >= 400:
-        raise FeishuDiscoveryError(
-            f"Feishu request failed: HTTP {response.status_code}, code={payload.get('code')}, msg={payload.get('msg')}"
-        )
+        raise FeishuDiscoveryError(_format_feishu_error(response.status_code, payload, response.text))
     if payload.get("code") != 0:
-        raise FeishuDiscoveryError(str(payload.get("msg") or "Feishu resource discovery failed."))
+        raise FeishuDiscoveryError(_format_feishu_error(response.status_code, payload, response.text))
     data = payload.get("data") if isinstance(payload.get("data"), dict) else {}
     return list(data.get("items") or [])

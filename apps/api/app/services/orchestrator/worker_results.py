@@ -1016,16 +1016,15 @@ def _write_feishu_record(
     try:
         write_result = write_feishu_record(feishu_config, fields)
     except FeishuWriteError as exc:
-        _mark_feishu_failed(db, job, round_, str(exc), {"field_names": list(fields.keys()), "field_count": len(fields)})
+        _persist_feishu_token_cache(db, job.user_id, feishu_config, getattr(exc, "token_cache", None))
+        _mark_feishu_failed(db, job, round_, str(exc), _feishu_failure_extra(fields, exc))
         return
     except Exception as exc:
         _mark_feishu_failed(db, job, round_, f"Feishu write failed: {exc}", {"field_names": list(fields.keys()), "field_count": len(fields)})
         return
 
     token_cache = write_result.pop("token_cache", None)
-    if token_cache:
-        feishu_config["token_cache"] = token_cache
-        save_user_settings(db, job.user_id, {"feishu": feishu_config}, allow_internal=True)
+    _persist_feishu_token_cache(db, job.user_id, feishu_config, token_cache)
 
     satisfaction = _feishu_satisfaction(db, job.id, round_.id)
     satisfied = bool(satisfaction["satisfied"])
@@ -1043,6 +1042,33 @@ def _write_feishu_record(
         extra=write_result,
     )
     _advance_after_feishu_success(db, job, round_, satisfied, decision)
+
+
+def _persist_feishu_token_cache(
+    db: Session,
+    user_id: str,
+    feishu_config: dict,
+    token_cache: dict | None,
+) -> None:
+    if not token_cache:
+        return
+    feishu_config["token_cache"] = token_cache
+    save_user_settings(db, user_id, {"feishu": feishu_config}, allow_internal=True)
+
+
+def _feishu_failure_extra(fields: dict[str, object], exc: FeishuWriteError) -> dict:
+    extra = {"field_names": list(fields.keys()), "field_count": len(fields)}
+    if exc.auth_mode:
+        extra["auth_mode"] = exc.auth_mode
+    if exc.status_code is not None:
+        extra["http_status"] = exc.status_code
+    if exc.code is not None:
+        extra["feishu_code"] = exc.code
+    if exc.operation:
+        extra["operation"] = exc.operation
+    if exc.token_cache:
+        extra["token_cache_refreshed_before_failure"] = True
+    return extra
 
 
 def _mark_feishu_failed(
