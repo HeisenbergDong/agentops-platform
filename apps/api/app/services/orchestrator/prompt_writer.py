@@ -73,6 +73,20 @@ AgentOps SOP context:
 
 
 def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) -> str:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    if intent.get("run_mode") == "test":
+        prompt = build_fallback_prompt(job, round_, {}, "test mode fast path")
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="prompt_generation_fallback",
+            message="Test mode uses deterministic prompt fallback for a fast chain check.",
+            level="warning",
+            extra={"prompt_chars": len(prompt), "test_mode_fast_path": True},
+        )
+        return _store_prompt(db, job, round_, prompt, model="built-in-test-fallback", wire_api="local")
+
     role = get_user_role(db, user.id, "prompt_writer")
     rules: dict[str, str] = {}
     role_name = "提示词策略员"

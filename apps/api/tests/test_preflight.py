@@ -213,6 +213,40 @@ def test_start_job_test_mode_forces_test_intent_and_short_prompt_policy(monkeypa
     assert "不要主动执行耗时自测" in command.payload["prompt"]
 
 
+def test_start_job_test_mode_does_not_call_intent_or_prompt_llms(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class ExplodingLLMClient:
+        def complete(self, *_args, **_kwargs):
+            raise AssertionError("test mode should not call LLM")
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", ExplodingLLMClient)
+    monkeypatch.setattr("app.services.orchestrator.intent.LLMClient", ExplodingLLMClient)
+
+    result = start_job(
+        StartJobRequest(directions=["AgentOps E2E smoke: create README with AgentOps E2E smoke OK only."], run_mode="test"),
+        user=user,
+        db=db,
+    )
+
+    command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    fallback_log = db.scalar(
+        select(RuntimeLog)
+        .where(RuntimeLog.stage == "prompt_generation_fallback")
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
+    )
+    assert result["job"]["intent"]["run_mode"] == "test"
+    assert command is not None
+    assert "AgentOps E2E smoke OK" in command.payload["prompt"]
+    assert len(command.payload["prompt"]) < 700
+    assert fallback_log is not None
+    assert fallback_log.extra["test_mode_fast_path"] is True
+
+
 def test_test_mode_smoke_fallback_keeps_prompt_tiny():
     db = _test_session()
     job = Job(

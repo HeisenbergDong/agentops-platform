@@ -56,7 +56,7 @@ def resolve_job_intent(
 ) -> dict[str, Any]:
     fallback = infer_job_intent(scope_text=scope_text, directions=directions)
     if run_mode == "test":
-        fallback = force_test_mode_intent(fallback, scope_text=scope_text)
+        return force_test_mode_intent(fallback, scope_text=scope_text)
     role = get_user_role(db, user.id, "orchestrator_intent")
     if role and not role.enabled:
         return fallback
