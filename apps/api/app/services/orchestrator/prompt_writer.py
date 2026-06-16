@@ -217,6 +217,9 @@ def build_fallback_prompt(
     intent = job.intent if isinstance(job.intent, dict) else {}
     prompt_brief = str(intent.get("prompt_brief") or "").strip()
     direction = prompt_brief or (directions[0] if directions else "做一个方便后续继续迭代的业务系统。")
+    smoke_prompt = _test_smoke_prompt(direction, intent)
+    if smoke_prompt:
+        return smoke_prompt
     task = _build_direction_task(direction, _select_stack(job, round_))
     prompt = _naturalize_prompt(str(task["base"]))
     quality_error = prompt_quality_error(None, job, round_, prompt)
@@ -239,6 +242,22 @@ def build_fallback_prompt(
         "3. 至少完成一个可运行的主流程，并补上必要的校验、空状态、错误提示和示例数据。\n"
         "4. 完成后运行合适的检查或启动命令；如果因为环境缺依赖导致不能运行，请把原因和下一步写清楚。\n"
         "5. 最终回复用自然中文说明：完成了哪些功能、改了哪些关键文件、运行了哪些验证、还有没有阻塞。"
+    )
+
+
+def _test_smoke_prompt(direction: str, intent: dict) -> str:
+    flags = {str(item) for item in intent.get("flags", []) if str(item)}
+    text = str(direction or "").strip()
+    lower_text = text.lower()
+    if intent.get("run_mode") != "test":
+        return ""
+    if not (flags & {"chain_validation_only", "single_page_quick"} or "smoke" in lower_text):
+        return ""
+    base = text or "AgentOps E2E smoke: create a tiny README or static page that says AgentOps E2E smoke OK."
+    return _naturalize_prompt(
+        f"{base} This is only an AgentOps chain smoke test: make the smallest reviewable change, "
+        "do not expand it into a complex business system, do not run slow tests, long builds, "
+        "or full browser acceptance, and finish with one or two short sentences listing changed files."
     )
 
 

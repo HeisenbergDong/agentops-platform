@@ -1,3 +1,5 @@
+from datetime import timedelta
+
 import pytest
 from fastapi import HTTPException
 from sqlalchemy import create_engine, select
@@ -209,6 +211,30 @@ def test_start_job_test_mode_forces_test_intent_and_short_prompt_policy(monkeypa
     assert "skip_trae_self_tests" in job.intent["flags"]
     assert command is not None
     assert "不要主动执行耗时自测" in command.payload["prompt"]
+
+
+def test_test_mode_smoke_fallback_keeps_prompt_tiny():
+    db = _test_session()
+    job = Job(
+        id="job1",
+        user_id="user1",
+        status=JobState.GENERATING_PROMPT,
+        directions=["AgentOps E2E smoke: create README with AgentOps E2E smoke OK only."],
+        intent={
+            "run_mode": "test",
+            "prompt_brief": "AgentOps E2E smoke: create README with AgentOps E2E smoke OK only.",
+            "flags": ["test_run", "chain_validation_only", "single_page_quick"],
+        },
+    )
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.GENERATING_PROMPT)
+
+    prompt = prompt_writer.build_fallback_prompt(job, round_)
+
+    assert "AgentOps E2E smoke OK" in prompt
+    assert "do not run slow tests" in prompt
+    assert "涓氬姟妯″潡" not in prompt
+    assert "鍋氭垚涓€涓兘鐩存帴杩愯鐨勪笟鍔″伐浣滃彴" not in prompt
+    assert len(prompt) < 520
 
 
 def test_start_job_test_button_preserves_chain_validation_flags_when_llm_omits_them(monkeypatch):
@@ -492,6 +518,56 @@ def test_stop_job_cancels_active_work_and_leaves_stop_command_queued():
     assert stop_command.status == "queued"
     assert stop_command.payload["reason"] == "user_stop"
     assert stop_command.payload["project_name"] == "roles-dashboard"
+    assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
+
+
+def test_stop_job_queues_stop_for_stale_worker_that_is_running_active_command():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    worker = _create_worker(db, user.id)
+    worker.last_seen_at = now_utc() - timedelta(minutes=10)
+    _save_required_settings(db, user.id, workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.WAITING_TRAE, directions=["demo"])
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="roles-dashboard",
+        direction="demo",
+        workspace_path="D:/mr-d/roles-dashboard",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.WAITING_TRAE,
+    )
+    active = WorkerCommand(
+        id="active-wait",
+        worker_id=worker.worker_id,
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"workspace_path": "D:/mr-d/roles-dashboard"},
+        status="running",
+    )
+    db.add_all([job, project, round_, active])
+    db.commit()
+
+    stop_job(user=user, db=db)
+
+    db.refresh(active)
+    stop_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value)
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    assert active.status == "cancelled"
+    assert stop_command is not None
+    assert stop_command.worker_id == worker.worker_id
+    assert stop_command.status == "queued"
     assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
 
 

@@ -489,6 +489,7 @@ def stop_job(
             "previous_round_status": previous_round_status,
         },
     )
+    stop_worker_id = latest_active_worker_id(db, job.id, round_.id if round_ else None)
     cancelled_commands = cancel_job_worker_commands(db, job.id)
     if cancelled_commands:
         add_log(
@@ -506,6 +507,8 @@ def stop_job(
         job.id,
         round_.id if round_ else None,
         runtime_context=current_job_runtime_context(db, job, round_),
+        preferred_worker_id=stop_worker_id,
+        allow_stale_preferred_worker=True,
     )
     if command:
         add_log(
@@ -696,6 +699,11 @@ def latest_active_worker_command(db: Session, job_id: str, round_id: str | None)
     if round_id:
         query = query.where(WorkerCommand.round_id == round_id)
     return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+
+
+def latest_active_worker_id(db: Session, job_id: str, round_id: str | None) -> str:
+    command = latest_active_worker_command(db, job_id, round_id)
+    return str(command.worker_id or "").strip() if command else ""
 
 
 def latest_resumable_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
@@ -934,15 +942,17 @@ def enqueue_stop_worker_command(
     round_id: str | None,
     reason: str = "user_stop",
     runtime_context: dict | None = None,
+    preferred_worker_id: str | None = None,
+    allow_stale_preferred_worker: bool = False,
 ):
     settings = load_user_settings(db, user_id)
-    worker_id = settings.get("worker", {}).get("worker_id")
+    worker_id = str(preferred_worker_id or settings.get("worker", {}).get("worker_id") or "").strip()
     if not worker_id:
         return None
     worker = get_worker_by_worker_id(db, worker_id)
     if not worker or worker.user_id != user_id:
         return None
-    if is_worker_offline(worker):
+    if is_worker_offline(worker) and not (allow_stale_preferred_worker and preferred_worker_id):
         return None
     return create_worker_command(
         db,
