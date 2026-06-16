@@ -964,6 +964,26 @@ def test_run_git_submit_initializes_project_and_sets_remote(tmp_path: Path):
     assert "trae_reply_traces/" in gitignore
 
 
+def test_run_git_submit_ignores_parent_repository(tmp_path: Path):
+    parent = tmp_path / "workspace-root"
+    project = parent / "project"
+    parent.mkdir()
+    project.mkdir()
+    _git(parent, "init")
+    _git(parent, "config", "user.name", "Parent User")
+    _git(parent, "config", "user.email", "parent@example.invalid")
+    (parent / "outside.txt").write_text("outside\n", encoding="utf-8")
+    (project / "README.md").write_text("AgentOps E2E smoke OK\n", encoding="utf-8")
+
+    result = run_git_submit(parent, project, commit_message="AgentOps test", push=False)
+
+    assert result["status"] == "committed"
+    assert result["repo_prepare"]["initialized"] is True
+    assert (project / ".git").exists()
+    assert result["changed_files"] == 1
+    assert "outside.txt" not in _git(project, "show", "--name-only", "--format=").stdout
+
+
 def test_probe_trace_reports_full_trace_shape():
     trace = (
         "toolName: edit\n"

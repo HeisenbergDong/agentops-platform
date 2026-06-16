@@ -211,7 +211,13 @@ def _ensure_git_repository(
     project_path.mkdir(parents=True, exist_ok=True)
     initialized = False
     inside = _git(project_path, ["rev-parse", "--is-inside-work-tree"], timeout, cancellation_check)
-    if inside.returncode != 0 or inside.stdout.strip() != "true":
+    top_level = _git(project_path, ["rev-parse", "--show-toplevel"], timeout, cancellation_check) if inside.returncode == 0 else None
+    using_parent_repo = (
+        top_level is not None
+        and top_level.returncode == 0
+        and Path(top_level.stdout.strip()).resolve() != project_path.resolve()
+    )
+    if using_parent_repo or inside.returncode != 0 or inside.stdout.strip() != "true":
         init = _git(project_path, ["init", "-b", branch_name], timeout, cancellation_check)
         if init.returncode != 0:
             init = _git(project_path, ["init"], timeout, cancellation_check)
