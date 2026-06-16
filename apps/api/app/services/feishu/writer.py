@@ -87,7 +87,6 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
     access_token, refreshed_cache, auth_mode = get_feishu_access_token(feishu_config)
     try:
         field_meta = _list_fields(access_token, app_token, table_id)
-        records = _list_records(access_token, app_token, table_id)
     except FeishuWriteError as exc:
         if refreshed_cache and exc.token_cache is None:
             exc.token_cache = refreshed_cache
@@ -96,10 +95,10 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
         raise
     available_fields = {item.get("field_name", "") for item in field_meta if item.get("field_name")}
     options = _option_names(field_meta)
-    explicit_target = _find_explicit_target_record(records, feishu_config)
+    explicit_target = _find_explicit_target_record(access_token, app_token, table_id, feishu_config)
     if explicit_target is None and _explicit_target_requested(feishu_config):
         raise FeishuWriteError("Explicit Feishu target row was not found.")
-    target_record = explicit_target or _find_empty_session_record(records)
+    target_record = explicit_target or _find_empty_session_record(access_token, app_token, table_id)
     target_record_id = _record_id(target_record)
     field_report = _field_mapping_report(fields, available_fields)
     if field_report["missing_required_fields"]:
@@ -116,7 +115,7 @@ def write_feishu_record(feishu_config: dict[str, Any], fields: dict[str, Any]) -
         if auth_mode and not exc.auth_mode:
             exc.auth_mode = auth_mode
         raise
-    duplicate = _find_duplicate_record(records, target_record_id, mapped)
+    duplicate = _find_duplicate_record_for_search(access_token, app_token, table_id, target_record_id, mapped)
     if duplicate:
         return {
             "status": "skipped_duplicate",
@@ -202,18 +201,33 @@ def _list_fields(access_token: str, app_token: str, table_id: str) -> list[dict[
     return list(payload.get("items") or [])
 
 
-def _list_records(access_token: str, app_token: str, table_id: str) -> list[dict[str, Any]]:
+def _search_records(
+    access_token: str,
+    app_token: str,
+    table_id: str,
+    *,
+    field_names: list[str] | None = None,
+    conditions: list[dict[str, Any]] | None = None,
+    page_size: int = 100,
+    max_pages: int = 1,
+) -> list[dict[str, Any]]:
     records: list[dict[str, Any]] = []
     page_token = ""
-    while True:
-        params = {"page_size": "500"}
+    body: dict[str, Any] = {"automatic_fields": False}
+    if field_names:
+        body["field_names"] = field_names
+    if conditions:
+        body["filter"] = {"conjunction": "and", "conditions": conditions}
+    for _ in range(max_pages):
+        params = {"page_size": str(page_size)}
         if page_token:
             params["page_token"] = page_token
         data = _request_json(
-            "GET",
-            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records",
+            "POST",
+            f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/search",
             access_token,
             params=params,
+            json=body,
         )
         payload = data.get("data") if isinstance(data.get("data"), dict) else {}
         records.extend(list(payload.get("items") or []))
@@ -225,7 +239,16 @@ def _list_records(access_token: str, app_token: str, table_id: str) -> list[dict
     return records
 
 
-def _find_empty_session_record(records: list[dict[str, Any]]) -> dict[str, Any]:
+def _find_empty_session_record(access_token: str, app_token: str, table_id: str) -> dict[str, Any]:
+    records = _search_records(
+        access_token,
+        app_token,
+        table_id,
+        field_names=["UID", SESSION_FIELD],
+        conditions=[{"field_name": SESSION_FIELD, "operator": "isEmpty", "value": []}],
+        page_size=100,
+        max_pages=5,
+    )
     candidates: list[tuple[int, int, str]] = []
     by_id = {}
     for index, item in enumerate(records, start=1):
@@ -247,6 +270,30 @@ def _explicit_target_requested(feishu_config: dict[str, Any]) -> bool:
 
 
 def _find_explicit_target_record(
+    access_token: str,
+    app_token: str,
+    table_id: str,
+    feishu_config: dict[str, Any],
+) -> dict[str, Any] | None:
+    target_record_id = _first_config_value(feishu_config, TARGET_RECORD_ID_KEYS)
+    if target_record_id:
+        return _get_record(access_token, app_token, table_id, target_record_id)
+
+    target_uid = _first_config_value(feishu_config, TARGET_UID_KEYS)
+    if not target_uid:
+        return {}
+    records = _search_records(
+        access_token,
+        app_token,
+        table_id,
+        field_names=["UID", SESSION_FIELD],
+        conditions=[{"field_name": "UID", "operator": "is", "value": [target_uid]}],
+        page_size=10,
+    )
+    return records[0] if records else None
+
+
+def _find_explicit_target_record_from_records(
     records: list[dict[str, Any]],
     feishu_config: dict[str, Any],
 ) -> dict[str, Any] | None:
@@ -265,6 +312,17 @@ def _find_explicit_target_record(
         if str(fields.get("UID") or "").strip() == target_uid:
             return record
     return None
+
+
+def _get_record(access_token: str, app_token: str, table_id: str, record_id: str) -> dict[str, Any] | None:
+    data = _request_json(
+        "GET",
+        f"{FEISHU_BASE_URL}/bitable/v1/apps/{app_token}/tables/{table_id}/records/{record_id}",
+        access_token,
+    )
+    payload = data.get("data") if isinstance(data.get("data"), dict) else {}
+    record = payload.get("record") if isinstance(payload.get("record"), dict) else payload
+    return record if _record_id(record) else None
 
 
 def _filter_allowed_fields(fields: dict[str, Any], available_fields: set[str]) -> dict[str, Any]:
@@ -310,6 +368,81 @@ def _build_updates(
         if name in overwrite_allowed or _is_empty(current.get(name)):
             updates[name] = normalized
     return updates
+
+
+def _find_duplicate_record_for_search(
+    access_token: str,
+    app_token: str,
+    table_id: str,
+    target_record_id: str,
+    mapped: dict[str, Any],
+) -> dict[str, Any]:
+    field_names = ["UID", SESSION_FIELD, "User Prompt", "杞", "浠诲姟绫诲瀷", "涓氬姟棰嗗煙"]
+    session = str(mapped.get(SESSION_FIELD) or "").strip()
+    if session:
+        duplicate = _first_matching_record(
+            _search_records(
+                access_token,
+                app_token,
+                table_id,
+                field_names=field_names,
+                conditions=[{"field_name": SESSION_FIELD, "operator": "is", "value": [session]}],
+                page_size=20,
+            ),
+            target_record_id,
+            lambda fields: str(fields.get(SESSION_FIELD) or "").strip() == session,
+        )
+        if duplicate:
+            return duplicate
+
+    prompt = _normalized_duplicate_text(mapped.get("User Prompt"))
+    round_label = _normalized_duplicate_text(mapped.get("杞"))
+    if not prompt or not round_label:
+        return {}
+    task_type = _normalized_duplicate_text(mapped.get("浠诲姟绫诲瀷"))
+    domain = _normalized_duplicate_text(mapped.get("涓氬姟棰嗗煙"))
+    return _first_matching_record(
+        _search_records(
+            access_token,
+            app_token,
+            table_id,
+            field_names=field_names,
+            conditions=[
+                {"field_name": "User Prompt", "operator": "is", "value": [str(mapped.get("User Prompt") or "")]},
+                {"field_name": "杞", "operator": "is", "value": [str(mapped.get("杞") or "")]},
+            ],
+            page_size=50,
+        ),
+        target_record_id,
+        lambda fields: (
+            _normalized_duplicate_text(fields.get("User Prompt")) == prompt
+            and _normalized_duplicate_text(fields.get("杞")) == round_label
+            and (
+                not task_type
+                or not _normalized_duplicate_text(fields.get("浠诲姟绫诲瀷"))
+                or _normalized_duplicate_text(fields.get("浠诲姟绫诲瀷")) == task_type
+            )
+            and (
+                not domain
+                or not _normalized_duplicate_text(fields.get("涓氬姟棰嗗煙"))
+                or _normalized_duplicate_text(fields.get("涓氬姟棰嗗煙")) == domain
+            )
+        ),
+    )
+
+
+def _first_matching_record(
+    records: list[dict[str, Any]],
+    target_record_id: str,
+    predicate,
+) -> dict[str, Any]:
+    for record in records:
+        if _record_id(record) == target_record_id:
+            continue
+        fields = record.get("fields") or {}
+        if predicate(fields):
+            return record
+    return {}
 
 
 def _find_duplicate_record(

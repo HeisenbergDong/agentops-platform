@@ -121,6 +121,47 @@ def test_write_feishu_record_fails_when_required_payload_field_is_missing_from_t
         )
 
 
+def test_write_feishu_record_uses_search_instead_of_listing_all_records(monkeypatch):
+    calls = []
+
+    monkeypatch.setattr(
+        writer,
+        "get_feishu_access_token",
+        lambda _config: ("cached-token", None, "tenant"),
+    )
+    monkeypatch.setattr(
+        writer,
+        "_list_fields",
+        lambda _token, _app, _table: [
+            {"field_name": writer.SESSION_FIELD},
+            {"field_name": "User Prompt"},
+        ],
+    )
+
+    def fake_request_json(method, url, access_token, params=None, json=None):
+        calls.append((method, url, json))
+        if method == "POST" and url.endswith("/records/search"):
+            return {"code": 0, "data": {"items": [{"record_id": "rec-empty", "fields": {"UID": "1", writer.SESSION_FIELD: ""}}]}}
+        if method == "PUT":
+            return {"code": 0, "data": {"record": {"record_id": "rec-empty"}}}
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(writer, "_request_json", fake_request_json)
+
+    result = writer.write_feishu_record(
+        {
+            "app_token": "app-token",
+            "table_id": "table-id",
+            "token_cache": {"tenant_access_token": "cached-token", "expires_at": 4102444800},
+        },
+        {writer.SESSION_FIELD: "session-1", "User Prompt": "prompt"},
+    )
+
+    assert result["status"] == "written"
+    assert any(method == "POST" and url.endswith("/records/search") for method, url, _json in calls)
+    assert not any(method == "GET" and url.endswith("/records") for method, url, _json in calls)
+
+
 def test_feishu_error_message_identifies_permission_and_field_mapping():
     permission = writer._format_feishu_error(403, {"code": 99991663, "msg": "Forbidden"}, "")
     bitable_permission = writer._format_feishu_error(403, {"code": 91403, "msg": "Forbidden"}, "")
@@ -217,7 +258,21 @@ def _patch_feishu_dependencies(monkeypatch, records):
         lambda _config: ("cached-token", None, "tenant"),
     )
     monkeypatch.setattr(writer, "_list_fields", lambda _token, _app, _table: fields)
-    monkeypatch.setattr(writer, "_list_records", lambda _token, _app, _table: records)
+    monkeypatch.setattr(
+        writer,
+        "_find_empty_session_record",
+        lambda _token, _app, _table: records[-1] if records else {},
+    )
+    monkeypatch.setattr(
+        writer,
+        "_find_duplicate_record_for_search",
+        lambda _token, _app, _table, target_id, mapped: writer._find_duplicate_record(records, target_id, mapped),
+    )
+    monkeypatch.setattr(
+        writer,
+        "_find_explicit_target_record",
+        lambda _token, _app, _table, config: writer._find_explicit_target_record_from_records(records, config),
+    )
     monkeypatch.setattr(
         writer,
         "_request_json",
