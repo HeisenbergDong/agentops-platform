@@ -271,6 +271,7 @@ def test_wait_completion_success_queues_trace_copy():
     assert round_.status == JobState.COLLECTING_TRACE
     assert next_command is not None
     assert next_command.status == "queued"
+    assert next_command.payload["completion_observation"]["supervisor_decision"]["action"] == "collect_trace"
     assert collect_log is not None
     assert collect_log.extra["supervisor_decision"]["action"] == "collect_trace"
     assert collect_log.extra["watcher_observation"]["activity"]["source"] == "agent_log"
@@ -385,6 +386,7 @@ def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
     assert round_.status == JobState.COLLECTING_TRACE
     assert copy_command is not None
     assert copy_command.payload["allow_local_trace_fallback"] is True
+    assert copy_command.payload["completion_observation"]["supervisor_decision"]["action"] == "collect_trace"
     assert click_command is None
 
 
@@ -431,6 +433,7 @@ def test_wait_completion_timeout_with_completion_decision_queues_trace_collectio
     assert job.status == JobState.COLLECTING_TRACE
     assert round_.status == JobState.COLLECTING_TRACE
     assert copy_command is not None
+    assert copy_command.payload["completion_observation"]["supervisor_decision"]["trae_turn_completion_decision"]["is_complete"] is True
 
 
 def test_stop_current_task_result_logs_structured_stop_confirmation():
@@ -1606,10 +1609,16 @@ def test_click_continue_typed_continue_event_message_is_precise():
     assert "点击 Trae CN 的继续按钮" not in message
 
 
-def test_incomplete_trace_falls_back_to_recovery_after_max_copy_attempts():
+def test_completed_trace_copy_failure_stops_without_continue_after_max_copy_attempts():
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
-    command.payload = {"trace_copy_attempts": 5, "max_trace_copy_attempts": 5}
+    command.payload = {
+        "trace_copy_attempts": 5,
+        "max_trace_copy_attempts": 5,
+        "completion_observation": {
+            "supervisor_decision": {"action": "collect_trace", "reason": "visual_completion_detected"}
+        },
+    }
     db.commit()
 
     handle_worker_result(
@@ -1621,11 +1630,54 @@ def test_incomplete_trace_falls_back_to_recovery_after_max_copy_attempts():
     db.refresh(job)
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
-    assert job.status == JobState.AWAITING_CONTINUE
-    assert round_.status == JobState.AWAITING_CONTINUE
-    assert next_command is not None
-    assert next_command.payload["recovery_reason"] == "trace_too_short"
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.TRACE_MISSING_ABORT))
+    assert job.status == JobState.TRACE_MISSING_ABORT
+    assert round_.status == JobState.TRACE_MISSING_ABORT
+    assert round_.trace_status == "trace_unavailable_after_completed:trace_too_short"
+    assert next_command is None
+    assert log is not None
+    assert log.extra["completed_without_full_trace"] is True
     assert _latest_dissatisfaction_reason(db) is None
+
+
+def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypatch):
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    job.intent = {
+        "run_mode": "test",
+        "dissatisfaction_policy": "force_test_unsatisfied",
+        "downstream_policy": "test_chain_allowed",
+        "trace_gate_policy": "test_exception",
+        "flags": ["test_run", "continue_chain_on_trae_error", "force_unsatisfied"],
+    }
+    command.payload = {
+        "trace_copy_attempts": 5,
+        "max_trace_copy_attempts": 5,
+        "completion_observation": {
+            "supervisor_decision": {"action": "collect_trace", "reason": "visual_completion_detected"}
+        },
+    }
+    db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/webhook/test"}))
+    db.commit()
+    monkeypatch.setattr(webhook_notifier.httpx, "post", lambda *args, **kwargs: type("Response", (), {"status_code": 200, "text": "ok"})())
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"raw_text": "short"}),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    screenshot_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CAPTURE_SCREENSHOT.value))
+    click_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    assert job.status == JobState.SCREENSHOT_CAPTURING
+    assert round_.status == JobState.SCREENSHOT_CAPTURING
+    assert round_.trace_status == "test_exception"
+    assert screenshot_command is not None
+    assert click_command is None
+    assert trace is not None
 
 
 def test_incomplete_trace_stops_after_copy_and_continue_limits():

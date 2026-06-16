@@ -13,6 +13,7 @@ states:
   - collecting_trace
   - trace_validating
   - trace_missing_abort
+  - test_chain_exception
   - screenshot_capturing
   - product_reviewing
   - browser_accepting
@@ -29,6 +30,12 @@ states:
 hard_gates:
   github_requires: trace_validating_passed
   feishu_requires: github_submitting_passed
+
+completion_trace_rules:
+  - waiting_trae_to_collecting_trace_must_persist_completion_observation
+  - copy_latest_reply_failure_after_completion_must_not_enqueue_click_continue
+  - formal_completed_without_trace_goes_to_trace_missing_abort
+  - test_completed_without_trace_may_continue_only_with_labeled_test_chain_exception
 
 abort_states:
   - trace_missing_abort

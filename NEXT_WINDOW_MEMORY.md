@@ -11,6 +11,35 @@ Every future work session should follow this operating rhythm unless the user ex
 5. Do not stop after only proposing a plan or only making local code changes when the user's intent is to fix/ship the system.
 6. If deployment is unsafe or blocked, clearly explain the blocker and what has already been completed.
 
+## 2026-06-16 Completed-Trae Trace Copy Fallback Fix
+
+User showed that Trae CN had already reached a visible task-completed/code-changes state, but AgentOps kept observing and later required Pause. Production diagnostics showed the previous fix did enter `copy_latest_reply`; the remaining bug was that trace-copy failures were treated like unfinished Trae replies and routed back into `click_continue` / `wait_completion`.
+
+Implemented locally:
+
+- API now persists the `completion_observation` from `wait_completion` into `copy_latest_reply` commands and preserves it across trace-copy retries.
+- If `copy_latest_reply` fails or returns an incomplete trace after a persisted completion observation:
+  - formal mode stops at `trace_missing_abort` with a clear completed-but-trace-unavailable reason;
+  - test-chain mode creates a labeled test trace exception and continues to screenshot/review/GitHub/Feishu validation;
+  - neither path enqueues `click_continue`.
+- Worker stop verification no longer treats noisy Trae log mtime churn alone as active generation; project file changes are the strong stop-verification signal.
+- Worker stop no longer uses the AI UI analyst by default, avoiding long stop delays from visual-analysis timeouts. It still uses explicit UIA stop controls and can opt into AI analysis via payload.
+- Worker runtime version is now `0.1.7-completed-trace-stop` with capabilities:
+  - `completed_trace_unavailable_handoff`
+  - `stop_log_noise_filter`
+- Role rules updated so orchestrator, prompt writer, worker controller, and state-machine roles know:
+  - completed Trae turn and trace availability are separate states;
+  - trace-copy failure after completion must not be routed to continue/reobserve;
+  - formal mode remains strict, test mode may continue only with labeled exception.
+
+Verification passed locally:
+
+- API full suite: `120 passed, 3 warnings`.
+- Worker full suite: `133 passed, 6 warnings`.
+- API worker/preflight targeted suite: `82 passed`.
+- Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
+- `git diff --check` passed.
+
 ## 2026-06-16 Stop Confirmation, Trace Handoff, and Role SOP Fix
 
 User asked to fix two older unresolved issues and first feed the corrected understanding into LLM roles:

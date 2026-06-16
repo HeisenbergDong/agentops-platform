@@ -143,6 +143,25 @@ def test_stop_current_task_reports_structured_confirmation(monkeypatch: pytest.M
     assert result["data"]["message"] == "Worker stop completed."
 
 
+def test_stop_verification_ignores_noisy_trae_log_when_project_is_quiet():
+    before = {
+        "trae_log": {"path": "C:/Trae/logs/main.log", "mtime": 10, "size": 100},
+        "project": {"path": "D:/work/project/app.py", "mtime": 20, "size": 200},
+    }
+    after = {
+        "trae_log": {"path": "C:/Trae/logs/main.log", "mtime": 11, "size": 120},
+        "project": {"path": "D:/work/project/app.py", "mtime": 20, "size": 200},
+    }
+
+    result = command_runner._stop_verification_result(before, after)
+
+    assert result["log_tail_changed"] is True
+    assert result["project_write_changed"] is False
+    assert result["log_change_ignored_for_generation"] is True
+    assert result["still_generating_suspected"] is False
+    assert result["trae_ui_stopped_verified"] is True
+
+
 def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
     workspace = tmp_path / "project"
     workspace.mkdir()

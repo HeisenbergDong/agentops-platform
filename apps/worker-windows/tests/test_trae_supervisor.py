@@ -210,6 +210,36 @@ def test_supervisor_collects_trace_from_visible_task_complete_text():
     assert decision["trae_turn_completion_decision"]["next_action"] == "copy_trace"
 
 
+def test_supervisor_collects_trace_from_trae_code_change_completion_view():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text=(
+                "任务完成\n"
+                "代码变更\n"
+                "67 个文件变更 +5675 -21\n"
+                "build.bat +28 -0\n"
+                "JobController.java +46 -0"
+            ),
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+            idle_seconds=90,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            watcher_observation={
+                "project_write": {"mtime": 1000.0, "path": "D:/work/permission-system/build.bat"},
+                "activity": {"recent": False, "quiet_seconds": 90.0, "source": "project"},
+            },
+        )
+    )
+
+    assert decision["action"] == "collect_trace"
+    assert decision["reason"] == "ui_completion_detected"
+    completion = decision["trae_turn_completion_decision"]
+    assert completion["is_complete"] is True
+    assert "ui_completion_visible" in completion["evidence"]
+    assert "project_write_detected" in completion["evidence"]
+
+
 def test_supervisor_collects_trace_from_low_confidence_completed_candidate_with_project_write():
     decision = decide_next_action(
         SupervisorObservation(

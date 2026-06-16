@@ -202,7 +202,7 @@ class CommandRunner:
                 workspace_error = str(exc)
         before = _stop_verification_snapshot(workspace_path)
         stop_click = _try_click_trae_stop(
-            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", False)) else None
         )
         cleanup = cleanup_local_activity(
             workspace_path=workspace_path,
@@ -460,7 +460,8 @@ def _float_or_none(value: Any) -> float | None:
 
 def _try_click_trae_stop(ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None) -> dict[str, Any]:
     try:
-        return click_stop_generation(timeout_seconds=5.0, ui_analyst=ui_analyst)
+        timeout_seconds = 2.0 if ui_analyst is None else 5.0
+        return click_stop_generation(timeout_seconds=timeout_seconds, ui_analyst=ui_analyst)
     except Exception as exc:
         return {"status": "not_clicked", "reason": "stop_click_failed", "error": str(exc)}
 
@@ -480,12 +481,13 @@ def _stop_verification_snapshot(workspace_path: Path | None) -> dict[str, Any]:
 def _stop_verification_result(before: dict[str, Any], after: dict[str, Any]) -> dict[str, Any]:
     log_changed = _snapshot_changed(before.get("trae_log"), after.get("trae_log"))
     project_changed = _snapshot_changed(before.get("project"), after.get("project"))
-    still_generating = bool(log_changed or project_changed)
+    still_generating = bool(project_changed)
     return {
         "before": before,
         "after": after,
         "log_tail_changed": log_changed,
         "project_write_changed": project_changed,
+        "log_change_ignored_for_generation": bool(log_changed and not project_changed),
         "trae_ui_stopped_verified": not still_generating,
         "still_generating_suspected": still_generating,
     }

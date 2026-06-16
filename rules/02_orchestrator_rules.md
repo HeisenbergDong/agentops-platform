@@ -29,6 +29,10 @@ The completion decision should combine multiple signals instead of requiring a p
 
 `keep/adopt/save changes` is evidence that Trae finished producing changes. It may be clicked only when the Worker is still in a safe UI-intervention state, but it must not block trace collection when other evidence already shows the turn is complete.
 
+When `waiting_trae` transitions to `collecting_trace`, persist the completion observation into the next Worker command payload. If `copy_latest_reply` later fails, exhausts retries, or returns only an incomplete trace, do not enqueue `click_continue` merely because trace collection failed. A completed Trae turn with unavailable trace is a trace-gate problem, not an unfinished-Trae problem.
+
+Formal mode must stop at `trace_missing_abort` with a clear message when the completed Trae turn cannot provide a verified trace. Test-chain mode may create a labeled test trace exception and continue screenshot/review/GitHub/Feishu validation, but every downstream record must say it is a test exception and not formal acceptance.
+
 ## Gate Rules
 
 - Trace validation must pass before screenshot, review, GitHub, or Feishu business flow proceeds.

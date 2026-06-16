@@ -58,6 +58,7 @@ FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
 DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
+TRACE_UNAVAILABLE_AFTER_COMPLETION = "trace_unavailable_after_completed"
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -265,6 +266,7 @@ def _queue_trace_collection_after_wait(
             "trace_copy_attempts": command.payload.get("trace_copy_attempts", 0),
             "max_trace_copy_attempts": command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
             "allow_local_trace_fallback": True,
+            "completion_observation": wait_extra,
         },
     )
     add_log(
@@ -292,6 +294,8 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             "Worker did not copy a complete Trae assistant trace; retrying trace copy before recovery.",
             {**extra, "validation": {"valid": False, "reason": "copy_command_failed"}},
         ):
+            return
+        if _handle_completed_trace_unavailable(db, command, job, round_, {**extra, "validation": {"valid": False, "reason": "copy_command_failed"}}):
             return
         _queue_continue_recovery(
             db,
@@ -338,6 +342,8 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             trace_extra,
         ):
             return
+        if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra):
+            return
         _queue_continue_recovery(
             db,
             command,
@@ -355,6 +361,8 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             if round_:
                 round_.trace_status = gate["reason"]
             if gate["recoverable"]:
+                if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra):
+                    return
                 _queue_continue_recovery(
                     db,
                     command,
@@ -1642,6 +1650,7 @@ def _queue_trace_copy_retry(
             "max_trace_copy_attempts": max_trace_copy_attempts,
             "prompt": round_.prompt if round_ and round_.prompt else source_command.payload.get("prompt", ""),
             "allow_local_trace_fallback": True,
+            "completion_observation": source_command.payload.get("completion_observation", {}),
         },
     )
     add_log(
@@ -1975,6 +1984,117 @@ def _recoverable_copy_gate_reason(reason: str) -> bool:
     if reason in RECOVERABLE_COPY_GATE_REASONS:
         return True
     return reason.startswith("trae_turn_not_completed:")
+
+
+def _handle_completed_trace_unavailable(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    extra: dict,
+) -> bool:
+    if not _has_completed_observation(command, extra):
+        return False
+
+    trace_status = _completed_trace_unavailable_reason(extra)
+    completed_extra = {
+        **extra,
+        "trace_status": trace_status,
+        "completion_observation": _completion_observation(command, extra),
+        "completed_without_full_trace": True,
+    }
+    if round_:
+        round_.trace_status = trace_status
+
+    if round_ and _test_chain_allowed(job):
+        _apply_test_trace_exception(db, job, round_, command, "")
+        job.status = JobState.SCREENSHOT_CAPTURING
+        round_.status = JobState.SCREENSHOT_CAPTURING
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.SCREENSHOT_CAPTURING,
+            message=(
+                "Trae was already completed but the full trace could not be copied; "
+                "test-chain mode will continue with a labeled trace exception."
+            ),
+            level="warning",
+            extra=completed_extra,
+        )
+        screenshot_command = _enqueue_worker_command(
+            db,
+            command,
+            WorkerCommandType.CAPTURE_SCREENSHOT,
+            {"target": "trae_window", "quality_required": True},
+        )
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.SCREENSHOT_CAPTURING,
+            message="capture_screenshot worker command queued after test trace exception.",
+            extra={"worker_id": screenshot_command.worker_id, "command_id": screenshot_command.id},
+        )
+        return True
+
+    _mark_trace_missing_abort(
+        db,
+        job,
+        round_,
+        (
+            "Trae was already completed, but Worker could not copy a complete assistant trace. "
+            "Downstream review, GitHub, and Feishu writes were stopped instead of clicking continue again."
+        ),
+        completed_extra,
+    )
+    return True
+
+
+def _has_completed_observation(command: WorkerCommand, extra: dict) -> bool:
+    observation = _completion_observation(command, extra)
+    if not observation:
+        return False
+    supervisor = observation.get("supervisor_decision") if isinstance(observation.get("supervisor_decision"), dict) else {}
+    completion = (
+        supervisor.get("trae_turn_completion_decision")
+        if isinstance(supervisor.get("trae_turn_completion_decision"), dict)
+        else {}
+    )
+    if str(supervisor.get("action") or "") == "collect_trace":
+        return True
+    if completion.get("is_complete") is True and str(completion.get("next_action") or "") == "copy_trace":
+        return True
+    if str(supervisor.get("reason") or "") in {
+        "ui_completion_detected",
+        "trae_turn_completed",
+        "timeout_completion_detected",
+        "completion_candidate_with_project_write",
+        "completion_evidence_threshold",
+        "visual_completion_detected",
+    }:
+        return True
+    return False
+
+
+def _completion_observation(command: WorkerCommand, extra: dict) -> dict:
+    payload_observation = command.payload.get("completion_observation")
+    if isinstance(payload_observation, dict) and payload_observation:
+        return payload_observation
+    extra_observation = extra.get("completion_observation")
+    if isinstance(extra_observation, dict) and extra_observation:
+        return extra_observation
+    return {}
+
+
+def _completed_trace_unavailable_reason(extra: dict) -> str:
+    reason = _trace_copy_retry_reason(extra)
+    if reason in TRACE_COPY_RETRY_REASONS or reason == "copy_command_failed":
+        return f"{TRACE_UNAVAILABLE_AFTER_COMPLETION}:{reason}"
+    gate = extra.get("current_turn_gate")
+    if isinstance(gate, dict) and str(gate.get("reason") or "").strip():
+        return f"{TRACE_UNAVAILABLE_AFTER_COMPLETION}:{gate['reason']}"
+    return TRACE_UNAVAILABLE_AFTER_COMPLETION
 
 
 def _mark_trace_missing_abort(
