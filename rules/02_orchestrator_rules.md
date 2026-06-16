@@ -12,6 +12,23 @@ When the user clicks Continue, preserve pending prompt, current task, direction 
 
 When the user clicks Stop, stop server scheduling, background queues, and the bound Windows Worker. Do not delete existing records.
 
+Stop is successful only after the bound Worker has had a chance to execute `stop_current_task` and report a structured result. The scheduler should log whether local project processes were killed, whether Trae stop was clicked, whether Trae still appears to be generating, and whether Continue must send a resume prompt before re-observing.
+
+Do not treat Stop as discard/delete/reset. Preserve the job, current round, project workspace, prompt, trace candidates, and downstream evidence gathered so far.
+
+## Trae Completion Handoff
+
+The scheduler must not wait forever after Trae visibly finishes. Completion-to-trace handoff is a first-class transition:
+
+1. Worker sends the prompt to Trae.
+2. Worker observes Trae until the current turn is complete or safely recoverable.
+3. When Trae appears complete, the next command is `copy_latest_reply`.
+4. Trace validation decides whether downstream review/GitHub/Feishu may proceed.
+
+The completion decision should combine multiple signals instead of requiring a perfect local log match: Trae task card completed, assistant reply stopped generating, project files were written, Trae logs contain a plausible completed turn, no recent meaningful activity, visual analyst says completed, or a keep/adopt/save banner is visible after changes are complete.
+
+`keep/adopt/save changes` is evidence that Trae finished producing changes. It may be clicked only when the Worker is still in a safe UI-intervention state, but it must not block trace collection when other evidence already shows the turn is complete.
+
 ## Gate Rules
 
 - Trace validation must pass before screenshot, review, GitHub, or Feishu business flow proceeds.

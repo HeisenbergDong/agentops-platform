@@ -91,8 +91,56 @@ def test_stop_cleanup_matches_workspace_and_sandbox(monkeypatch: pytest.MonkeyPa
     result = stop_cleanup.cleanup_local_activity(workspace_path=workspace, project_name="roles-dashboard")
 
     assert result["status"] == "completed"
+    assert result["matched_count"] == 2
+    assert result["killed_count"] == 2
     assert killed == [101, 103]
     assert [item["pid"] for item in result["killed"]] == [101, 103]
+
+
+def test_stop_cleanup_reports_no_matching_processes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "roles-dashboard"
+    workspace.mkdir()
+    monkeypatch.setattr(stop_cleanup, "_query_processes", lambda: [])
+
+    result = stop_cleanup.cleanup_local_activity(workspace_path=workspace, project_name="roles-dashboard")
+
+    assert result["status"] == "no_matching_processes"
+    assert result["matched_count"] == 0
+    assert result["killed_count"] == 0
+    assert result["errors"] == []
+
+
+def test_stop_current_task_reports_structured_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
+    monkeypatch.setattr(
+        command_runner,
+        "cleanup_local_activity",
+        lambda **_kwargs: {
+            "status": "no_matching_processes",
+            "matched_count": 0,
+            "killed_count": 0,
+            "error_count": 0,
+            "killed": [],
+            "errors": [],
+        },
+    )
+    monkeypatch.setattr(command_runner, "_try_click_trae_stop", lambda **_kwargs: {"status": "not_clicked", "reason": "no_stop_button"})
+    monkeypatch.setattr(command_runner, "_stop_verification_snapshot", lambda _workspace: {"project": {"path": "", "mtime": 0}})
+    monkeypatch.setattr(command_runner.time, "sleep", lambda _seconds: None)
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {"command_id": "cmd-stop", "type": "stop_current_task", "payload": {"workspace_path": "project"}}
+    )
+
+    assert result["status"] == "success"
+    report = result["data"]["stop_report"]
+    assert report["stop_confirmed"] is True
+    assert report["cleanup_status"] == "no_matching_processes"
+    assert report["local_processes_killed"] == 0
+    assert result["data"]["message"] == "Worker stop completed."
 
 
 def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

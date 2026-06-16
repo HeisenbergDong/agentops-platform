@@ -95,3 +95,23 @@ def test_trae_ui_analyst_blocks_unsafe_target():
     assert result["risk"] == "blocked"
     assert result["recommended_action"] == "do_not_click"
     assert result["blocked_reason"] == "unsafe_target_label"
+
+
+def test_trae_ui_analyst_treats_keep_bar_as_trace_candidate_during_wait_completion():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_keep_changes",
+        "confidence": 0.82,
+        "risk": "safe",
+        "target": {"action": "keep_button", "label": "Keep changes", "center": {"x": 500, "y": 80}},
+        "evidence": ["changes completed banner is visible"],
+    }
+
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 1000, "height": 800}}},
+    )
+
+    assert result["screen_state"] == "awaiting_keep_changes"
+    assert result["recommended_action"] == "collect_trace_candidate"
+    assert result["target"]["action"] == "keep_button"

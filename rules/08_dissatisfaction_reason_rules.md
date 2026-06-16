@@ -23,3 +23,6 @@ When satisfaction is selected, dissatisfaction reason must be empty.
 - Do not invent broken buttons, login failures, or flow failures without evidence.
 - If build fails, include 1-4 key error lines.
 - Use one representative file path/line example for similar code issues.
+- If automation stopped before trace collection, the process dissatisfaction must say the chain did not yet produce verified Trae trace/evidence; do not pretend GitHub or Feishu evidence exists.
+- If test mode continues after incomplete trace, label it as a test exception and do not describe it as formal business acceptance.
+- If the Worker stop report shows local cleanup succeeded but Trae was not safely stopped, distinguish that from product quality. It is process evidence, not a product bug by itself.

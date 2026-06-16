@@ -62,6 +62,15 @@ PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。
 5. 如果上一轮问题是证据不足或日志缺失，不要让编码助手修“日志轨迹/飞书/GitHub”，而要回到当前业务系统的可验证交互或工程交付。
 只输出 JSON：{"prompt": "...", "prompt_kind": "bugfix|feature", "focus": "...", "acceptance_checks": ["..."], "difference_from_previous": "..."}"""
 
+PROMPT_WRITER_SYSTEM += """
+
+AgentOps SOP context:
+- The platform, not the Trae prompt, handles trace collection, GitHub commit, and Feishu write after Trae completes.
+- Prompts sent to Trae must read like normal user development requests, not internal scheduler instructions.
+- If this round resumes after Stop/Pause, ask Trae to continue from the interruption point, preserve existing files and structure, and avoid rebuilding from scratch.
+- Do not mention internal trace gates, Worker stop reports, scheduler states, or evidence commits unless the product being built is AgentOps itself and those are real product features.
+""".strip()
+
 
 def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) -> str:
     role = get_user_role(db, user.id, "prompt_writer")

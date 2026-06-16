@@ -652,6 +652,65 @@ def test_wait_completion_accepts_visible_task_complete_text(monkeypatch: pytest.
     assert diagnosis_calls["count"] == 0
 
 
+def test_wait_completion_accepts_low_confidence_candidate_with_project_write(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    diagnosis_calls = {"count": 0}
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(
+        wait_module,
+        "window_text_snapshot",
+        lambda window: "Changes completed. Keep changes\napp.js +120 -4",
+    )
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {
+            "status": "missing",
+            "reason": "low_confidence_context_match",
+            "candidate": {"turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+        },
+    )
+    monkeypatch.setattr(
+        wait_module,
+        "build_trae_observation",
+        lambda **kwargs: {
+            "activity": {"recent": False, "source": "project", "quiet_seconds": 120.0},
+            "project_write": {"mtime": 1000.0, "path": "D:/work/demo/app.js", "last_write": "2026-06-16T10:00:00"},
+            "log": {"tail_hash": "abc123"},
+        },
+    )
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
+        diagnosis_calls["count"] += 1
+        return {"state": "idle_or_running", "suggested_intervention": {}}
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    result = wait_module.wait_completion(
+        timeout_seconds=3,
+        stable_seconds=0.5,
+        poll_interval_seconds=0.5,
+        intervention_idle_seconds=0.5,
+        max_interventions=1,
+    )
+
+    assert result["status"] == "completed"
+    completion = result["supervisor_decision"]["trae_turn_completion_decision"]
+    assert completion["is_complete"] is True
+    assert completion["next_action"] == "copy_trace"
+    assert diagnosis_calls["count"] == 0
+
+
 def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass

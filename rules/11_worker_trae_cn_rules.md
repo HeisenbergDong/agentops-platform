@@ -9,3 +9,9 @@
 - If screenshot is not Trae CN or appears locked/unrelated, wait and report instead of clicking.
 - If no safe action is available, return manual_required.
 - Stop signal must prevent new prompts and automatic clicks.
+- `stop_current_task` must run even when another command was just cancelled. It should clean workspace/project-local shells, dev servers, build/test processes, and Trae sandbox children; it must not kill the main Trae window unless explicitly requested.
+- During stop, click only an explicit safe Trae stop-generation control. Never click delete, discard, reset, cancel, abandon, or close-project controls.
+- The stop result must include `stopped`, cleanup status, killed process records, whether a Trae stop click was applied, whether activity still appears to be changing, and whether Continue should first send a resume prompt.
+- Completion detection should return `collect_trace` when the current turn is complete or when a robust completion decision says trace collection should be attempted. Do not keep observing only because a keep/adopt/save banner remains visible.
+- Treat `changes completed`, `keep changes`, `adopt`, and `save` banners as completion evidence. Treat 3003/service interruption/terminal prompts as recoverable states only when the turn is not already complete.
+- If UIA reads only window chrome, combine visual analysis, project writes, Trae logs, and inactivity before giving up. Do not block trace collection solely because UIA text is sparse.

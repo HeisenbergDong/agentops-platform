@@ -52,10 +52,20 @@ def cleanup_local_activity(
             killed.append(record)
         else:
             errors.append(record)
+    status = "completed"
+    if candidates and errors and not killed:
+        status = "failed"
+    elif candidates and errors:
+        status = "partial"
+    elif not candidates:
+        status = "no_matching_processes"
     return {
-        "status": "completed",
+        "status": status,
         "markers": markers,
         "kill_trae": kill_trae,
+        "matched_count": len(candidates),
+        "killed_count": len(killed),
+        "error_count": len(errors),
         "killed": killed,
         "errors": errors,
     }

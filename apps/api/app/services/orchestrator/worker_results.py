@@ -1747,9 +1747,18 @@ def _wait_failure_can_collect_trace(extra: dict) -> bool:
         return False
     data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
     supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    completion = supervisor.get("trae_turn_completion_decision") if isinstance(supervisor.get("trae_turn_completion_decision"), dict) else {}
+    if completion.get("is_complete") is True and str(completion.get("next_action") or "") == "copy_trace":
+        return True
     if str(supervisor.get("action") or "") == "collect_trace":
         return True
-    if str(supervisor.get("reason") or "") in {"ui_completion_detected", "trae_turn_completed", "timeout_completion_detected"}:
+    if str(supervisor.get("reason") or "") in {
+        "ui_completion_detected",
+        "trae_turn_completed",
+        "timeout_completion_detected",
+        "completion_candidate_with_project_write",
+        "completion_evidence_threshold",
+    }:
         return True
     gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
     if gate.get("passed") is True:
@@ -2314,10 +2323,14 @@ def _stop_report_summary(report: dict) -> dict:
     if not isinstance(report, dict):
         return {}
     return {
+        "stop_confirmed": bool(report.get("stop_confirmed") or report.get("worker_command_cancelled")),
         "trae_stop_clicked": bool(report.get("trae_stop_clicked")),
         "trae_ui_stopped_verified": bool(report.get("trae_ui_stopped_verified")),
         "still_generating_suspected": bool(report.get("still_generating_suspected")),
         "requires_resume_prompt": bool(report.get("requires_resume_prompt")),
+        "local_processes_matched": int(report.get("local_processes_matched") or 0),
+        "local_processes_killed": int(report.get("local_processes_killed") or report.get("sandbox_killed") or 0),
+        "local_process_kill_errors": int(report.get("local_process_kill_errors") or 0),
         "sandbox_killed": int(report.get("sandbox_killed") or 0),
         "cleanup_status": str(report.get("cleanup_status") or ""),
     }
@@ -2325,13 +2338,17 @@ def _stop_report_summary(report: dict) -> dict:
 
 def _stop_result_message(report: dict) -> str:
     summary = _stop_report_summary(report)
+    if summary.get("local_process_kill_errors"):
+        return "Worker received the stop command and paused scheduling, but local process cleanup reported warnings."
     if summary.get("trae_stop_clicked") and summary.get("trae_ui_stopped_verified"):
-        return "Worker stopped local activity and confirmed Trae generation is no longer changing."
+        return "Worker stopped local activity, paused Trae generation, and confirmed the stop."
     if summary.get("trae_stop_clicked"):
         return "Worker clicked Trae stop and stopped local activity; continue will send a resume prompt first."
-    if summary.get("sandbox_killed"):
-        return "Worker stopped local sandbox activity; Trae UI stop button was not clicked."
-    return "Worker stop command finished."
+    if summary.get("local_processes_killed"):
+        return "Worker stopped local project/sandbox activity; Trae UI stop button was not clicked."
+    if summary.get("stop_confirmed"):
+        return "Worker received the stop command and confirmed there was no matching local activity to clean."
+    return "Worker stop command finished with no explicit confirmation."
 
 
 def _should_ignore_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> bool:

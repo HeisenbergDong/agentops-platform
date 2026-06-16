@@ -15,6 +15,7 @@ from app.services.orchestrator.events import build_display_message
 from app.services.orchestrator.states import JobState
 from app.worker_gateway.contracts import (
     CreateWorkerCommandRequest,
+    WorkerCommandType,
     WorkerHeartbeat,
     WorkerRegisterRequest,
     WorkerResult,
@@ -168,7 +169,10 @@ def poll_worker_commands(db: Session, worker_id: str, limit: int = 5) -> list[Wo
         db.scalars(
             select(WorkerCommand)
             .where(WorkerCommand.worker_id == worker_id, WorkerCommand.status == "queued")
-            .order_by(WorkerCommand.created_at)
+            .order_by(
+                (WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value).desc(),
+                WorkerCommand.created_at,
+            )
             .limit(limit)
         ).all()
     )

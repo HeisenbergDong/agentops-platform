@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.5-trae-run-vision"
+WORKER_RUNTIME_VERSION = "0.1.6-stop-trace-handoff"
 
 CAPABILITIES = [
     "auto_launch_trae",
@@ -14,6 +14,7 @@ CAPABILITIES = [
     "trae_activity_progress",
     "trae_safe_observation_retry",
     "trae_ui_completion_detection",
+    "trae_turn_completion_decision",
     "diagnose_ui",
     "click_continue",
     "click_confirm",
@@ -27,4 +28,5 @@ CAPABILITIES = [
     "stop_current_task",
     "strict_prompt_submission_verification",
     "workspace_process_cleanup",
+    "structured_stop_confirmation",
 ]

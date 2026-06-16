@@ -214,18 +214,36 @@ class CommandRunner:
         if workspace_error:
             cleanup["workspace_path_error"] = workspace_error
         verification = _stop_verification_result(before, after)
+        cleanup_status = str(cleanup.get("status") or "")
+        cleanup_failed = cleanup_status in {"failed", "partial"} and bool(cleanup.get("errors"))
+        stop_confirmed = bool(
+            not cleanup_failed
+            and (
+                _stop_click_applied(stop_click)
+                or cleanup_status in {"completed", "no_matching_processes", "skipped"}
+            )
+        )
         stop_report = {
             "worker_command_cancelled": True,
+            "stop_confirmed": stop_confirmed,
             "trae_stop_clicked": _stop_click_applied(stop_click),
             "trae_stop_click": stop_click,
+            "local_processes_matched": int(cleanup.get("matched_count") or 0),
+            "local_processes_killed": int(cleanup.get("killed_count") or len(cleanup.get("killed") or [])),
+            "local_process_kill_errors": int(cleanup.get("error_count") or len(cleanup.get("errors") or [])),
             "sandbox_killed": len(cleanup.get("killed") or []),
-            "cleanup_status": cleanup.get("status") or "",
+            "cleanup_status": cleanup_status,
             "trae_ui_stopped_verified": verification.get("trae_ui_stopped_verified", False),
             "still_generating_suspected": verification.get("still_generating_suspected", False),
             "requires_resume_prompt": _stop_click_applied(stop_click),
             "verification": verification,
         }
-        return {"stopped": True, "cleanup": cleanup, "stop_report": stop_report}
+        return {
+            "stopped": True,
+            "message": "Worker stop completed." if stop_confirmed else "Worker stop completed with cleanup warnings.",
+            "cleanup": cleanup,
+            "stop_report": stop_report,
+        }
 
     def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken, command_id: str = "") -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))

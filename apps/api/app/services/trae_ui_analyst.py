@@ -18,7 +18,9 @@ Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bott
 Dangerous actions such as delete, remove, clear, reset, discard, cancel, abandon must have risk "blocked" and recommended_action "do_not_click".
 If the model request failed with 3003 or service interruption, prefer recommended_action "type_continue" with risk "safe".
 If the assistant appears to still be generating or tools are running, use recommended_action "wait".
-If the left task card or assistant area visibly says the task is complete, and there is no visible generating spinner, terminal prompt, service error, continue prompt, or pending run/keep confirmation, classify screen_state "completed" and recommended_action "collect_trace_candidate".
+If the left task card or assistant area visibly says the task is complete, classify screen_state "completed" and recommended_action "collect_trace_candidate" unless there is a visible generating spinner, terminal prompt, service error, or explicit continue prompt.
+If the editor shows "changes completed", "keep changes", "adopt", or "save" after generated file changes, treat it as completion evidence. It may also be screen_state "awaiting_keep_changes", but for wait_completion_state the preferred recommended_action is still "collect_trace_candidate" when no generation/error/terminal prompt is visible.
+Keep/adopt/save buttons are not dangerous, but they are not the core goal; the platform should collect trace after completion.
 When task context asks for wait_completion_state, prefer deciding completed vs blocked vs still working over finding a click target.
 """.strip()
 
@@ -189,6 +191,9 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
     recommended_action = _normalized_choice(str(data.get("recommended_action") or ""), RECOMMENDED_ACTIONS, "")
     if not recommended_action:
         recommended_action = _recommended_action_from_state(screen_state, target, targets)
+    task = str(context.get("task") or "").strip()
+    if task == "wait_completion_state" and screen_state == "awaiting_keep_changes":
+        recommended_action = "collect_trace_candidate"
     confidence = _clamped_float(data.get("confidence"), default=_target_confidence(target, targets))
     risk = _normalized_choice(str(data.get("risk") or ""), RISKS, "")
     if not risk:

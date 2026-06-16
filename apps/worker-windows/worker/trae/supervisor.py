@@ -9,6 +9,7 @@ RECOVERABLE_TURN_REASONS = {
     "awaiting_current_continuation",
     "no_completed_turn_after_prompt_send",
     "current_turn_missing",
+    "low_confidence_context_match",
 }
 PENDING_INTERVENTION_MARKERS = (
     "\u53d8\u66f4\u5df2\u5b8c\u6210",
@@ -34,8 +35,11 @@ UI_COMPLETION_MARKERS = (
     "\u4efb\u52a1\u5b8c\u6210",
     "\u4efb\u52a1\u5df2\u5b8c\u6210",
     "\u5df2\u5b8c\u6210\u4efb\u52a1",
+    "\u53d8\u66f4\u5df2\u5b8c\u6210",
     "Task completed",
     "task completed",
+    "Changes completed",
+    "changes completed",
 )
 
 
@@ -62,6 +66,7 @@ class SupervisorObservation:
 def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
     pending_intervention_visible = has_pending_intervention_text(observation.latest_text)
     gate = completion_gate(observation.turn_probe, observation.output_probe, observation.latest_text)
+    completion_decision = trae_turn_completion_decision(observation, gate)
     activity_summary = {
         "recent": bool(observation.recent_activity),
         "source": str(observation.activity_source or ""),
@@ -71,6 +76,7 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
     }
     context = {
         "completion_gate": gate,
+        "trae_turn_completion_decision": completion_decision,
         "pending_intervention_visible": pending_intervention_visible,
         "output_probe": observation.output_probe,
         "turn_probe": observation.turn_probe or {},
@@ -82,25 +88,15 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
         "max_interventions": int(observation.max_interventions or 0),
     }
 
-    ui_completion_visible = has_ui_completion_text(observation.latest_text)
-
-    if gate["passed"]:
+    if completion_decision["is_complete"]:
         return {
             "action": "collect_trace",
-            "reason": "trae_turn_completed",
+            "reason": str(completion_decision.get("reason") or "trae_turn_completed"),
             "recoverable": False,
             **context,
         }
 
     output_reason = str((observation.output_probe or {}).get("reason") or "")
-    if ui_completion_visible and output_reason not in RECOVERABLE_OUTPUT_REASONS and not observation.window_chrome_only:
-        return {
-            "action": "collect_trace",
-            "reason": "ui_completion_detected",
-            "recoverable": False,
-            **context,
-        }
-
     if output_reason in RECOVERABLE_OUTPUT_REASONS:
         if observation.intervention_count >= observation.max_interventions:
             return {
@@ -241,6 +237,110 @@ def completion_gate(turn_probe: object, output_probe: object, latest_text: str) 
         "session_id": str(turn_probe.get("session_id") or ""),
         "user_message_id": str(turn_probe.get("user_message_id") or ""),
         "pending_intervention_visible": pending_intervention_visible,
+    }
+
+
+def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict[str, Any] | None = None) -> dict[str, Any]:
+    gate = gate or completion_gate(observation.turn_probe, observation.output_probe, observation.latest_text)
+    output_reason = str((observation.output_probe or {}).get("reason") or "")
+    evidence: list[str] = []
+    risk = "safe"
+    score = 0.0
+
+    if gate.get("passed"):
+        evidence.append("completion_gate_passed")
+        score += 0.88
+
+    if has_ui_completion_text(observation.latest_text):
+        evidence.append("ui_completion_visible")
+        score += 0.42
+
+    if has_pending_intervention_text(observation.latest_text):
+        evidence.append("pending_keep_or_safe_action_visible")
+        score += 0.16
+
+    turn = observation.turn_probe if isinstance(observation.turn_probe, dict) else {}
+    candidate = turn.get("candidate") if isinstance(turn.get("candidate"), dict) else {}
+    if str(turn.get("turn_status") or "") == "completed":
+        evidence.append("turn_probe_completed")
+        score += 0.62
+    elif str(candidate.get("turn_status") or candidate.get("status") or "") == "completed":
+        evidence.append("completed_turn_candidate")
+        score += 0.35
+    elif str(turn.get("reason") or "") == "low_confidence_context_match":
+        evidence.append("low_confidence_completed_turn_candidate")
+        score += 0.25
+
+    watcher = observation.watcher_observation if isinstance(observation.watcher_observation, dict) else {}
+    project_write = watcher.get("project_write") if isinstance(watcher.get("project_write"), dict) else {}
+    if project_write.get("mtime") or observation.project_last_write:
+        evidence.append("project_write_detected")
+        score += 0.18
+
+    if not observation.recent_activity:
+        evidence.append("no_recent_meaningful_activity")
+        score += 0.16
+    elif observation.activity_quiet_seconds is not None:
+        try:
+            quiet_seconds = float(observation.activity_quiet_seconds)
+        except (TypeError, ValueError):
+            quiet_seconds = 0.0
+        if quiet_seconds >= max(30.0, min(float(observation.intervention_idle_seconds or 0.0), 120.0)):
+            evidence.append("activity_quiet_long_enough")
+            score += 0.12
+
+    if output_reason in RECOVERABLE_OUTPUT_REASONS:
+        evidence.append(f"recoverable_output:{output_reason}")
+        score -= 0.72
+        risk = "recoverable_before_trace"
+    if observation.terminal_prompt:
+        evidence.append("terminal_prompt_visible")
+        score -= 0.55
+        risk = "blocked_terminal_prompt"
+    if observation.busy:
+        evidence.append("busy_marker_visible")
+        score -= 0.5
+        risk = "still_generating"
+    if observation.window_chrome_only and not gate.get("passed"):
+        evidence.append("window_chrome_only")
+        score -= 0.2
+
+    confidence = max(0.0, min(0.99, score))
+    strong_gate = bool(gate.get("passed"))
+    robust_visual = "ui_completion_visible" in evidence and "no_recent_meaningful_activity" in evidence
+    robust_candidate = (
+        any(item in evidence for item in {"completed_turn_candidate", "low_confidence_completed_turn_candidate"})
+        and "project_write_detected" in evidence
+        and "no_recent_meaningful_activity" in evidence
+    )
+    is_complete = bool(
+        output_reason not in RECOVERABLE_OUTPUT_REASONS
+        and not observation.busy
+        and not observation.terminal_prompt
+        and (
+            strong_gate
+            or confidence >= 0.62
+            or robust_visual
+            or robust_candidate
+        )
+    )
+    reason = "not_complete"
+    if is_complete:
+        if strong_gate:
+            reason = "trae_turn_completed"
+        elif "ui_completion_visible" in evidence:
+            reason = "ui_completion_detected"
+        elif robust_candidate:
+            reason = "completion_candidate_with_project_write"
+        else:
+            reason = "completion_evidence_threshold"
+    return {
+        "is_complete": is_complete,
+        "confidence": round(confidence, 3),
+        "next_action": "copy_trace" if is_complete else "wait_or_recover",
+        "evidence": evidence,
+        "risk": risk,
+        "reason": reason,
     }
 
 

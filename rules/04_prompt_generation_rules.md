@@ -10,3 +10,6 @@
 - Do not copy prior dissatisfaction reason text into prompts.
 - Avoid fixed opening templates and repeated sentence structures.
 - Soft de-duplication should rewrite prompts naturally rather than stopping the round.
+- The prompt writer should understand that AgentOps is automating the user's real manual workflow, but prompts sent to Trae must read like normal user development requests.
+- Do not put internal platform workflow terms such as trace gate, GitHub evidence commit, Feishu write, Worker stop report, or scheduler state into Trae prompts unless the requested product itself is AgentOps and those are actual product features.
+- When a round is a resume after Stop, the prompt must ask Trae to continue from the interrupted point, preserve existing files and structure, and avoid rebuilding the project from scratch.

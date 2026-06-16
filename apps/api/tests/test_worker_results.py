@@ -388,6 +388,97 @@ def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
     assert click_command is None
 
 
+def test_wait_completion_timeout_with_completion_decision_queues_trace_collection():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "supervisor_decision": {
+                    "action": "wait",
+                    "reason": "low_confidence_context_match",
+                    "trae_turn_completion_decision": {
+                        "is_complete": True,
+                        "confidence": 0.72,
+                        "next_action": "copy_trace",
+                        "evidence": [
+                            "completed_turn_candidate",
+                            "project_write_detected",
+                            "no_recent_meaningful_activity",
+                        ],
+                        "risk": "safe",
+                    },
+                },
+                "watcher_observation": {
+                    "project_write": {"path": "D:/work/demo/app.js", "mtime": 1000.0},
+                    "activity": {"recent": False, "quiet_seconds": 120.0},
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_command is not None
+
+
+def test_stop_current_task_result_logs_structured_stop_confirmation():
+    db = _test_session()
+    job = Job(id="job1", user_id="user1", status=JobState.PAUSED, directions=["demo"])
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PAUSED)
+    command = WorkerCommand(
+        id="stop1",
+        worker_id="worker1",
+        user_id="user1",
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.STOP_CURRENT_TASK.value,
+        payload={"reason": "user_stop"},
+        status="completed",
+    )
+    db.add_all([job, round_, command])
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "stopped": True,
+                "stop_report": {
+                    "stop_confirmed": True,
+                    "trae_stop_clicked": False,
+                    "cleanup_status": "no_matching_processes",
+                    "local_processes_matched": 0,
+                    "local_processes_killed": 0,
+                    "local_process_kill_errors": 0,
+                },
+            },
+        ),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.PAUSED).order_by(RuntimeLog.created_at.desc()).limit(1))
+
+    assert log is not None
+    assert log.message == "Worker received the stop command and confirmed there was no matching local activity to clean."
+    assert log.extra["stop_report_summary"]["stop_confirmed"] is True
+    assert log.extra["stop_report_summary"]["cleanup_status"] == "no_matching_processes"
+
+
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)

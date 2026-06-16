@@ -83,6 +83,26 @@ def test_ack_rejects_stale_claim_lease():
     assert acked.status == "claimed"
 
 
+def test_poll_prioritizes_stop_command_before_older_work():
+    db = _test_session()
+    wait_command = _create_command(db)
+    stop_command = worker_repo.create_worker_command(
+        db,
+        worker_id="worker1",
+        user_id="user1",
+        payload=CreateWorkerCommandRequest(
+            type=WorkerCommandType.STOP_CURRENT_TASK,
+            job_id=None,
+            round_id=None,
+            payload={"reason": "user_stop"},
+        ),
+    )
+
+    polled = worker_repo.poll_worker_commands(db, "worker1", limit=2)
+
+    assert [item.id for item in polled] == [stop_command.id, wait_command.id]
+
+
 def test_ack_rotates_running_lease_and_renew_extends_it(monkeypatch):
     db = _test_session()
     _create_command(db)

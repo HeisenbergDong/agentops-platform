@@ -1,5 +1,87 @@
 # AgentOps Platform Next Window Memory
 
+## Standing Collaboration Norm
+
+Every future work session should follow this operating rhythm unless the user explicitly asks for diagnosis only or asks not to change code:
+
+1. First understand the user's real requirement and the current production/local context.
+2. Then decide a reasonable technical/product方案 before editing.
+3. Then execute the full implementation.
+4. "执行" normally means completing the code changes, running appropriate verification, committing and pushing to GitHub, deploying to production, and verifying the deployed result.
+5. Do not stop after only proposing a plan or only making local code changes when the user's intent is to fix/ship the system.
+6. If deployment is unsafe or blocked, clearly explain the blocker and what has already been completed.
+
+## 2026-06-16 Stop Confirmation, Trace Handoff, and Role SOP Fix
+
+User asked to fix two older unresolved issues and first feed the corrected understanding into LLM roles:
+
+1. When the UI Stop/Pause is clicked, Worker must actually receive `stop_current_task`, clean local scripts/sandboxes/dev processes, safely pause Trae when possible, and report a successful stop instead of leaving the user without confirmation.
+2. After Trae has replied/finished, AgentOps must recognize completion and enter downstream trace/evidence collection instead of staying in `wait_completion`.
+3. The corrected SOP must be written into role rules/prompts so orchestrator, intent parser, prompt writer, reviewer, visual analyst, and Worker-controller roles understand the workflow.
+
+Implemented locally in clean worktree:
+
+- Added SOP rules to:
+  - `rules/01_global_rules.md`
+  - `rules/02_orchestrator_rules.md`
+  - `rules/04_prompt_generation_rules.md`
+  - `rules/08_dissatisfaction_reason_rules.md`
+  - `rules/11_worker_trae_cn_rules.md`
+- Added built-in role prompt context to:
+  - `apps/api/app/services/orchestrator/intent.py`
+  - `apps/api/app/services/orchestrator/prompt_writer.py`
+  - `apps/api/app/services/orchestrator/dissatisfaction.py`
+  - `apps/api/app/services/trae_ui_analyst.py`
+- Trae visual analyst now treats keep/adopt/save/change-completed banners as completion evidence during `wait_completion_state`, preferring `collect_trace_candidate` over clicking keep when no generation/error/terminal prompt is visible.
+- Worker Supervisor now emits a structured `trae_turn_completion_decision`:
+  - `is_complete`
+  - `confidence`
+  - `next_action`
+  - `evidence`
+  - `risk`
+  - `reason`
+- Completion decision combines:
+  - current turn completed;
+  - visible task/change completion text;
+  - low-confidence completed turn candidate;
+  - project file writes;
+  - no recent meaningful activity;
+  - pending keep/adopt/save banner as evidence;
+  - recoverable service/3003/terminal/busy states as negative signals.
+- API wait-timeout recovery now also queues `copy_latest_reply` when `trae_turn_completion_decision.is_complete=true` and `next_action=copy_trace`.
+- Worker stop cleanup now reports:
+  - matched/killed/error counts;
+  - `completed`, `partial`, `failed`, `no_matching_processes`, or `skipped`;
+  - structured stop confirmation.
+- Worker `stop_current_task` result now includes:
+  - `stop_confirmed`;
+  - `local_processes_matched`;
+  - `local_processes_killed`;
+  - `local_process_kill_errors`;
+  - cleanup status;
+  - Trae stop click info;
+  - resume-prompt requirement.
+- API stop result logging now produces clearer messages such as confirmed stop/no matching local activity, local cleanup warnings, Trae stop clicked, or local project/sandbox activity stopped.
+- Worker command polling now prioritizes queued `stop_current_task` commands ahead of older queued work, so UI stop reaches Worker faster.
+- Worker runtime version bumped to `0.1.6-stop-trace-handoff` with capabilities:
+  - `trae_turn_completion_decision`
+  - `structured_stop_confirmation`
+
+Verification passed locally:
+
+- API full suite: `119 passed, 3 warnings`.
+- Windows Worker full suite: `131 passed, 2 warnings`.
+- Web build: `npm.cmd run build` passed after `npm ci` in the clean worktree; existing Vite chunk-size warning remains.
+- Targeted API/Worker tests passed before full suite:
+  - API targeted: `67 passed`.
+  - Worker targeted: `79 passed, 2 warnings`.
+- `git diff --check` passed.
+- `py_compile` for changed API/Worker Python modules passed.
+
+Deployment status:
+
+- Pending commit/push, Worker ZIP build, production deploy, and production verification.
+
 ## 2026-06-15 Pause Resume Semantics and Test Intent Strengthening
 
 User request addressed in order:
