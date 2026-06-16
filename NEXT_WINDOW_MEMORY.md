@@ -80,7 +80,50 @@ Verification passed locally:
 
 Deployment status:
 
-- Pending commit/push, Worker ZIP build, production deploy, and production verification.
+- Completed.
+
+Deployment completion:
+
+- Code commit: `7d4bdee fix: confirm stop and hand off completed Trae turns`, full commit `7d4bdeec434cb787a7ee8bec92c14ee99df755ef`.
+- Pushed to GitHub `origin/main`.
+- Worker ZIP built:
+  - path: `D:\code-space\auto-tool\agentops-platform-stop-trace-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - size: `22471510`
+  - SHA256: `64318a121f751f3d9211720b1e9e7a7c3e7efd98277ad12d20d0b3c7e7488579`
+  - header: `PK`
+- Uploaded deploy bundle to production:
+  - `/tmp/agentops-deploy-7d4bdee/agentops-source-7d4bdee.tar`
+  - `/tmp/agentops-deploy-7d4bdee/agentops-web-dist-7d4bdee.tar`
+  - `/tmp/agentops-deploy-7d4bdee/agentops-worker-windows.zip`
+- Production backup dir:
+  - `/opt/agentops-deploy-backups/20260616-111955-7d4bdee`
+- Synced source to `/opt/agentops-platform`, excluding production `.env`, `.venv`, storage, Worker build/dist, Web node_modules, and caches.
+- Web dist copied to `/opt/agentops-platform/apps/web/dist`.
+- Worker package copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `7d4bdeec434cb787a7ee8bec92c14ee99df755ef`.
+
+Production verification:
+
+- Local API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Public API health: `{"status":"ok","service":"agentops-api","database":true}`.
+- Homepage `http://115.190.113.8/`: `200`.
+- Web assets:
+  - `index-DUmaFp9c.js`: `200`, size `1202383`.
+  - `index-UTf109PN.css`: `200`, size `7027`.
+- Production Worker ZIP:
+  - size: `22471510`
+  - SHA256: `64318a121f751f3d9211720b1e9e7a7c3e7efd98277ad12d20d0b3c7e7488579`
+- Production source contains:
+  - `WORKER_RUNTIME_VERSION = "0.1.6-stop-trace-handoff"`
+  - `trae_turn_completion_decision`
+  - `structured_stop_confirmation`
+  - `stop_confirmed`
+
+Deployment note:
+
+- The first remote deployment command exited with code `1` only because a final `stat` verification path carried a Windows CRLF `\r`. The sync, migration, API restart, revision write, and Worker ZIP copy had already completed; follow-up clean verification commands all passed.
 
 ## 2026-06-15 Pause Resume Semantics and Test Intent Strengthening
 
