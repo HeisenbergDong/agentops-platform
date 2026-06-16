@@ -40,6 +40,32 @@ Verification passed locally:
 - Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
 - `git diff --check` passed.
 
+Deployment completion:
+
+- Code commit: `29bd192 fix: keep completed Trae turns from continuing after trace copy failure`, full commit `29bd192b6c2c46733d0d3973033d07e8a19e4124`.
+- Pushed to GitHub `origin/main`.
+- Worker ZIP rebuilt:
+  - local path: `D:\code-space\auto-tool\agentops-platform-stop-trace-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - size: `22472926`
+  - SHA256: `6f24e12e6ff2bf239f548bafe516e0ef85428913a475500ce5c3d5190c1b2feb`
+  - header: `PK`
+- Uploaded deploy bundle to production: `/tmp/agentops-deploy-29bd192/`.
+- Production backup dir: `/opt/agentops-deploy-backups/20260616-142219-29bd192`.
+- Synced source to `/opt/agentops-platform`, preserving production `.env`, API `.venv`, storage, Worker build/dist, Web node_modules, and caches.
+- Web dist copied to `/opt/agentops-platform/apps/web/dist`.
+- Worker package copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `29bd192b6c2c46733d0d3973033d07e8a19e4124`.
+- Production verification:
+  - local API health OK;
+  - public API health OK;
+  - homepage `http://115.190.113.8/`: `200`;
+  - web assets `index-DUmaFp9c.js` and `index-UTf109PN.css`: `200`;
+  - production Worker ZIP size/SHA/header matched the local build.
+- Local running Worker was replaced and restarted from `D:\code-space\auto-tool\agentops-platform\apps\worker-windows\dist\agentops-worker-windows\agentops-worker.exe`.
+- Server sees `local-windows-worker` online with version `0.1.7-completed-trace-stop` and capabilities including `completed_trace_unavailable_handoff` and `stop_log_noise_filter`.
+
 ## 2026-06-16 Stop Confirmation, Trace Handoff, and Role SOP Fix
 
 User asked to fix two older unresolved issues and first feed the corrected understanding into LLM roles:
