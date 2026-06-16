@@ -825,7 +825,12 @@ def _resume_worker_command(
     worker = get_worker_by_worker_id(db, worker_id)
     if not worker or worker.user_id != user.id:
         raise HTTPException(status_code=400, detail="Configured worker is not available for continue.")
-    retry_payload = refreshed_retry_payload(previous.payload, worker_settings, previous.id)
+    retry_payload = refreshed_retry_payload(
+        previous.payload,
+        worker_settings,
+        previous.id,
+        runtime_context=current_job_runtime_context(db, job, round_),
+    )
     command = create_worker_command(
         db,
         worker_id=worker.worker_id,
@@ -900,11 +905,17 @@ def _safe_command_dict(value: dict | None) -> dict:
     return result
 
 
-def refreshed_retry_payload(payload: dict | None, worker_settings: dict, previous_command_id: str) -> dict:
+def refreshed_retry_payload(
+    payload: dict | None,
+    worker_settings: dict,
+    previous_command_id: str,
+    runtime_context: dict | None = None,
+) -> dict:
     result = dict(payload or {})
     result["retry_of_command_id"] = previous_command_id
     result["retry_requested_at"] = now_utc().isoformat()
-    workspace_path = worker_settings.get("trae_workspace_path")
+    runtime_context = runtime_context or {}
+    workspace_path = runtime_context.get("workspace_path") or worker_settings.get("trae_workspace_path")
     if workspace_path:
         result["trae_workspace_path"] = workspace_path
         result["workspace_path"] = workspace_path

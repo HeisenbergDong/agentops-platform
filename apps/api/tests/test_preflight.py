@@ -445,13 +445,77 @@ def test_stop_job_queues_workspace_cleanup_payload():
     assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
 
 
+def test_stop_job_cancels_active_work_and_leaves_stop_command_queued():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.WAITING_TRAE, directions=["demo"])
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="roles-dashboard",
+        direction="demo",
+        workspace_path="D:/mr-d/roles-dashboard",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.WAITING_TRAE,
+    )
+    active = WorkerCommand(
+        id="active-wait",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"workspace_path": "D:/mr-d/roles-dashboard"},
+        status="running",
+    )
+    db.add_all([job, project, round_, active])
+    db.commit()
+
+    stop_job(user=user, db=db)
+
+    db.refresh(active)
+    stop_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.command_type == WorkerCommandType.STOP_CURRENT_TASK.value)
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    assert active.status == "cancelled"
+    assert stop_command is not None
+    assert stop_command.status == "queued"
+    assert stop_command.payload["reason"] == "user_stop"
+    assert stop_command.payload["project_name"] == "roles-dashboard"
+    assert stop_command.payload["workspace_path"] == "D:/mr-d/roles-dashboard"
+
+
 def test_continue_paused_job_requeues_cancelled_worker_command():
     db = _test_session()
     user = _create_user(db, "user1")
     _create_worker(db, user.id)
     _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
     job = Job(id="job1", user_id=user.id, status=JobState.PAUSED, directions=["demo"], scope_text="demo")
-    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PAUSED, prompt="demo prompt")
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="demo-project",
+        direction="demo",
+        workspace_path="D:/mr-d/demo-project",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.PAUSED,
+        prompt="demo prompt",
+    )
     previous = WorkerCommand(
         id="cmd1",
         worker_id="worker1",
@@ -463,7 +527,7 @@ def test_continue_paused_job_requeues_cancelled_worker_command():
         status="cancelled",
         message="Cancelled by user stop.",
     )
-    db.add_all([job, round_, previous])
+    db.add_all([job, project, round_, previous])
     db.commit()
 
     result = jobs_api.continue_job(user=user, db=db)
@@ -479,7 +543,8 @@ def test_continue_paused_job_requeues_cancelled_worker_command():
     assert new_command.command_type == WorkerCommandType.WAIT_COMPLETION.value
     assert new_command.status == "queued"
     assert new_command.payload["retry_of_command_id"] == previous.id
-    assert new_command.payload["workspace_path"] == "D:/mr-d"
+    assert new_command.payload["workspace_path"] == "D:/mr-d/demo-project"
+    assert new_command.payload["trae_workspace_path"] == "D:/mr-d/demo-project"
     db.refresh(round_)
     assert round_.status == JobState.WAITING_TRAE
 
