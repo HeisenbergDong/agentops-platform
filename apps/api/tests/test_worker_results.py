@@ -1,6 +1,7 @@
 from pathlib import Path
 import tempfile
 
+import pytest
 from sqlalchemy import create_engine, select
 from sqlalchemy.orm import sessionmaker
 
@@ -1719,12 +1720,15 @@ def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypa
     screenshot_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CAPTURE_SCREENSHOT.value))
     click_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
     trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    exception_attachment = db.scalar(select(Attachment).where(Attachment.kind == "test_trace_exception"))
     assert job.status == JobState.SCREENSHOT_CAPTURING
     assert round_.status == JobState.SCREENSHOT_CAPTURING
     assert round_.trace_status == "test_exception"
+    assert round_.trae_session_id == ""
     assert screenshot_command is not None
     assert click_command is None
-    assert trace is not None
+    assert trace is None
+    assert exception_attachment is not None
 
 
 def test_incomplete_trace_stops_after_copy_and_continue_limits():
@@ -1814,15 +1818,78 @@ def test_test_mode_trace_exception_continues_downstream_and_notifies(monkeypatch
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value))
     trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    exception_attachment = db.scalar(select(Attachment).where(Attachment.kind == "test_trace_exception"))
     log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "test_chain_exception"))
     assert job.status == JobState.BROWSER_ACCEPTING
     assert round_.trace_status == "test_exception"
-    assert round_.trae_session_id.startswith("test-exception-")
+    assert round_.trae_session_id == ""
     assert next_command is not None
-    assert trace is not None
+    assert trace is None
+    assert exception_attachment is not None
     assert log is not None
     assert sent["url"] == "https://open.feishu.cn/webhook/test"
     assert "测试模式" in sent["json"]["content"]["text"]
+
+
+def test_feishu_payload_refuses_runtime_logs_as_trace(tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    for attachment in db.scalars(
+        select(Attachment).where(Attachment.job_id == job.id, Attachment.round_id == round_.id, Attachment.kind == "trace")
+    ).all():
+        db.delete(attachment)
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.COLLECTING_TRACE,
+            message="TEST MODE TRACE EXCEPTION should not become 日志轨迹",
+        )
+    )
+    db.commit()
+
+    with pytest.raises(worker_results.FeishuWriteError, match="Verified Trae assistant trace is missing"):
+        worker_results._prepare_feishu_fields(
+            db,
+            job,
+            round_,
+            command,
+            WorkerResult(
+                command_id=command.id,
+                worker_id=command.worker_id,
+                status="success",
+                data={"status": "pushed", "commit_sha": "abc123"},
+            ),
+        )
+
+
+def test_feishu_payload_keeps_standard_task_type_in_test_mode(tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    job.intent = {
+        "run_mode": "test",
+        "dissatisfaction_policy": "force_test_unsatisfied",
+        "downstream_policy": "test_chain_allowed",
+        "trace_gate_policy": "test_exception",
+    }
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+
+    fields = worker_results._prepare_feishu_fields(
+        db,
+        job,
+        round_,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123"},
+        ),
+    )
+
+    assert fields["任务类型"] == "0-1代码生成"
+    assert fields["任务类型"].startswith("测试-") is False
+    assert fields["日志轨迹"] == "full trae trace"
 
 
 def test_send_prompt_manual_required_marks_job_manual_required():

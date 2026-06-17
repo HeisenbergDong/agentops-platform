@@ -23,6 +23,7 @@ PROMPT_INPUT_MIN_WIDTH = 80
 PROMPT_INPUT_MIN_HEIGHT = 12
 PROMPT_INPUT_CANDIDATE_LIMIT = 2
 SUBMISSION_PROBE_INTERVAL_SECONDS = 0.75
+NEW_TASK_SETTLE_SECONDS = 0.8
 PROMPT_INPUT_NAME_MARKERS = (
     "ask",
     "chat",
@@ -53,6 +54,7 @@ def send_prompt(
     sent_at_epoch: float | None = None,
     submission_timeout_seconds: float = 15.0,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    open_new_task: bool = False,
 ) -> dict:
     prompt = prompt.strip()
     if not prompt:
@@ -79,6 +81,13 @@ def send_prompt(
     except ClipboardError as exc:
         raise PromptSendError(str(exc)) from exc
 
+    new_task_result = _open_new_task_composer() if open_new_task else {"status": "skipped"}
+    if new_task_result.get("status") == "sent":
+        window = wait_for_workspace_window_or_any(
+            timeout_seconds=3.0,
+            workspace_path=workspace_path,
+            prefer_workspace_match=bool(workspace_path),
+        )
     window_rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
     if not window_rect:
         input_result = _focus_prompt_input(window)
@@ -111,7 +120,7 @@ def send_prompt(
             "workspace_match": focus_result.get("workspace_match", False),
             "input": input_result,
             "submission": submission,
-            "automation": {"strategy": "uia_no_window_rect"},
+            "automation": {"strategy": "uia_no_window_rect", "new_task": new_task_result},
         }
 
     attempt_result = _send_prompt_with_adaptive_targets(
@@ -125,6 +134,7 @@ def send_prompt(
         window_rect=window_rect,
         window_title=str(focus_result.get("window_title") or ""),
         ui_analyst=ui_analyst,
+        new_task_result=new_task_result,
     )
     return {
         "status": "sent",
@@ -235,6 +245,7 @@ def _send_prompt_with_adaptive_targets(
     window_rect: tuple[int, int, int, int],
     window_title: str,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    new_task_result: dict[str, Any],
 ) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     workspace_marker = _workspace_marker(workspace_path)
@@ -254,6 +265,7 @@ def _send_prompt_with_adaptive_targets(
         attempts.append(_compact_attempt(result))
         if result.get("status") == "sent":
             result.setdefault("automation", {})["attempts"] = attempts
+            result["automation"]["new_task"] = new_task_result
             return result
 
     screenshot_info = _capture_ui_analysis_screenshot(workspace_path=workspace_path)
@@ -279,6 +291,7 @@ def _send_prompt_with_adaptive_targets(
             local_result.setdefault("automation", {})["attempts"] = attempts
             local_result["automation"]["screenshot"] = screenshot_info
             local_result["automation"]["local_analysis"] = local_analysis
+            local_result["automation"]["new_task"] = new_task_result
             return local_result
 
     ai_analysis: dict[str, Any] = {}
@@ -317,6 +330,7 @@ def _send_prompt_with_adaptive_targets(
                 ai_result["automation"]["screenshot"] = screenshot_info
                 ai_result["automation"]["local_analysis"] = local_analysis
                 ai_result["automation"]["ai_analysis"] = ai_analysis
+                ai_result["automation"]["new_task"] = new_task_result
                 return ai_result
 
     details = {
@@ -330,6 +344,7 @@ def _send_prompt_with_adaptive_targets(
         "local_analysis": local_analysis,
         "ai_analysis": ai_analysis,
         "ai_error": ai_error,
+        "new_task": new_task_result,
         "manual_hint": "Please inspect Trae and click the correct input/send controls manually.",
     }
     last_error = _last_attempt_error(attempts)
@@ -483,6 +498,15 @@ def _try_candidate_set(
             "submission_verified": verified,
         },
     }
+
+
+def _open_new_task_composer() -> dict[str, Any]:
+    try:
+        _send_keys("^%n")
+        time.sleep(NEW_TASK_SETTLE_SECONDS)
+        return {"status": "sent", "method": "ctrl_alt_n"}
+    except PromptSendError as exc:
+        return {"status": "failed", "method": "ctrl_alt_n", "error": str(exc)}
 
 
 def _unconfirmed_submission(error: PromptSendError) -> dict[str, Any]:
@@ -903,6 +927,8 @@ def _send_keys(keys: str) -> None:
             _press_key(0x0D)
         elif normalized in {"^{ENTER}", "^ENTER", "^Enter", "CTRL+ENTER", "Ctrl+Enter"}:
             _hotkey(0x11, 0x0D)
+        elif normalized in {"^%n", "^%N", "CTRL+ALT+N", "Ctrl+Alt+N"}:
+            _hotkey_many([0x11, 0x12], 0x4E)
         else:
             raise PromptSendError(f"Unsupported key sequence: {keys}")
     except PromptSendError:
@@ -918,6 +944,16 @@ def _hotkey(modifier_vk: int, key_vk: int) -> None:
         _press_key(key_vk)
     finally:
         _key_up(modifier_vk)
+
+
+def _hotkey_many(modifier_vks: list[int], key_vk: int) -> None:
+    for modifier_vk in modifier_vks:
+        _key_down(modifier_vk)
+    try:
+        _press_key(key_vk)
+    finally:
+        for modifier_vk in reversed(modifier_vks):
+            _key_up(modifier_vk)
 
 
 def _press_key(vk: int) -> None:

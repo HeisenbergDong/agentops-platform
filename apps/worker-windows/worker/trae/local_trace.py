@@ -42,7 +42,7 @@ def collect_local_trace(
     prompt: str = "",
     workspace_path: str = "",
 ) -> dict[str, Any]:
-    turn = trae_turn if isinstance(trae_turn, dict) else {}
+    turn = normalize_turn_probe(trae_turn)
     db_trace = read_trace_from_db(turn, workspace_path=workspace_path)
     if _is_valid_local_trace(db_trace):
         return {
@@ -68,6 +68,16 @@ def collect_local_trace(
         "trace_probe": probe_local_trace(log_trace or db_trace),
         "chars": len(log_trace or db_trace),
     }
+
+
+def normalize_turn_probe(trae_turn: dict[str, Any] | None) -> dict[str, Any]:
+    turn = trae_turn if isinstance(trae_turn, dict) else {}
+    if turn.get("session_id") or turn.get("user_message_id"):
+        return turn
+    candidate = turn.get("candidate") if isinstance(turn.get("candidate"), dict) else {}
+    if candidate.get("session_id") or candidate.get("user_message_id"):
+        return {**candidate, "probe_status": turn.get("status"), "probe_reason": turn.get("reason")}
+    return turn
 
 
 def read_trace_from_db(turn: dict[str, Any], *, workspace_path: str = "") -> str:

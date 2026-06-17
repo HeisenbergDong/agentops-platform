@@ -576,20 +576,31 @@ def _record_screenshot_attachment(db: Session, command: WorkerCommand, result: W
 
 
 def _record_trace_attachment(db: Session, command: WorkerCommand, raw_trace: str) -> Attachment:
-    filename = f"trae-trace-{command.job_id or 'job'}-{command.round_id or 'round'}.txt"
-    out_dir = settings.attachment_root / "traces"
+    return _record_text_attachment(db, command, raw_trace, kind="trace", filename_prefix="trae-trace")
+
+
+def _record_text_attachment(
+    db: Session,
+    command: WorkerCommand,
+    text: str,
+    *,
+    kind: str,
+    filename_prefix: str,
+) -> Attachment:
+    filename = f"{filename_prefix}-{command.job_id or 'job'}-{command.round_id or 'round'}.txt"
+    out_dir = settings.attachment_root / f"{kind}s"
     out_dir.mkdir(parents=True, exist_ok=True)
     path = out_dir / filename
-    path.write_text(raw_trace, encoding="utf-8")
+    path.write_text(text, encoding="utf-8")
     attachment = Attachment(
         user_id=command.user_id,
         job_id=command.job_id,
         round_id=command.round_id,
-        kind="trace",
+        kind=kind,
         filename=filename,
         path=str(path),
         content_type="text/plain; charset=utf-8",
-        size_bytes=len(raw_trace.encode("utf-8")),
+        size_bytes=len(text.encode("utf-8")),
     )
     db.add(attachment)
     db.flush()
@@ -2167,7 +2178,7 @@ def _apply_test_trace_exception(
     command: WorkerCommand,
     trace_text: str,
 ) -> None:
-    if round_.trace_status == "test_exception" and _latest_trace_text(db, job.id, round_.id).strip():
+    if round_.trace_status == "test_exception" and _latest_attachment(db, job.id, round_.id, "test_trace_exception"):
         return
     text = (
         "TEST MODE TRACE EXCEPTION\n"
@@ -2179,10 +2190,8 @@ def _apply_test_trace_exception(
         f"Previous trace status: {round_.trace_status}\n"
         f"Runtime logs:\n{_runtime_log_text(db, job.id, round_.id)}\n"
     )
-    _record_trace_attachment(db, command, text)
+    _record_text_attachment(db, command, text, kind="test_trace_exception", filename_prefix="test-trace-exception")
     round_.trace_status = "test_exception"
-    round_.trae_session_id = round_.trae_session_id or f"test-exception-{job.id}-{round_.id}"
-    round_.trae_trace_id = round_.trae_trace_id or "test-exception"
     _record_dissatisfaction_from_context(
         db,
         job,
@@ -2733,6 +2742,8 @@ def _prepare_feishu_fields(
         raise FeishuWriteError("Real Trae Session ID is missing; refusing to write Feishu business record.")
     screenshot = _latest_attachment(db, job.id, round_.id, "screenshot")
     log_trace, attachment_paths = _feishu_trace_field_and_attachments(db, job.id, round_.id)
+    if not log_trace.strip():
+        raise FeishuWriteError("Verified Trae assistant trace is missing; refusing to write Feishu business record.")
     git_data = git_result.data or {}
     github_url = _github_url(git_data)
     commit_sha = str(git_data.get("commit_sha") or "")
@@ -2757,7 +2768,6 @@ def _prepare_feishu_fields(
     }
     intent = job.intent if isinstance(job.intent, dict) else {}
     if intent.get("run_mode") == "test":
-        fields["任务类型"] = f"测试-{fields['任务类型']}"
         fields["不满意原因"] = (
             f"{fields['不满意原因']}\n"
             "测试说明：本条记录来自测试模式，用于验证 AgentOps 的 GitHub/飞书链路，不作为正式业务验收结论。"
@@ -2770,10 +2780,10 @@ def _prepare_feishu_fields(
 def _feishu_trace_field_and_attachments(db: Session, job_id: str, round_id: str) -> tuple[str, list[str]]:
     attachment = _latest_attachment(db, job_id, round_id, "trace")
     if not attachment:
-        return _runtime_log_text(db, job_id, round_id), []
+        return "", []
     path = Path(attachment.path)
     if not path.exists():
-        return _runtime_log_text(db, job_id, round_id), []
+        return "", []
     text = path.read_text(encoding="utf-8")
     if len(text) > LOG_TRACE_FIELD_SOFT_LIMIT:
         return LOG_TRACE_OVERFLOW_TEXT, [str(path)]

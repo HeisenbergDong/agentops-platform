@@ -187,6 +187,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
             "submit_hotkey": submit_hotkey,
             "verify_submission": kwargs.get("verify_submission"),
             "strict_submission_verification": kwargs.get("strict_submission_verification"),
+            "open_new_task": kwargs.get("open_new_task"),
             "workspace_path": str(kwargs.get("workspace_path") or ""),
         },
     )
@@ -208,6 +209,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
     assert result["data"]["verify_submission"] is True
     assert result["data"]["strict_submission_verification"] is True
+    assert result["data"]["open_new_task"] is True
     assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
@@ -1072,6 +1074,54 @@ def test_copy_latest_reply_uses_local_trace_when_clipboard_is_incomplete(monkeyp
     assert result["trace_source"] == "trae_local_raw_log_trace"
     assert result["raw_text"] == local_trace
     assert result["copy_candidates"][0]["reason"] == "missing_tool_trace_markers"
+
+
+def test_copy_latest_reply_uses_low_confidence_turn_candidate_for_local_trace(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    local_trace = (
+        "Trae raw execution trace for session s1, user message u1.\n"
+        "toolName: edit\nstatus: success\nfilePath: README.md\ncommand: write note\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+    seen_turns: list[dict] = []
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [])
+
+    def fake_collect_local_trace(trae_turn, prompt, workspace_path):
+        from worker.trae.local_trace import normalize_turn_probe
+
+        turn = normalize_turn_probe(trae_turn)
+        seen_turns.append(turn)
+        return {
+            "status": "collected",
+            "raw_text": local_trace,
+            "chars": len(local_trace),
+            "trace_source": "trae_local_raw_log_trace",
+            "trace_probe": trace_copy.probe_trace(local_trace),
+        }
+
+    monkeypatch.setattr(trace_copy, "collect_local_trace", fake_collect_local_trace)
+
+    result = trace_copy.copy_latest_reply(
+        timeout_seconds=1,
+        trae_turn={
+            "status": "missing",
+            "reason": "low_confidence_context_match",
+            "candidate": {"turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+        },
+        prompt="demo",
+        workspace_path="D:/work/demo",
+    )
+
+    assert result["status"] == "copied"
+    assert result["copy_method"] == "trae_local_raw_log_trace"
+    assert seen_turns[0]["session_id"] == "s1"
+    assert seen_turns[0]["user_message_id"] == "u1"
 
 
 def test_probe_trace_reports_awaiting_continuation():

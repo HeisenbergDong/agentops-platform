@@ -167,6 +167,7 @@ class CommandRunner:
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 30)),
                 ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+                open_new_task=bool(payload.get("open_new_task", True)),
             )
         except PromptSendError as exc:
             details = dict(exc.details or {})
@@ -559,13 +560,26 @@ def _current_turn_gate(turn: object, trace_probe: object = None) -> dict:
             "source": "trae_turn",
         }
     if turn.get("status") != "found":
+        candidate = turn.get("candidate") if isinstance(turn.get("candidate"), dict) else {}
+        candidate_status = str(candidate.get("turn_status") or candidate.get("status") or "")
+        probe_reason = str((trace_probe or {}).get("reason") or "") if isinstance(trace_probe, dict) else ""
+        if candidate_status == "completed" and probe_reason == "ok":
+            return {
+                "passed": True,
+                "reason": "completed_turn_candidate",
+                "recoverable": False,
+                "source": "trae_turn_candidate",
+                "session_id": str(candidate.get("session_id") or ""),
+                "user_message_id": str(candidate.get("user_message_id") or ""),
+                "candidate": candidate,
+            }
         reason = str(turn.get("reason") or "current_turn_missing")
         return {
             "passed": False,
             "reason": reason,
             "recoverable": _recoverable_turn_gate_reason(reason),
             "source": "trae_turn",
-            "candidate": turn.get("candidate") if isinstance(turn.get("candidate"), dict) else None,
+            "candidate": candidate or None,
         }
     turn_status = str(turn.get("turn_status") or "")
     if turn_status != "completed":

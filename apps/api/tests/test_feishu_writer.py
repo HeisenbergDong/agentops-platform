@@ -92,6 +92,19 @@ def test_write_feishu_record_skips_duplicate_by_prompt_round(monkeypatch):
     assert result["duplicate_existing_uid"] == "1"
 
 
+def test_task_type_test_prefix_normalizes_to_allowed_option():
+    assert writer._normalize_option(
+        "任务类型",
+        "测试-Bug修复",
+        {"任务类型": {"Bug修复", "Feature迭代", "0-1代码生成"}},
+    ) == "Bug修复"
+    assert writer._normalize_option(
+        "任务类型",
+        "测试-0-1代码生成",
+        {"任务类型": {"Bug修复", "Feature迭代", "0-1代码生成"}},
+    ) == "0-1代码生成"
+
+
 def test_write_feishu_record_fails_when_required_payload_field_is_missing_from_table(monkeypatch):
     _patch_feishu_dependencies(
         monkeypatch,

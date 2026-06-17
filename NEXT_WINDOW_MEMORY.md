@@ -11,6 +11,34 @@ Every future work session should follow this operating rhythm unless the user ex
 5. Do not stop after only proposing a plan or only making local code changes when the user's intent is to fix/ship the system.
 6. If deployment is unsafe or blocked, clearly explain the blocker and what has already been completed.
 
+## 2026-06-17 Trace Exception Integrity and New Trae Task Composer Fix
+
+User asked to first finish the recommended local patch set before moving to other tasks.
+
+Implemented locally:
+
+- API no longer lets test-chain trace exceptions masquerade as formal Trae trace evidence:
+  - test-chain exceptions are stored as `test_trace_exception` attachments, not `trace`;
+  - test-chain exceptions no longer synthesize fake `trae_session_id` / `trae_trace_id`;
+  - Feishu payload preparation now refuses runtime logs when a verified `trace` attachment is missing.
+- Test-mode Feishu rows keep the standard allowed `任务类型` option instead of writing `测试-...`; the test nature is recorded in the dissatisfaction/test note instead.
+- Feishu option normalization can still accept legacy `测试-...` task-type input by stripping the prefix before matching allowed options.
+- Worker `send_prompt` can open a new Trae task composer before paste/send via `Ctrl+Alt+N` when payload `open_new_task=true`.
+- Worker local trace collection now normalizes low-confidence completed turn candidates so a valid local raw trace can still be collected from Trae DB/log context.
+
+Verification passed locally:
+
+- API targeted: `68 passed`.
+- Worker targeted: `60 passed`.
+- API full suite: `132 passed, 3 warnings`.
+- Worker full suite: `136 passed, 2 warnings`.
+- Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
+- `git diff --check` passed.
+
+Deployment status:
+
+- Pending commit, push, Worker ZIP rebuild, production deploy, and production verification at the time this note was first written.
+
 ## 2026-06-16 Completed-Trae Trace Copy Fallback Fix
 
 User showed that Trae CN had already reached a visible task-completed/code-changes state, but AgentOps kept observing and later required Pause. Production diagnostics showed the previous fix did enter `copy_latest_reply`; the remaining bug was that trace-copy failures were treated like unfinished Trae replies and routed back into `click_continue` / `wait_completion`.

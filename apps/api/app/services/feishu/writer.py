@@ -489,7 +489,7 @@ def _option_names(fields: list[dict[str, Any]]) -> dict[str, set[str]]:
 def _normalize_option(field_name: str, value: Any, options: dict[str, set[str]]) -> Any:
     if not isinstance(value, str):
         return value
-    normalized = VALUE_ALIASES.get(field_name, {}).get(value, value)
+    normalized = _normalize_option_alias(field_name, value)
     allowed = options.get(field_name)
     if allowed is None or not normalized:
         return normalized
@@ -500,6 +500,14 @@ def _normalize_option(field_name: str, value: Any, options: dict[str, set[str]])
     if field_name == "修改范围" and "模块内多文件" in allowed:
         return "模块内多文件"
     return ""
+
+
+def _normalize_option_alias(field_name: str, value: str) -> str:
+    text = str(value or "").strip()
+    normalized = VALUE_ALIASES.get(field_name, {}).get(text, text)
+    if field_name == "任务类型" and normalized.startswith("测试-"):
+        normalized = normalized.removeprefix("测试-").strip()
+    return VALUE_ALIASES.get(field_name, {}).get(normalized, normalized)
 
 
 def _request_json(

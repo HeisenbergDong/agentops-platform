@@ -115,6 +115,24 @@ def test_send_prompt_verifies_submission_with_trae_turn_probe(monkeypatch):
     assert result["submission"]["probe"]["status"] == "found"
 
 
+def test_send_prompt_can_open_new_task_before_paste(monkeypatch):
+    fake_window = FakeWindow([])
+    keys: list[str] = []
+
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: None)
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: keys.append(keys_))
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+
+    result = prompt_module.send_prompt("build it", open_new_task=True)
+
+    assert keys == ["^%n", "^a", "{BACKSPACE}", "^v"]
+    assert result["automation"]["new_task"] == {"status": "sent", "method": "ctrl_alt_n"}
+
+
 def test_send_prompt_falls_back_when_workspace_title_is_missing(monkeypatch):
     fake_window = FakeWindow([])
     focus_calls: list[bool] = []
