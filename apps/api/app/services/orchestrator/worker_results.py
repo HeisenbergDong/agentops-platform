@@ -343,7 +343,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             trace_extra,
         ):
             return
-        if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra):
+        if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra, raw_trace=raw_trace):
             return
         _queue_continue_recovery(
             db,
@@ -362,7 +362,7 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
             if round_:
                 round_.trace_status = gate["reason"]
             if gate["recoverable"]:
-                if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra):
+                if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra, raw_trace=raw_trace):
                     return
                 _queue_continue_recovery(
                     db,
@@ -2090,6 +2090,7 @@ def _handle_completed_trace_unavailable(
     job: Job,
     round_: TaskRound | None,
     extra: dict,
+    raw_trace: str = "",
 ) -> bool:
     if not _has_completed_observation(command, extra):
         return False
@@ -2105,7 +2106,7 @@ def _handle_completed_trace_unavailable(
         round_.trace_status = trace_status
 
     if round_ and _test_chain_allowed(job):
-        _apply_test_trace_exception(db, job, round_, command, "")
+        _apply_test_trace_exception(db, job, round_, command, raw_trace)
         job.status = JobState.SCREENSHOT_CAPTURING
         round_.status = JobState.SCREENSHOT_CAPTURING
         add_log(

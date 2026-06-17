@@ -1809,10 +1809,19 @@ def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypa
     db.commit()
     monkeypatch.setattr(webhook_notifier.httpx, "post", lambda *args, **kwargs: type("Response", (), {"status_code": 200, "text": "ok"})())
 
+    raw_trace = _valid_trace_with_ids()
     handle_worker_result(
         db,
         command,
-        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"raw_text": "short"}),
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": raw_trace,
+                "current_turn_gate": {"passed": False, "reason": "trae_turn_not_completed:interrupted", "recoverable": True},
+            },
+        ),
     )
 
     db.refresh(job)
@@ -1829,6 +1838,7 @@ def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypa
     assert click_command is None
     assert trace is None
     assert exception_attachment is not None
+    assert VALID_TRAE_SESSION_ID in Path(exception_attachment.path).read_text(encoding="utf-8")
 
 
 def test_incomplete_trace_stops_after_copy_and_continue_limits():
