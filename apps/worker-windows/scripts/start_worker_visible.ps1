@@ -18,7 +18,9 @@ $arguments = @()
 if ($Config) {
     $arguments += @("--config", $Config)
 }
-$arguments += $WorkerArgs
+if ($WorkerArgs) {
+    $arguments += @($WorkerArgs | Where-Object { -not [string]::IsNullOrWhiteSpace($_) })
+}
 
 if (Test-Path $Exe) {
     $command = $Exe
