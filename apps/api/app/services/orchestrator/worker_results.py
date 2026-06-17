@@ -1,5 +1,6 @@
 from datetime import datetime, timezone
 from pathlib import Path
+import re
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -1967,6 +1968,25 @@ def _ensure_trae_session_gate(
 ) -> bool:
     if round_ and round_.trae_session_id:
         return True
+    if round_ and _hydrate_trae_session_from_trace(db, job, round_):
+        return True
+    trace_text = _latest_trace_text(db, job.id, round_.id) if round_ else ""
+    if round_ and _test_chain_allowed(job) and round_.trace_status == "valid" and trace_text.strip():
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="session_missing_test_exception",
+            message="Real Trae session id is missing, but a verified test trace exists; test chain will continue with an explicit exception.",
+            level="warning",
+            extra={
+                "command_id": command.id,
+                "command_type": command.command_type,
+                "trace_chars": len(trace_text),
+                "trace_status": round_.trace_status,
+            },
+        )
+        return True
     job.status = "session_missing_abort"
     if round_:
         round_.status = "session_missing_abort"
@@ -1980,6 +2000,47 @@ def _ensure_trae_session_gate(
         extra={"command_id": command.id, "command_type": command.command_type},
     )
     return False
+
+
+def _hydrate_trae_session_from_trace(db: Session, job: Job, round_: TaskRound) -> bool:
+    trace_text = _latest_trace_text(db, job.id, round_.id, max_chars=0)
+    if not trace_text.strip():
+        return False
+    ids = _extract_trae_ids_from_trace(trace_text)
+    session_id = str(ids.get("session_id") or "").strip()
+    if not session_id:
+        return False
+    round_.trae_session_id = session_id
+    round_.trae_user_message_id = str(ids.get("message_id") or "").strip()
+    round_.trae_task_id = str(ids.get("task_id") or "").strip()
+    round_.trae_trace_id = str(ids.get("trace_id") or "").strip()
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="session_collected",
+        message="Real Trae session metadata recovered from the verified trace attachment.",
+        extra={
+            "session_id": round_.trae_session_id,
+            "user_message_id": round_.trae_user_message_id,
+            "task_id": round_.trae_task_id,
+            "trace_id": round_.trae_trace_id,
+            "source": "trace_attachment",
+        },
+    )
+    return True
+
+
+def _extract_trae_ids_from_trace(trace_text: str) -> dict[str, str]:
+    result: dict[str, str] = {}
+    text = str(trace_text or "")
+    for key in ("session_id", "task_id", "message_id", "trace_id"):
+        pattern = rf'{key}=(?:"([^"]+)"|([0-9a-fA-F]{{16,64}}))'
+        for quoted, bare in re.findall(pattern, text):
+            value = (quoted or bare or "").strip()
+            if value:
+                result[key] = value
+    return result
 
 
 def _copy_current_turn_gate(data: object) -> dict:
@@ -2790,14 +2851,17 @@ def _feishu_trace_field_and_attachments(db: Session, job_id: str, round_id: str)
     return text, []
 
 
-def _latest_trace_text(db: Session, job_id: str, round_id: str) -> str:
+def _latest_trace_text(db: Session, job_id: str, round_id: str, max_chars: int = 18000) -> str:
     attachment = _latest_attachment(db, job_id, round_id, "trace")
     if not attachment:
         return ""
     path = Path(attachment.path)
     if not path.exists():
         return ""
-    return path.read_text(encoding="utf-8")[-18000:]
+    text = path.read_text(encoding="utf-8")
+    if max_chars and max_chars > 0:
+        return text[-max_chars:]
+    return text
 
 
 def _latest_attachment(db: Session, job_id: str, round_id: str, kind: str) -> Attachment | None:

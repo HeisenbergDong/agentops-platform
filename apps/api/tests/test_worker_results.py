@@ -1018,6 +1018,8 @@ def test_browser_acceptance_blocks_without_real_trae_session():
     db = _test_session()
     job, round_, command = _create_browser_acceptance_rows(db)
     round_.trae_session_id = ""
+    trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    Path(trace.path).write_text(_valid_trace(), encoding="utf-8")
     db.commit()
 
     handle_worker_result(
@@ -1037,6 +1039,65 @@ def test_browser_acceptance_blocks_without_real_trae_session():
     assert job.status == "session_missing_abort"
     assert round_.status == "session_missing_abort"
     assert next_command is None
+
+
+def test_browser_acceptance_recovers_real_trae_session_from_trace_attachment():
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    round_.trae_session_id = ""
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "failed", "url": "http://localhost:5173", "http_status": 500},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
+    assert job.status == JobState.GITHUB_SUBMITTING
+    assert round_.status == JobState.GITHUB_SUBMITTING
+    assert round_.trae_session_id == VALID_TRAE_SESSION_ID
+    assert round_.trae_user_message_id == VALID_TRAE_USER_MESSAGE_ID
+    assert round_.trae_task_id == VALID_TRAE_TASK_ID
+    assert round_.trae_trace_id == VALID_TRAE_TRACE_ID
+    assert next_command is not None
+
+
+def test_test_browser_acceptance_allows_valid_trace_without_session_id():
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    job.intent = {"run_mode": "test", "downstream_policy": "test_chain_allowed", "trace_gate_policy": "test_exception"}
+    round_.trae_session_id = ""
+    trace = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    Path(trace.path).write_text(_valid_trace(), encoding="utf-8")
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "failed", "url": "http://localhost:5173", "http_status": 500},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "session_missing_test_exception"))
+    assert job.status == JobState.GITHUB_SUBMITTING
+    assert round_.status == JobState.GITHUB_SUBMITTING
+    assert next_command is not None
+    assert log is not None
 
 
 def test_browser_acceptance_missing_url_generates_reason_and_continues_to_github():
@@ -2262,7 +2323,11 @@ def _create_git_submit_rows(db):
 def _create_valid_trace_attachment_for_round(db, job: Job, round_: TaskRound) -> Attachment:
     trace_dir = Path(tempfile.mkdtemp(prefix="agentops-test-trace-"))
     path = trace_dir / f"{job.id}-{round_.id}.txt"
-    text = "full trae trace evidence"
+    text = (
+        _valid_trace()
+        + f'\nsession_id={VALID_TRAE_SESSION_ID} task_id={VALID_TRAE_TASK_ID} '
+        + f'message_id={VALID_TRAE_USER_MESSAGE_ID} trace_id="{VALID_TRAE_TRACE_ID}"\n'
+    )
     path.write_text(text, encoding="utf-8")
     attachment = Attachment(
         user_id=job.user_id,

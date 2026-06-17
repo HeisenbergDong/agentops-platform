@@ -2357,3 +2357,23 @@ Implemented in this round:
 Verification status:
 - Per user instruction, no pytest, E2E, Worker startup, or deployment was run in this round.
 - Next time testing resumes, start the Worker visibly with `apps/worker-windows/scripts/start_worker_visible.ps1` and close that visible window after the test.
+
+## 2026-06-18 Two-round E2E pause: session gate fix
+
+Real test run:
+- Deployed prompt de-dup and visible Worker launcher, then fixed two launcher bugs:
+  - no-arg `Start-Process -ArgumentList` error,
+  - empty `ValueFromRemainingArguments` element.
+- The visible Worker did start successfully from `apps/worker-windows/dist/agentops-worker-windows/scripts/start_worker_visible.ps1`.
+- Test job: `c2d1e35dd15643d583db6627870fc008`, round `3ffb250195cf4805a14d3ffe4a02272b`, daily target manually limited to 2.
+- The copy-trace step did not hang: `copy_latest_reply` moved from running to `trace_status=valid` in roughly 30 seconds, with trace attachment `trae-trace-c2d1e35dd15643d583db6627870fc008-3ffb250195cf4805a14d3ffe4a02272b.txt`.
+- The chain then reached screenshot, scan, and browser acceptance, but stopped at `session_missing_abort`: valid trace existed, yet `round_.trae_session_id` was empty, so GitHub/Feishu/round 2 did not start.
+
+Implemented fix:
+- API now attempts to recover Trae session/task/message/trace ids from the verified trace attachment.
+- If still missing, formal mode remains strict and aborts.
+- In test-chain mode only, a verified trace attachment with missing session id is allowed to continue with a `session_missing_test_exception` warning so GitHub/Feishu/round-2 automation can be tested.
+
+Verification:
+- `apps/api`: `python -m pytest tests/test_worker_results.py -q` -> `61 passed`.
+- Local process check after pausing/closing Worker: no `agentops-worker.exe`, `Trae CN.exe`, or `trae-sandbox.exe`.
