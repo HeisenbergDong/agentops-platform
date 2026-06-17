@@ -32,8 +32,13 @@ Write-Host "Starting AgentOps Worker in a visible window."
 Write-Host "Close that window to stop this temporary worker."
 Write-Host "This script does not install autostart or a Windows service."
 
-Start-Process `
-    -FilePath $command `
-    -ArgumentList $argumentList `
-    -WorkingDirectory $ProjectRoot `
-    -WindowStyle Normal | Out-Null
+$startParams = @{
+    FilePath = $command
+    WorkingDirectory = $ProjectRoot
+    WindowStyle = "Normal"
+}
+if ($argumentList.Count -gt 0) {
+    $startParams.ArgumentList = $argumentList
+}
+
+Start-Process @startParams | Out-Null
