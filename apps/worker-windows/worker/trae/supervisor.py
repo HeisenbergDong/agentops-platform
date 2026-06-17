@@ -311,7 +311,7 @@ def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict
     robust_candidate = (
         any(item in evidence for item in {"completed_turn_candidate", "low_confidence_completed_turn_candidate"})
         and "project_write_detected" in evidence
-        and "no_recent_meaningful_activity" in evidence
+        and any(item in evidence for item in {"no_recent_meaningful_activity", "activity_quiet_long_enough"})
     )
     is_complete = bool(
         output_reason not in RECOVERABLE_OUTPUT_REASONS

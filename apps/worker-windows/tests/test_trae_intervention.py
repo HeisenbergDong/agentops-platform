@@ -680,7 +680,7 @@ def test_wait_completion_accepts_low_confidence_candidate_with_project_write(mon
         wait_module,
         "build_trae_observation",
         lambda **kwargs: {
-            "activity": {"recent": False, "source": "project", "quiet_seconds": 120.0},
+            "activity": {"recent": True, "source": "agent_log", "quiet_seconds": 120.0},
             "project_write": {"mtime": 1000.0, "path": "D:/work/demo/app.js", "last_write": "2026-06-16T10:00:00"},
             "log": {"tail_hash": "abc123"},
         },

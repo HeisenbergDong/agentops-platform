@@ -295,3 +295,34 @@ def test_supervisor_does_not_collect_trace_from_completed_candidate_while_recent
     assert decision["action"] == "wait"
     assert decision["reason"] == "recent_trae_activity"
     assert decision["trae_turn_completion_decision"]["is_complete"] is False
+
+
+def test_supervisor_collects_low_confidence_completed_candidate_after_quiet_heartbeat_activity():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={
+                "status": "missing",
+                "reason": "low_confidence_context_match",
+                "candidate": {"turn_status": "completed", "session_id": "s1", "user_message_id": "u1"},
+            },
+            idle_seconds=390,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            recent_activity=True,
+            activity_source="agent_log",
+            activity_quiet_seconds=383.0,
+            watcher_observation={
+                "project_write": {"mtime": 1000.0, "path": "D:/work/demo/index.html", "last_write": "2026-06-18T02:06:47"},
+                "activity": {"recent": True, "quiet_seconds": 383.0, "source": "agent_log"},
+            },
+        )
+    )
+
+    assert decision["action"] == "collect_trace"
+    assert decision["reason"] == "completion_candidate_with_project_write"
+    completion = decision["trae_turn_completion_decision"]
+    assert completion["is_complete"] is True
+    assert "activity_quiet_long_enough" in completion["evidence"]
+    assert "completed_turn_candidate" in completion["evidence"]
