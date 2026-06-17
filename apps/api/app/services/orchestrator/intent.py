@@ -248,6 +248,8 @@ def _prompt_brief(
     single_page_quick: bool = False,
     chain_validation: bool = False,
 ) -> str:
+    # Keep prompt intent as the user's request only; prompt_writer appends test constraints once.
+    return scope_text.strip()
     text = scope_text.strip()
     if single_page_quick or chain_validation:
         return (
@@ -264,6 +266,8 @@ def _prompt_brief(
 
 
 def _test_button_prompt_brief(scope_text: str) -> str:
+    # Keep test-start prompt brief short; avoid duplicating chain-test instructions downstream.
+    return scope_text.strip() or "Create the smallest runnable smoke-test prototype."
     text = scope_text.strip() or "做一个最小可运行的小范围原型"
     if _has_any(text.lower(), ["单页面", "单页", "一个页面", "快速回复", "日志轨迹", "github", "飞书"]):
         return (

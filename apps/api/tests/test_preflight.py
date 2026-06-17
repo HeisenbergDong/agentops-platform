@@ -14,6 +14,7 @@ from app.db.session import Base
 from app.services.llm.client import LLMError
 from app.services.orchestrator.states import JobState
 from app.services.orchestrator.directions import normalize_job_directions, split_direction_text
+from app.services.orchestrator.intent import force_test_mode_intent, infer_job_intent
 from app.services.orchestrator import prompt_writer
 from app.services.orchestrator.worker_dispatch import dispatch_prompt_to_worker
 from app.services.preflight import REQUIRED_WORKER_CAPABILITIES, build_preflight
@@ -268,6 +269,28 @@ def test_test_mode_smoke_fallback_keeps_prompt_tiny():
     assert "do not run slow tests" in prompt
     assert "涓氬姟妯″潡" not in prompt
     assert "鍋氭垚涓€涓兘鐩存帴杩愯鐨勪笟鍔″伐浣滃彴" not in prompt
+    assert len(prompt) < 520
+
+
+def test_test_mode_prompt_does_not_duplicate_user_scope():
+    scope = (
+        "AgentOps E2E smoke: create a tiny page titled AgentOps E2E Smoke Test "
+        "with one clickable button."
+    )
+    intent = force_test_mode_intent(infer_job_intent(scope_text=scope, directions=[scope]), scope_text=scope)
+    job = Job(
+        id="job1",
+        user_id="user1",
+        status=JobState.GENERATING_PROMPT,
+        directions=[scope],
+        intent=intent,
+    )
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.GENERATING_PROMPT)
+
+    prompt = prompt_writer.build_fallback_prompt(job, round_)
+
+    assert prompt.count("AgentOps E2E Smoke Test") == 1
+    assert prompt.count("Test constraint:") == 1
     assert len(prompt) < 520
 
 

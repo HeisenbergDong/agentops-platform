@@ -2340,3 +2340,20 @@ This record completes the strict prompt send and stop cleanup fix above.
 Next real-test expectation:
 - A Worker on version `0.1.2-strict-send-stop-cleanup` should not report success when prompt submission is unconfirmed. If Trae startup is too slow or the prompt did not enter the chat, the flow should stop as manual_required instead of moving to wait_completion.
 - Stop/reopen commands now include workspace/project context and should clean workspace-scoped shells/dev servers plus `trae-sandbox.exe` leftovers without closing the main Trae window by default.
+
+## 2026-06-17 Prompt de-dup and visible Worker test launcher
+
+Interrupted real E2E:
+- User asked to pause testing before continuing. Do not start another local Worker or E2E test until the user explicitly confirms.
+- Local `agentops-worker.exe`, `Trae CN.exe`, and `trae-sandbox.exe` were checked and no running processes remained after cleanup.
+- The interrupted smoke job was `2c08c5075c9944099d2f73d3099a7e12`; it had already produced a validated Trae trace and screenshot before the pause, then was marked stopped with active commands cancelled.
+
+Implemented in this round:
+- Test-mode prompt generation now keeps `prompt_brief` to the user scope only, avoiding the previous duplicate smoke-test instruction block.
+- `prompt_writer` appends a single short `Test constraint:` paragraph for smoke/test-chain prompts.
+- Added `apps/worker-windows/scripts/start_worker_visible.ps1` so future temporary E2E runs can start the Worker in a visible normal window. The script explicitly does not install autostart or a Windows service.
+- Worker README now documents the visible temporary E2E launcher.
+
+Verification status:
+- Per user instruction, no pytest, E2E, Worker startup, or deployment was run in this round.
+- Next time testing resumes, start the Worker visibly with `apps/worker-windows/scripts/start_worker_visible.ps1` and close that visible window after the test.

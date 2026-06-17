@@ -269,9 +269,9 @@ def _test_smoke_prompt(direction: str, intent: dict) -> str:
         return ""
     base = text or "AgentOps E2E smoke: create a tiny README or static page that says AgentOps E2E smoke OK."
     return _naturalize_prompt(
-        f"{base} This is only an AgentOps chain smoke test: make the smallest reviewable change, "
-        "do not expand it into a complex business system, do not run slow tests, long builds, "
-        "or full browser acceptance, and finish with one or two short sentences listing changed files."
+        f"{base}\n\n"
+        "Test constraint: make the smallest reviewable change, skip slow tests/builds/browser "
+        "acceptance, and finish with one or two short sentences listing changed files."
     )
 
 

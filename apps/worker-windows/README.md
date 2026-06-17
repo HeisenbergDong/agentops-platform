@@ -28,6 +28,14 @@ Next time, start it by double-clicking:
 
 Keep the window open while the worker should stay online. Closing the window stops the worker. Reopen `agentops-worker.exe` to start it again.
 
+For temporary end-to-end tests, start the worker in a visible window so the operator can see when it is running and close it after the test:
+
+```powershell
+.\scripts\start_worker_visible.ps1
+```
+
+This visible test launcher does not install autostart or a Windows service.
+
 When the worker runtime starts, it automatically reuses an open Trae CN window or starts Trae CN by itself. It also retries this before sending each prompt. You do not need to open Trae manually. If Trae CN is installed in a nonstandard path, register with `--trae-exe-path` or set `AGENTOPS_WORKER_TRAE_EXE_PATH`.
 
 For a single heartbeat and command poll:
