@@ -35,9 +35,29 @@ Verification passed locally:
 - Web build: `npm.cmd run build` passed; existing Vite chunk-size warning remains.
 - `git diff --check` passed.
 
-Deployment status:
+Deployment completion:
 
-- Pending commit, push, Worker ZIP rebuild, production deploy, and production verification at the time this note was first written.
+- Code commit: `55a36d6 fix: preserve trace integrity in test chains`, full commit `55a36d625e07dffd5c6d27f000b45a19b92ec43c`.
+- Pushed to GitHub `origin/main`.
+- Worker ZIP rebuilt:
+  - local path: `D:\code-space\auto-tool\agentops-platform-stop-trace-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - size: `27386867`
+  - SHA256: `19b1d61eff3815b76b9ce8ddfa7d1cf9350f9e6a999415137c2b8e78a004df06`
+  - header: `PK`
+- Uploaded deploy bundle to production: `/tmp/agentops-deploy-55a36d6/`.
+- Production backup dir: `/opt/agentops-deploy-backups/20260617-222403-55a36d6`.
+- Synced source to `/opt/agentops-platform`, preserving production `.env`, API `.venv`, API storage, Web node_modules, Worker build/dist/venv, and caches.
+- Web dist copied to `/opt/agentops-platform/apps/web/dist`.
+- Worker package copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`.
+- Restarted `agentops-api`; service is `active`.
+- Production `.deploy-revision`: `55a36d625e07dffd5c6d27f000b45a19b92ec43c`.
+- Production verification:
+  - local API health OK;
+  - public API health OK;
+  - homepage `http://115.190.113.8/`: `200`;
+  - production Worker ZIP size/SHA/header matched the local build;
+  - production source contains `test_trace_exception`, `open_new_task`, `normalize_turn_probe`, and the strict Feishu trace-missing guard.
 
 ## 2026-06-16 Completed-Trae Trace Copy Fallback Fix
 
