@@ -1970,14 +1970,14 @@ def _ensure_trae_session_gate(
         return True
     if round_ and _hydrate_trae_session_from_trace(db, job, round_):
         return True
-    trace_text = _latest_trace_text(db, job.id, round_.id) if round_ else ""
-    if round_ and _test_chain_allowed(job) and round_.trace_status == "valid" and trace_text.strip():
+    trace_text = _latest_trace_text_for_gate(db, job, round_, max_chars=18000) if round_ else ""
+    if round_ and _test_chain_allowed(job) and round_.trace_status in {"valid", "test_exception"} and trace_text.strip():
         add_log(
             db,
             job_id=job.id,
             round_id=round_.id,
             stage="session_missing_test_exception",
-            message="Real Trae session id is missing, but a verified test trace exists; test chain will continue with an explicit exception.",
+            message="Real Trae session id is missing, but test-chain trace evidence exists; test chain will continue with an explicit exception.",
             level="warning",
             extra={
                 "command_id": command.id,
@@ -2003,7 +2003,7 @@ def _ensure_trae_session_gate(
 
 
 def _hydrate_trae_session_from_trace(db: Session, job: Job, round_: TaskRound) -> bool:
-    trace_text = _latest_trace_text(db, job.id, round_.id, max_chars=0)
+    trace_text = _latest_trace_text_for_gate(db, job, round_, max_chars=0)
     if not trace_text.strip():
         return False
     ids = _extract_trae_ids_from_trace(trace_text)
@@ -2019,13 +2019,13 @@ def _hydrate_trae_session_from_trace(db: Session, job: Job, round_: TaskRound) -
         job_id=job.id,
         round_id=round_.id,
         stage="session_collected",
-        message="Real Trae session metadata recovered from the verified trace attachment.",
+        message="Real Trae session metadata recovered from trace evidence.",
         extra={
             "session_id": round_.trae_session_id,
             "user_message_id": round_.trae_user_message_id,
             "task_id": round_.trae_task_id,
             "trace_id": round_.trae_trace_id,
-            "source": "trace_attachment",
+            "source": "trace_evidence",
         },
     )
     return True
@@ -2249,6 +2249,7 @@ def _apply_test_trace_exception(
         f"Round: {round_.id}\n"
         f"Blocked command: {command.command_type}\n"
         f"Previous trace status: {round_.trace_status}\n"
+        f"Captured trace text:\n{trace_text or '[no raw trace text captured]'}\n\n"
         f"Runtime logs:\n{_runtime_log_text(db, job.id, round_.id)}\n"
     )
     _record_text_attachment(db, command, text, kind="test_trace_exception", filename_prefix="test-trace-exception")
@@ -2802,7 +2803,7 @@ def _prepare_feishu_fields(
     if not round_.trae_session_id:
         raise FeishuWriteError("Real Trae Session ID is missing; refusing to write Feishu business record.")
     screenshot = _latest_attachment(db, job.id, round_.id, "screenshot")
-    log_trace, attachment_paths = _feishu_trace_field_and_attachments(db, job.id, round_.id)
+    log_trace, attachment_paths = _feishu_trace_field_and_attachments(db, job, round_)
     if not log_trace.strip():
         raise FeishuWriteError("Verified Trae assistant trace is missing; refusing to write Feishu business record.")
     git_data = git_result.data or {}
@@ -2838,14 +2839,24 @@ def _prepare_feishu_fields(
     return fields
 
 
-def _feishu_trace_field_and_attachments(db: Session, job_id: str, round_id: str) -> tuple[str, list[str]]:
-    attachment = _latest_attachment(db, job_id, round_id, "trace")
+def _feishu_trace_field_and_attachments(db: Session, job: Job, round_: TaskRound) -> tuple[str, list[str]]:
+    attachment = _latest_attachment(db, job.id, round_.id, "trace")
+    is_test_exception = False
+    if not attachment and _test_chain_allowed(job) and round_.trace_status == "test_exception":
+        attachment = _latest_attachment(db, job.id, round_.id, "test_trace_exception")
+        is_test_exception = attachment is not None
     if not attachment:
         return "", []
     path = Path(attachment.path)
     if not path.exists():
         return "", []
     text = path.read_text(encoding="utf-8")
+    if is_test_exception:
+        text = (
+            "TEST MODE TRACE EXCEPTION - not a formal business acceptance trace.\n"
+            "This row was written only to validate AgentOps GitHub/Feishu automation.\n\n"
+            f"{text}"
+        )
     if len(text) > LOG_TRACE_FIELD_SOFT_LIMIT:
         return LOG_TRACE_OVERFLOW_TEXT, [str(path)]
     return text, []
@@ -2855,6 +2866,20 @@ def _latest_trace_text(db: Session, job_id: str, round_id: str, max_chars: int =
     attachment = _latest_attachment(db, job_id, round_id, "trace")
     if not attachment:
         return ""
+    return _attachment_text(attachment, max_chars=max_chars)
+
+
+def _latest_trace_text_for_gate(db: Session, job: Job, round_: TaskRound, max_chars: int = 18000) -> str:
+    text = _latest_trace_text(db, job.id, round_.id, max_chars=max_chars)
+    if text.strip() or not _test_chain_allowed(job):
+        return text
+    attachment = _latest_attachment(db, job.id, round_.id, "test_trace_exception")
+    if not attachment:
+        return ""
+    return _attachment_text(attachment, max_chars=max_chars)
+
+
+def _attachment_text(attachment: Attachment, max_chars: int = 18000) -> str:
     path = Path(attachment.path)
     if not path.exists():
         return ""
