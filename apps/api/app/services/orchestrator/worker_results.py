@@ -822,6 +822,27 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
     extra = _result_extra(command, result)
     data_status = str(result.data.get("status") or "")
     if result.status in {"ok", "success", "completed"} and data_status == "passed":
+        if _force_test_unsatisfied(job):
+            _record_dissatisfaction(
+                db,
+                job,
+                round_,
+                command,
+                result,
+                JobState.BROWSER_ACCEPTING,
+                "Browser acceptance passed, but this test-chain run is configured to force dissatisfaction so the GitHub and Feishu follow-up path can be verified.",
+                extra,
+            )
+            _advance_to_github_submitting(
+                db,
+                command,
+                job,
+                round_,
+                "Browser acceptance passed; test mode forced dissatisfaction and GitHub submission will continue for chain validation.",
+                extra,
+                level="warning",
+            )
+            return
         if round_ and round_.round_index == 1 and not _has_dissatisfaction_reason(db, job.id, round_.id):
             _discard_first_round_satisfied(db, job, round_, extra)
             return
@@ -2226,6 +2247,11 @@ def _test_chain_allowed(job: Job) -> bool:
         and intent.get("downstream_policy") == "test_chain_allowed"
         and intent.get("trace_gate_policy") == "test_exception"
     )
+
+
+def _force_test_unsatisfied(job: Job) -> bool:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    return intent.get("run_mode") == "test" and intent.get("dissatisfaction_policy") == "force_test_unsatisfied"
 
 
 def _test_mode_skips_trae_self_tests(job: Job) -> bool:

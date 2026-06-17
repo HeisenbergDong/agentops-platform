@@ -1014,6 +1014,39 @@ def test_first_round_satisfied_is_discarded_without_github_submission():
     assert next_round.round_index == 1
 
 
+def test_test_mode_browser_acceptance_pass_forces_github_submission():
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    job.intent = {
+        "run_mode": "test",
+        "dissatisfaction_policy": "force_test_unsatisfied",
+        "downstream_policy": "test_chain_allowed",
+        "trace_gate_policy": "test_exception",
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "passed", "url": "http://localhost:5173", "http_status": 200},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
+    reason = _latest_dissatisfaction_reason(db)
+    assert job.status == JobState.GITHUB_SUBMITTING
+    assert round_.status == JobState.GITHUB_SUBMITTING
+    assert next_command is not None
+    assert reason is not None
+    assert "测试" in reason.extra["reason"] or "test" in reason.extra["reason"].lower()
+
+
 def test_browser_acceptance_blocks_without_real_trae_session():
     db = _test_session()
     job, round_, command = _create_browser_acceptance_rows(db)
