@@ -34,6 +34,14 @@ SERVICE_INTERRUPTION_MARKERS = (
     "service error",
     "failed to generate",
 )
+MANUAL_STOP_MARKERS = (
+    "\u624b\u52a8\u7ec8\u6b62\u8f93\u51fa",
+    "\u5f53\u524d\u4efb\u52a1\u88ab\u624b\u52a8\u4e2d\u65ad",
+    "\u624b\u52a8\u4e2d\u65ad",
+    "manually stopped",
+    "manual stop",
+    "stopped manually",
+)
 
 
 def collect_local_trace(
@@ -195,6 +203,8 @@ def probe_local_trace(text: str) -> dict[str, Any]:
     tail = normalized[-1600:].lower()
     if any(marker.lower() in tail for marker in CONTINUE_MARKERS):
         return {"complete_like": False, "reason": "awaiting_continuation", "chars": len(normalized)}
+    if any(marker.lower() in normalized[-2400:].lower() for marker in MANUAL_STOP_MARKERS):
+        return {"complete_like": False, "reason": "manual_stopped", "chars": len(normalized)}
     if any(marker.lower() in normalized[-2400:].lower() for marker in SERVICE_INTERRUPTION_MARKERS):
         return {"complete_like": False, "reason": "service_interrupted", "chars": len(normalized)}
     marker_count = sum(1 for marker in TRACE_MARKERS if marker in normalized)

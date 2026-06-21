@@ -30,6 +30,17 @@ def test_trace_validator_rejects_partial_code_copy():
     assert validate_full_trace(trace) == {"valid": False, "reason": "partial_code_copy"}
 
 
+def test_trace_validator_rejects_single_tool_fragment():
+    trace = (
+        "toolName: view_folder\n"
+        "status: success\n"
+        "d:\\code-space\\coding-soler\\workspace-dashboard-analytics-19cc3bb3\n"
+        + ("我先探索相关代码文件。\n" * 80)
+    )
+
+    assert validate_full_trace(trace) == {"valid": False, "reason": "partial_tool_trace"}
+
+
 def test_trace_validator_rejects_trace_that_requires_continue():
     trace = (
         "toolName: edit\n"

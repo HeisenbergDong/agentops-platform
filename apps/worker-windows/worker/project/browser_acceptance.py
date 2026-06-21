@@ -5,7 +5,7 @@ import time
 from html import unescape
 from pathlib import Path
 from typing import Callable
-from urllib.parse import urlparse
+from urllib.parse import urlparse, urlunparse
 
 import httpx
 
@@ -15,6 +15,9 @@ from worker.project.dev_env import command_environment, resolve_tool
 LOCAL_BROWSER_HOSTS = {"localhost", "127.0.0.1", "::1"}
 IGNORED_DIRS = {"node_modules", "dist", "build", "target", ".venv", "__pycache__", ".git", ".npm-cache"}
 DEFAULT_START_TIMEOUT_SECONDS = 45.0
+COMMON_SPA_PATHS = ("/", "/jobs", "/dashboard", "/candidates", "/interviews", "/login")
+LOCAL_URL_RE = re.compile(r"https?://(?:localhost|127\.0\.0\.1|\[::1\]):(?P<port>\d{2,5})(?P<path>/[^\s'\"<>)]*)?")
+LOCAL_PORT_HINT_RE = re.compile(r"(?:localhost|127\.0\.0\.1|port|端口|运行在|running).{0,30}?(?P<port>51\d{2})", re.IGNORECASE)
 
 
 def run_browser_acceptance(
@@ -43,13 +46,19 @@ def run_browser_acceptance(
             "message": "Only local HTTP URLs are supported for automated browser acceptance.",
         }
 
-    initial = _fetch_url(project_path, normalized_url, timeout_seconds, cancellation_check)
+    root = Path(project_path)
+    initial = _fetch_best_url(
+        project_path,
+        _candidate_urls(root, normalized_url, include_neighbor_ports=False),
+        timeout_seconds,
+        cancellation_check,
+    )
     if initial["status"] == "passed":
         return initial
 
     if cancellation_check:
         cancellation_check()
-    start_result = _start_local_dev_server(Path(project_path), parsed)
+    start_result = _start_local_dev_server(root, parsed)
     if start_result["status"] not in {"started", "already_running"}:
         initial["auto_start"] = start_result
         return initial
@@ -58,7 +67,12 @@ def run_browser_acceptance(
     latest = initial
     while time.monotonic() < deadline:
         _sleep_with_cancellation(1.5, cancellation_check)
-        latest = _fetch_url(project_path, normalized_url, timeout_seconds, cancellation_check)
+        latest = _fetch_best_url(
+            project_path,
+            _candidate_urls(root, normalized_url, start_result, include_neighbor_ports=True),
+            timeout_seconds,
+            cancellation_check,
+        )
         if latest["status"] == "passed":
             latest["auto_start"] = start_result
             latest["message"] = "Browser acceptance URL responded with content after starting the local dev server."
@@ -67,6 +81,41 @@ def run_browser_acceptance(
     latest["auto_start"] = start_result
     latest["message"] = "Browser acceptance URL did not become usable after starting the local dev server."
     return latest
+
+
+def _fetch_best_url(
+    project_path: str,
+    candidate_urls: list[str],
+    timeout_seconds: float,
+    cancellation_check: Callable[[], None] | None = None,
+) -> dict:
+    best: dict | None = None
+    best_score = -1
+    tried: list[str] = []
+    for candidate in candidate_urls:
+        if cancellation_check:
+            cancellation_check()
+        if candidate in tried:
+            continue
+        tried.append(candidate)
+        result = _fetch_url(project_path, candidate, timeout_seconds, cancellation_check)
+        result["candidate_urls_tried"] = list(tried)
+        if result["status"] == "passed":
+            return result
+        score = _acceptance_score(result)
+        if best is None or score > best_score:
+            best = result
+            best_score = score
+    if best is not None:
+        best["candidate_urls_tried"] = tried
+        return best
+    return {
+        "status": "failed",
+        "project_path": project_path,
+        "url": "",
+        "candidate_urls_tried": tried,
+        "message": "No browser acceptance candidate URL could be checked.",
+    }
 
 
 def _fetch_url(
@@ -163,6 +212,7 @@ def _start_local_dev_server(root: Path, parsed_url) -> dict:
             stderr=subprocess.STDOUT,
             creationflags=creationflags,
         )
+    _write_started_process_metadata(log_dir, process.pid, package_root, command)
 
     return {
         "status": "started",
@@ -171,6 +221,132 @@ def _start_local_dev_server(root: Path, parsed_url) -> dict:
         "command": [str(item) for item in command],
         "log_path": str(log_path),
     }
+
+
+def _write_started_process_metadata(log_dir: Path, pid: int, cwd: Path, command: list[str]) -> None:
+    try:
+        (log_dir / "browser-acceptance-server.json").write_text(
+            json.dumps(
+                {
+                    "pid": pid,
+                    "cwd": str(cwd),
+                    "command": [str(item) for item in command],
+                    "created_at": time.time(),
+                },
+                ensure_ascii=False,
+            ),
+            encoding="utf-8",
+        )
+    except OSError:
+        return
+
+
+def _candidate_urls(
+    root: Path,
+    normalized_url: str,
+    start_result: dict | None = None,
+    *,
+    include_neighbor_ports: bool = True,
+) -> list[str]:
+    parsed = urlparse(normalized_url)
+    urls: list[str] = []
+    log_urls = _urls_from_project_logs(root)
+    if isinstance(start_result, dict):
+        log_path = str(start_result.get("log_path") or "").strip()
+        if log_path:
+            log_urls = _urls_from_log_file(Path(log_path)) + log_urls
+    urls.extend(_expand_urls_with_common_paths(log_urls))
+    urls.append(normalized_url)
+    if include_neighbor_ports and parsed.port:
+        for port in range(parsed.port, parsed.port + 8):
+            for path in _candidate_paths(parsed.path):
+                urls.append(_replace_port_path(parsed, port, path))
+    return list(dict.fromkeys(url for url in urls if url))
+
+
+def _candidate_paths(path: str) -> list[str]:
+    values = [path or "/"]
+    values.extend(COMMON_SPA_PATHS)
+    normalized: list[str] = []
+    for value in values:
+        clean = "/" + str(value or "/").lstrip("/")
+        if clean not in normalized:
+            normalized.append(clean)
+    return normalized
+
+
+def _replace_port_path(parsed, port: int, path: str) -> str:
+    host = parsed.hostname or "localhost"
+    if ":" in host and not host.startswith("["):
+        host = f"[{host}]"
+    netloc = f"{host}:{port}"
+    return urlunparse((parsed.scheme or "http", netloc, path or "/", "", "", ""))
+
+
+def _expand_urls_with_common_paths(urls: list[str]) -> list[str]:
+    result: list[str] = []
+    for url in urls:
+        parsed = urlparse(url)
+        if not parsed.scheme or not parsed.hostname or not parsed.port:
+            continue
+        result.append(url)
+        for path in _candidate_paths(parsed.path):
+            result.append(_replace_port_path(parsed, parsed.port, path))
+    return list(dict.fromkeys(result))
+
+
+def _urls_from_project_logs(root: Path) -> list[str]:
+    if not root.exists():
+        return []
+    candidates: list[Path] = []
+    for relative in (".agentops/browser-acceptance-server.log", "stdout.txt", "stderr.txt"):
+        path = root / relative
+        if path.exists():
+            candidates.append(path)
+    try:
+        for path in root.rglob("*.log"):
+            if any(part in IGNORED_DIRS for part in path.relative_to(root).parts):
+                continue
+            candidates.append(path)
+    except OSError:
+        pass
+    unique = list({str(path): path for path in candidates}.values())
+    unique.sort(key=lambda item: item.stat().st_mtime if item.exists() else 0, reverse=True)
+    urls: list[str] = []
+    for path in unique[:8]:
+        urls.extend(_urls_from_log_file(path))
+    return list(dict.fromkeys(urls))
+
+
+def _urls_from_log_file(path: Path) -> list[str]:
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")[-20000:]
+    except OSError:
+        return []
+    urls: list[str] = []
+    for match in LOCAL_URL_RE.finditer(text):
+        port = match.group("port")
+        path_part = match.group("path") or "/"
+        urls.append(f"http://localhost:{port}{path_part}")
+    for match in LOCAL_PORT_HINT_RE.finditer(text):
+        urls.append(f"http://localhost:{match.group('port')}/")
+    return list(dict.fromkeys(urls))
+
+
+def _acceptance_score(result: dict) -> int:
+    status = str(result.get("status") or "")
+    score = 1000 if status == "passed" else 0
+    try:
+        http_status = int(result.get("http_status") or 0)
+    except (TypeError, ValueError):
+        http_status = 0
+    if 200 <= http_status < 400:
+        score += 100
+    inspection = result.get("inspection") if isinstance(result.get("inspection"), dict) else {}
+    score += min(int(inspection.get("text_length") or 0), 500)
+    score += int(inspection.get("interactive_count") or 0) * 25
+    score -= len(inspection.get("issues") or []) * 200
+    return score
 
 
 def _find_dev_server_script(root: Path, target_port: int | None) -> tuple[Path | None, str]:

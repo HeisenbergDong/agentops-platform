@@ -56,6 +56,45 @@ def test_download_worker_package_uses_configured_zip(monkeypatch, tmp_path: Path
     assert response.filename == "agentops-worker-windows.zip"
 
 
+def test_head_worker_package_reports_zip_metadata(monkeypatch, tmp_path: Path):
+    package = tmp_path / "agentops-worker-windows.zip"
+    package.write_bytes(b"zip")
+    monkeypatch.setattr(workers.settings, "worker_package_path", package)
+
+    response = workers.head_worker_package(user=User(id="user1", email="u@example.com", display_name="User"))
+
+    assert response.headers["content-type"] == "application/zip"
+    assert response.headers["content-length"] == "3"
+    assert "agentops-worker-windows.zip" in response.headers["content-disposition"]
+
+
+def test_create_worker_package_ticket_downloads_package(monkeypatch, tmp_path: Path):
+    package = tmp_path / "agentops-worker-windows.zip"
+    package.write_bytes(b"zip")
+    monkeypatch.setattr(workers.settings, "worker_package_path", package)
+
+    ticket = workers.create_worker_package_ticket(
+        user=User(id="user1", email="u@example.com", display_name="User")
+    )
+
+    assert ticket["download_url"].startswith("/api/workers/package-download/")
+    assert ticket["expires_in"] == workers.WORKER_PACKAGE_DOWNLOAD_TOKEN_TTL_SECONDS
+    assert ticket["filename"] == "agentops-worker-windows.zip"
+    token = ticket["download_url"].rsplit("/", 1)[-1]
+    response = workers.download_worker_package_by_ticket(token)
+
+    assert Path(response.path) == package.resolve()
+
+
+def test_worker_package_download_ticket_rejects_invalid_token():
+    try:
+        workers.download_worker_package_by_ticket("not-a-token")
+    except HTTPException as exc:
+        assert exc.status_code == 401
+    else:
+        raise AssertionError("Expected invalid download ticket to return 401")
+
+
 def test_download_worker_package_reports_missing(monkeypatch):
     monkeypatch.setattr(workers, "_worker_package_path", lambda: None)
 

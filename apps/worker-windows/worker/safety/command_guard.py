@@ -1,6 +1,12 @@
 ALLOWED_COMMAND_PREFIXES = {
     ("npm", "run"),
     ("npm", "test"),
+    ("npm.cmd", "run"),
+    ("npm.cmd", "test"),
+    ("npx",),
+    ("npx.cmd",),
+    ("pnpm", "run"),
+    ("pnpm.cmd", "run"),
     ("python", "-m"),
     ("pytest",),
     ("go", "test"),

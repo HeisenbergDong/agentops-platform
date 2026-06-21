@@ -51,7 +51,14 @@ def wait_completion(
     sent_at: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
 ) -> dict:
-    focus_trae(timeout_seconds=min(10.0, timeout_seconds))
+    if workspace_path:
+        focus_trae(
+            timeout_seconds=min(10.0, timeout_seconds),
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+    else:
+        focus_trae(timeout_seconds=min(10.0, timeout_seconds))
     deadline = time.monotonic() + timeout_seconds
     stable_since: float | None = None
     last_signature = ""
@@ -64,7 +71,14 @@ def wait_completion(
     while time.monotonic() < deadline:
         if cancellation_check:
             cancellation_check()
-        window = find_trae_window(timeout_seconds=2.0)
+        if workspace_path:
+            window = find_trae_window(
+                timeout_seconds=2.0,
+                workspace_path=workspace_path,
+                require_workspace_match=True,
+            )
+        else:
+            window = find_trae_window(timeout_seconds=2.0)
         latest_text = window_text_snapshot(window)
         signature = hashlib.sha256(latest_text.encode("utf-8", errors="ignore")).hexdigest()
         busy = any(marker in latest_text for marker in BUSY_MARKERS)
@@ -100,6 +114,7 @@ def wait_completion(
                     latest_text=latest_text,
                     interventions=interventions,
                     timeout_seconds=timeout_seconds,
+                    workspace_path=workspace_path,
                     ui_analyst=ui_analyst,
                 )
                 if outcome.get("status") == "completed":
@@ -153,6 +168,16 @@ def wait_completion(
                 last_progress_at,
                 min_interval=max(1.0, progress_interval_seconds),
             )
+            visual_completion = _try_visual_completion(
+                latest_text=latest_text,
+                stable_seconds=stable_seconds,
+                interventions=interventions,
+                timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
+                ui_analyst=ui_analyst,
+            )
+            if visual_completion:
+                return visual_completion
             decision = _supervisor_decision(
                 latest_text=latest_text,
                 busy=busy,
@@ -178,6 +203,7 @@ def wait_completion(
                 latest_text=latest_text,
                 interventions=interventions,
                 timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
             )
             if outcome.get("status") == "completed":
@@ -228,6 +254,42 @@ def wait_completion(
             "text_sample": latest_text[-1000:],
             "interventions": interventions,
         },
+    )
+
+
+def _try_visual_completion(
+    *,
+    latest_text: str,
+    stable_seconds: float,
+    interventions: list[dict],
+    timeout_seconds: float,
+    workspace_path: str = "",
+    ui_analyst: Callable[[str, dict], dict] | None,
+) -> dict | None:
+    if not ui_analyst:
+        return None
+    intervention = _try_auto_intervention(
+        reason="visual_completion_check",
+        timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+        workspace_path=workspace_path,
+        ui_analyst=ui_analyst,
+    )
+    if intervention.get("status") != "completed":
+        return None
+    decision = {
+        "action": "collect_trace",
+        "reason": str(intervention.get("reason") or "visual_completion_detected"),
+        "diagnosis": intervention.get("diagnosis") or {},
+        "output_probe": probe_trace(latest_text),
+    }
+    return _completed_result(
+        stable_seconds=stable_seconds,
+        latest_text=latest_text,
+        output_probe=decision["output_probe"],
+        turn_probe={},
+        gate={},
+        interventions=interventions,
+        supervisor_decision=decision,
     )
 
 
@@ -395,6 +457,7 @@ def _handle_supervisor_decision(
     latest_text: str,
     interventions: list[dict],
     timeout_seconds: float,
+    workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
 ) -> dict:
     action = str(decision.get("action") or "wait")
@@ -424,6 +487,7 @@ def _handle_supervisor_decision(
         intervention = _try_auto_intervention(
             reason=reason,
             timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
+            workspace_path=workspace_path,
             ui_analyst=ui_analyst,
         )
         intervention["supervisor_action"] = action
@@ -523,6 +587,7 @@ def _sleep_with_cancellation(seconds: float, cancellation_check: Callable[[], No
 def _try_auto_intervention(
     reason: str,
     timeout_seconds: float,
+    workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
 ) -> dict:
     try:
@@ -531,6 +596,7 @@ def _try_auto_intervention(
             scroll_bottom=True,
             ui_analyst=ui_analyst,
             task="wait_completion_state",
+            workspace_path=workspace_path or None,
         )
     except Exception as exc:
         return {
@@ -559,7 +625,14 @@ def _try_auto_intervention(
             "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
         }
     try:
-        result = apply_intervention(suggested, timeout_seconds=timeout_seconds)
+        if workspace_path:
+            result = apply_intervention(
+                suggested,
+                timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
+            )
+        else:
+            result = apply_intervention(suggested, timeout_seconds=timeout_seconds)
     except Exception as exc:
         return {
             "status": "failed",

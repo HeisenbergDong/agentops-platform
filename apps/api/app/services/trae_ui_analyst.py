@@ -13,27 +13,34 @@ Analyze a Trae CN screenshot and classify whether Trae is still working, complet
 You never control the mouse or keyboard. Return JSON only.
 Do not guess. If uncertain, return status "need_more_context" or "not_found".
 Coordinates must be absolute screen coordinates when window.bounds is provided, and also include ratios relative to that window.
-Allowed safe click targets include prompt_input, send_button, continue_button, run_button, confirm_button, keep_button, save_button.
-Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bottom, click_run_button, click_keep_button, click_continue_button, type_continue, answer_terminal_prompt, do_not_click, need_more_context.
-Dangerous actions such as delete, remove, clear, reset, discard, cancel, abandon must have risk "blocked" and recommended_action "do_not_click".
+Allowed click targets include prompt_input, send_button, copy_trace_button, more_actions_button, continue_button, run_button, confirm_button, keep_button, save_button, delete_button, discard_button, remove_button, reset_button, cancel_button.
+Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bottom, scroll_inner_panel, click_run_button, click_confirm_button, click_keep_button, click_save_button, click_continue_button, click_delete_button, click_discard_button, click_cancel_button, type_continue, answer_terminal_prompt, do_not_click, need_more_context.
+If the screenshot contains "正在等待你的操作", "等待您的操作", "确认执行", "保留", "删除", "应用", "继续", "运行", "允许", or "拒绝", classify it as a pending user action instead of ordinary generation.
+Hard rule: a visible waiting-for-user-action card is never a completed task. If that card includes destructive choices like "删除", "移除", "清空", "重置", "放弃", "丢弃", "取消", delete, remove, clear, reset, discard, cancel, or abandon, return screen_state "manual_required", recommended_action "do_not_click", risk "blocked", and explain blocked_reason.
+Example: if Trae shows "正在等待你的操作" with "删除 startup.log" and buttons "保留" / "删除", the correct answer is manual_required + do_not_click, not completed and not click_delete_button.
+If the pending action is inside a nested reply card or small inner panel and the card content is cut off or not fully visible, use screen_state "needs_scroll_inner_panel" and recommended_action "scroll_inner_panel".
+For destructive-looking actions such as delete, remove, clear, reset, discard, cancel, or abandon, use risk "blocked" and recommended_action "do_not_click" unless task context explicitly allows that exact destructive action. Prefer manual confirmation for file deletion cards.
 If the model request failed with 3003 or service interruption, prefer recommended_action "type_continue" with risk "safe".
 If the assistant appears to still be generating or tools are running, use recommended_action "wait".
 If the left task card or assistant area visibly says the task is complete, classify screen_state "completed" and recommended_action "collect_trace_candidate" unless there is a visible generating spinner, terminal prompt, service error, or explicit continue prompt.
-If the editor shows "changes completed", "keep changes", "adopt", or "save" after generated file changes, treat it as completion evidence. It may also be screen_state "awaiting_keep_changes", but for wait_completion_state the preferred recommended_action is still "collect_trace_candidate" when no generation/error/terminal prompt is visible.
-Keep/adopt/save buttons are not dangerous, but they are not the core goal; the platform should collect trace after completion.
-When task context asks for wait_completion_state, prefer deciding completed vs blocked vs still working over finding a click target.
+When task context desired_action is copy_trace_button, locate the safe copy button/icon for the latest completed assistant reply or its execution trace. Prefer the assistant message bottom toolbar copy control. Do not choose code-block copy buttons, editor toolbar copy icons, file explorer controls, or window chrome. If the reply area is narrow and the toolbar has a "..." / more / overflow button where copy may be hidden, return a safe more_actions_button target first, not not_found. If the overflow menu is already open, choose the Copy item inside that menu only when it belongs to the latest assistant reply toolbar. If no direct copy or overflow menu path is visible, return status "not_found" and need_scroll true when scrolling may reveal it.
+When task context desired_action is send_button, the target must be the active green send/up-arrow/paper-plane button at the lower-right of the Trae chat composer. Never choose microphone, voice input, audio, lightning, attachment, model selector, seed selector, or any toolbar icon as send_button. If the visible candidate is a microphone/voice icon, return not_found or do_not_click and explain it.
+When task context desired_action is verify_prompt_submission, classify only whether the prompt submission succeeded. If the prompt text still appears in the composer or the active green send button is still visible beside a filled composer, return screen_state "prompt_still_in_composer", recommended_action "do_not_click", risk "blocked". If no submitted user prompt or generation is visible, return screen_state "prompt_not_submitted". If the prompt has left the composer and Trae is generating or waiting for a safe follow-up action, return screen_state "prompt_submitted" or the more specific generating/awaiting_* state. Do not return click targets for this task.
+If Trae is asking whether to execute, continue, or keep/adopt/save changes, classify the prompt and return the exact visible safe button target when that is the correct next action.
+If Trae is asking whether to delete, remove, discard, reset, or cancel something, classify it as manual_required/do_not_click unless task context explicitly allows that destructive action.
+When task context asks for wait_completion_state, the screenshot is the source of truth for pending UI actions; do not treat visible confirmation cards as completion unless the prompt is already resolved.
 """.strip()
 
 
 OUTPUT_SCHEMA = {
     "status": "found | partial | need_more_context | not_found",
-    "screen_state": "generating | completed | awaiting_run_confirmation | awaiting_keep_changes | awaiting_continue | model_error_3003 | service_interrupted | terminal_prompt | needs_scroll_reply_bottom | editor_only | window_chrome_only | unknown",
-    "recommended_action": "wait | collect_trace_candidate | scroll_reply_bottom | click_run_button | click_keep_button | click_continue_button | type_continue | answer_terminal_prompt | do_not_click | need_more_context",
+    "screen_state": "generating | completed | prompt_submitted | prompt_still_in_composer | prompt_not_submitted | manual_required | awaiting_run_confirmation | awaiting_confirm | awaiting_keep_changes | awaiting_save | awaiting_continue | awaiting_delete_confirmation | awaiting_discard_confirmation | awaiting_cancel_confirmation | model_error_3003 | service_interrupted | terminal_prompt | needs_scroll_reply_bottom | needs_scroll_inner_panel | editor_only | window_chrome_only | unknown",
+    "recommended_action": "wait | collect_trace_candidate | scroll_reply_bottom | scroll_inner_panel | click_run_button | click_confirm_button | click_keep_button | click_save_button | click_continue_button | click_delete_button | click_discard_button | click_cancel_button | type_continue | answer_terminal_prompt | do_not_click | need_more_context",
     "confidence": 0.0,
     "risk": "safe | blocked | unknown",
     "target": {
-        "action": "continue_button",
-        "label": "Continue",
+        "action": "copy_trace_button",
+        "label": "Copy latest assistant reply",
         "center": {"x": 0, "y": 0},
         "ratio": {"x": 0.0, "y": 0.0},
     },
@@ -57,13 +64,23 @@ OUTPUT_SCHEMA = {
 SCREEN_STATES = {
     "generating",
     "completed",
+    "prompt_submitted",
+    "prompt_still_in_composer",
+    "prompt_not_submitted",
+    "manual_required",
     "awaiting_run_confirmation",
+    "awaiting_confirm",
     "awaiting_keep_changes",
+    "awaiting_save",
     "awaiting_continue",
+    "awaiting_delete_confirmation",
+    "awaiting_discard_confirmation",
+    "awaiting_cancel_confirmation",
     "model_error_3003",
     "service_interrupted",
     "terminal_prompt",
     "needs_scroll_reply_bottom",
+    "needs_scroll_inner_panel",
     "editor_only",
     "window_chrome_only",
     "unknown",
@@ -72,9 +89,15 @@ RECOMMENDED_ACTIONS = {
     "wait",
     "collect_trace_candidate",
     "scroll_reply_bottom",
+    "scroll_inner_panel",
     "click_run_button",
+    "click_confirm_button",
     "click_keep_button",
+    "click_save_button",
     "click_continue_button",
+    "click_delete_button",
+    "click_discard_button",
+    "click_cancel_button",
     "type_continue",
     "answer_terminal_prompt",
     "do_not_click",
@@ -82,11 +105,18 @@ RECOMMENDED_ACTIONS = {
 }
 RISKS = {"safe", "blocked", "unknown"}
 ACTION_TO_RECOMMENDATION = {
+    "copy_trace_button": "collect_trace_candidate",
+    "more_actions_button": "collect_trace_candidate",
     "continue_button": "click_continue_button",
     "run_button": "click_run_button",
-    "confirm_button": "click_run_button",
+    "confirm_button": "click_confirm_button",
     "keep_button": "click_keep_button",
-    "save_button": "click_keep_button",
+    "save_button": "click_save_button",
+    "delete_button": "click_delete_button",
+    "remove_button": "click_delete_button",
+    "discard_button": "click_discard_button",
+    "reset_button": "click_discard_button",
+    "cancel_button": "click_cancel_button",
 }
 UNSAFE_TEXT_MARKERS = (
     "delete",
@@ -103,6 +133,32 @@ UNSAFE_TEXT_MARKERS = (
     "放弃",
     "取消",
 )
+WAITING_ACTION_TEXT_MARKERS = (
+    "正在等待你的操作",
+    "正在等待您的操作",
+    "等待你的操作",
+    "等待您的操作",
+    "等待操作",
+    "waiting for your operation",
+    "waiting for your action",
+)
+DESTRUCTIVE_RECOMMENDED_ACTIONS = {
+    "click_delete_button",
+    "click_discard_button",
+    "click_cancel_button",
+}
+DESTRUCTIVE_SCREEN_STATES = {
+    "awaiting_delete_confirmation",
+    "awaiting_discard_confirmation",
+    "awaiting_cancel_confirmation",
+}
+DESTRUCTIVE_CONFIRMATION_ACTIONS = {
+    "delete_button": ("awaiting_delete_confirmation", "click_delete_button"),
+    "remove_button": ("awaiting_delete_confirmation", "click_delete_button"),
+    "discard_button": ("awaiting_discard_confirmation", "click_discard_button"),
+    "reset_button": ("awaiting_discard_confirmation", "click_discard_button"),
+    "cancel_button": ("awaiting_cancel_confirmation", "click_cancel_button"),
+}
 
 
 def analyze_trae_ui(
@@ -172,7 +228,7 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
         target = _normalize_target_geometry(dict(item), left=left, top=top, width=width, height=height)
         target["confidence"] = float(target.get("confidence") or 0)
         target["risk"] = _normalized_choice(str(target.get("risk") or "unknown"), RISKS, "unknown")
-        if _looks_unsafe_target(target):
+        if _should_block_unsafe_target(target, data, context):
             target["risk"] = "blocked"
         targets.append(target)
     status = str(data.get("status") or ("found" if targets else "not_found"))
@@ -187,22 +243,32 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
         if "risk" not in target:
             target["risk"] = data.get("risk") or (targets[0].get("risk") if targets else "unknown")
         target["risk"] = _normalized_choice(str(target.get("risk") or "unknown"), RISKS, "unknown")
+        if _should_block_unsafe_target(target, data, context):
+            target["risk"] = "blocked"
     screen_state = _normalized_choice(str(data.get("screen_state") or ""), SCREEN_STATES, "unknown")
     recommended_action = _normalized_choice(str(data.get("recommended_action") or ""), RECOMMENDED_ACTIONS, "")
     if not recommended_action:
         recommended_action = _recommended_action_from_state(screen_state, target, targets)
-    task = str(context.get("task") or "").strip()
-    if task == "wait_completion_state" and screen_state == "awaiting_keep_changes":
-        recommended_action = "collect_trace_candidate"
     confidence = _clamped_float(data.get("confidence"), default=_target_confidence(target, targets))
     risk = _normalized_choice(str(data.get("risk") or ""), RISKS, "")
     if not risk:
         risk = _risk_from_target(target, targets)
     blocked_reason = str(data.get("blocked_reason") or "")
-    if _looks_unsafe_target(target):
+    if _should_block_destructive_analysis(screen_state, recommended_action, target, targets, data, context):
+        if screen_state == "completed":
+            screen_state = "manual_required"
         risk = "blocked"
         recommended_action = "do_not_click"
-        blocked_reason = blocked_reason or "unsafe_target_label"
+        blocked_reason = blocked_reason or _destructive_block_reason(data, context)
+        if target:
+            target["risk"] = "blocked"
+        for item in targets:
+            if _looks_unsafe_target(item):
+                item["risk"] = "blocked"
+    if target and str(target.get("risk") or "") == "blocked":
+        risk = "blocked"
+        recommended_action = "do_not_click"
+        blocked_reason = blocked_reason or "target_marked_blocked"
         target["risk"] = "blocked"
     if target and str(target.get("action") or "") and not _target_in_list(target, targets):
         targets.insert(0, target)
@@ -270,11 +336,15 @@ def _recommended_action_from_state(screen_state: str, target: dict, targets: lis
         return "collect_trace_candidate"
     if screen_state == "needs_scroll_reply_bottom":
         return "scroll_reply_bottom"
+    if screen_state == "needs_scroll_inner_panel":
+        return "scroll_inner_panel"
     if screen_state in {"model_error_3003", "service_interrupted"}:
         return "type_continue"
     if screen_state == "terminal_prompt":
         return "answer_terminal_prompt"
     if screen_state in {"editor_only", "window_chrome_only"}:
+        return "do_not_click"
+    if screen_state == "manual_required":
         return "do_not_click"
     action = str(target.get("action") or "")
     if action in ACTION_TO_RECOMMENDATION:
@@ -314,6 +384,85 @@ def _clamped_float(value: Any, default: float = 0.0) -> float:
 def _looks_unsafe_target(target: dict) -> bool:
     text = f"{target.get('action') or ''} {target.get('label') or ''} {target.get('reason') or ''}".lower()
     return any(marker.lower() in text for marker in UNSAFE_TEXT_MARKERS)
+
+
+def _should_block_destructive_analysis(
+    screen_state: str,
+    recommended_action: str,
+    target: dict,
+    targets: list[dict],
+    data: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    if _destructive_action_allowed(target, context):
+        return False
+    if screen_state in DESTRUCTIVE_SCREEN_STATES or recommended_action in DESTRUCTIVE_RECOMMENDED_ACTIONS:
+        return True
+    if _context_has_destructive_waiting_prompt(context) or _analysis_has_destructive_waiting_prompt(data):
+        return True
+    return any(_should_block_unsafe_target(item, data, context) for item in ([target] if target else []) + targets)
+
+
+def _context_has_destructive_waiting_prompt(context: dict[str, Any]) -> bool:
+    text_parts = [str(context.get("visible_text_sample") or "")]
+    buttons = context.get("uia_buttons")
+    if isinstance(buttons, list):
+        for item in buttons:
+            if isinstance(item, dict):
+                text_parts.append(str(item.get("name") or item.get("label") or ""))
+    text = "\n".join(text_parts).lower()
+    return _has_waiting_marker(text) and _has_unsafe_marker(text)
+
+
+def _analysis_has_destructive_waiting_prompt(data: dict[str, Any]) -> bool:
+    evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+    text = "\n".join([str(data.get("reason") or ""), str(data.get("blocked_reason") or ""), *(str(item) for item in evidence)]).lower()
+    return _has_waiting_marker(text) and _has_unsafe_marker(text)
+
+
+def _has_waiting_marker(text: str) -> bool:
+    return any(marker.lower() in text for marker in WAITING_ACTION_TEXT_MARKERS)
+
+
+def _has_unsafe_marker(text: str) -> bool:
+    return any(marker.lower() in text for marker in UNSAFE_TEXT_MARKERS)
+
+
+def _destructive_block_reason(data: dict[str, Any], context: dict[str, Any]) -> str:
+    if _context_has_destructive_waiting_prompt(context):
+        return "visible_waiting_destructive_confirmation"
+    if _analysis_has_destructive_waiting_prompt(data):
+        return "analysis_waiting_destructive_confirmation"
+    return "destructive_action_requires_manual_confirmation"
+
+
+def _should_block_unsafe_target(target: dict, data: dict[str, Any], context: dict[str, Any]) -> bool:
+    if not _looks_unsafe_target(target):
+        return False
+    if not _destructive_action_allowed(target, context):
+        return True
+    if str(target.get("risk") or "") != "safe" or str(data.get("risk") or "") == "blocked":
+        return True
+    action = str(target.get("action") or "")
+    expected = DESTRUCTIVE_CONFIRMATION_ACTIONS.get(action)
+    if not expected:
+        return True
+    expected_state, expected_action = expected
+    screen_state = str(data.get("screen_state") or "")
+    recommended_action = str(data.get("recommended_action") or "") or ACTION_TO_RECOMMENDATION.get(action, "")
+    return not (screen_state == expected_state and recommended_action == expected_action)
+
+
+def _destructive_action_allowed(target: dict, context: dict[str, Any]) -> bool:
+    action = str(target.get("action") or "")
+    if action not in DESTRUCTIVE_CONFIRMATION_ACTIONS:
+        return False
+    if bool(context.get("allow_destructive_actions")):
+        return True
+    allowed = context.get("allowed_destructive_actions")
+    if isinstance(allowed, list) and action in {str(item) for item in allowed}:
+        return True
+    return False
 
 
 def _target_in_list(target: dict, targets: list[dict]) -> bool:

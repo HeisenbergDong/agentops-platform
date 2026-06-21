@@ -122,7 +122,7 @@ class AutomationElement:
 
 
 def resolve_trae_executable(trae_exe_path: Path) -> Path:
-    candidates = _candidate_trae_paths(trae_exe_path)
+    candidates = candidate_trae_paths(trae_exe_path)
     for candidate in candidates:
         if candidate.exists():
             return candidate
@@ -134,6 +134,10 @@ def resolve_trae_executable(trae_exe_path: Path) -> Path:
         "Trae executable not found. Configure --trae-exe-path or AGENTOPS_WORKER_TRAE_EXE_PATH. "
         f"Tried: {tried}"
     )
+
+
+def candidate_trae_paths(configured_path: Path) -> list[Path]:
+    return _candidate_trae_paths(configured_path)
 
 
 def open_trae(trae_exe_path: Path, workspace_path: Path | None = None, reuse_window: bool = False) -> dict:
@@ -159,15 +163,16 @@ def ensure_trae_running(
     launch_timeout_seconds: float = 30.0,
     force_open_workspace: bool = False,
 ) -> dict:
+    workspace_required = bool(workspace_path)
     existing = _try_find_trae_window(
         workspace_path=workspace_path,
-        require_workspace_match=bool(workspace_path),
+        require_workspace_match=workspace_required,
     )
     if existing and not force_open_workspace:
-        window = wait_for_workspace_window_or_any(
+        window = wait_for_stable_trae_window(
             workspace_path=workspace_path,
             timeout_seconds=min(launch_timeout_seconds, 6.0),
-            prefer_workspace_match=bool(workspace_path),
+            require_workspace_match=workspace_required,
         )
         title = _focus_window(window)
         return {
@@ -179,14 +184,14 @@ def ensure_trae_running(
         }
 
     existing_any = _try_find_trae_window()
-    reuse_window = bool(existing_any and workspace_path and not force_open_workspace)
+    reuse_window = bool(existing_any and workspace_path)
     launch_result = open_trae(trae_exe_path, workspace_path, reuse_window=reuse_window)
     if existing_any:
         time.sleep(2.0)
-    window = wait_for_workspace_window_or_any(
+    window = wait_for_stable_trae_window(
         timeout_seconds=launch_timeout_seconds,
         workspace_path=workspace_path,
-        prefer_workspace_match=bool(workspace_path),
+        require_workspace_match=workspace_required,
     )
     title = _focus_window(window)
     return {

@@ -22,7 +22,10 @@ from app.worker_gateway.contracts import (
 )
 
 LEASED_COMMAND_STATES = {"claimed", "running"}
+ACTIVE_COMMAND_STATES = {"queued", "claimed", "running"}
 TERMINAL_COMMAND_STATES = {"completed", "failed", "manual_required", "cancelled"}
+DEFAULT_LOCAL_WORKER_ID = "local-windows-worker"
+LATE_SEND_PROMPT_GRACE_SECONDS = 90
 
 
 def create_registration_code(
@@ -63,12 +66,18 @@ def register_worker(db: Session, payload: WorkerRegisterRequest) -> tuple[Worker
         db.commit()
         raise ValueError("Worker registration code expired")
 
-    worker_id = payload.worker_id.strip() or f"worker_{new_id()}"
+    requested_worker_id = payload.worker_id.strip()
+    worker_id = "" if requested_worker_id == DEFAULT_LOCAL_WORKER_ID else requested_worker_id
+    worker_id = worker_id or f"worker_{new_id()}"
     token = generate_worker_token()
     worker = db.scalar(select(Worker).where(Worker.worker_id == worker_id))
     if not worker:
         worker = Worker(worker_id=worker_id, machine_name=payload.machine_name)
         db.add(worker)
+    elif not _registration_can_update_worker(worker, code.assigned_user_id):
+        raise ValueError(
+            "Worker ID is already bound to another user. Use a unique worker_id or ask an admin to rebind it."
+        )
     worker.token_hash = hash_worker_secret(token)
     worker.display_name = payload.display_name or payload.machine_name
     worker.worker_type = payload.worker_type
@@ -77,9 +86,9 @@ def register_worker(db: Session, payload: WorkerRegisterRequest) -> tuple[Worker
     worker.version = payload.version
     worker.supported_apps = payload.supported_apps
     worker.capabilities = payload.capabilities
-    worker.status = "online"
+    worker.status = "offline"
     worker.busy = False
-    worker.last_seen_at = now_utc()
+    worker.last_seen_at = None
     worker.registered_at = worker.registered_at or now_utc()
     worker.revoked_at = None
     if code.assigned_user_id:
@@ -93,11 +102,31 @@ def register_worker(db: Session, payload: WorkerRegisterRequest) -> tuple[Worker
     return worker, token
 
 
+def _registration_can_update_worker(worker: Worker, assigned_user_id: str | None) -> bool:
+    if not worker.user_id:
+        return True
+    return bool(assigned_user_id and worker.user_id == assigned_user_id)
+
+
 def _is_expired(expires_at) -> bool:
     current = now_utc()
     if expires_at.tzinfo is None:
         current = current.replace(tzinfo=None)
     return expires_at < current
+
+
+def _effective_worker_status(worker: Worker) -> str:
+    if worker.revoked_at:
+        return "revoked"
+    if not worker.last_seen_at:
+        return "offline"
+    current = now_utc()
+    last_seen = worker.last_seen_at
+    if last_seen.tzinfo is None:
+        current = current.replace(tzinfo=None)
+    if current - last_seen > timedelta(minutes=2):
+        return "offline"
+    return str(worker.status or "offline")
 
 
 def update_worker_heartbeat(db: Session, worker: Worker, payload: WorkerHeartbeat) -> Worker:
@@ -111,6 +140,7 @@ def update_worker_heartbeat(db: Session, worker: Worker, payload: WorkerHeartbea
     worker.capabilities = payload.capabilities or payload.supported_apps
     worker.current_stage = payload.current_stage
     worker.current_window_title = payload.current_window_title
+    worker.runtime_status = payload.runtime_status or {}
     worker.busy = payload.busy
     worker.status = "busy" if payload.busy else "online"
     worker.last_seen_at = now_utc()
@@ -119,15 +149,20 @@ def update_worker_heartbeat(db: Session, worker: Worker, payload: WorkerHeartbea
     return worker
 
 
-def list_workers(db: Session, user_id: str | None = None) -> list[Worker]:
+def list_workers(db: Session, user_id: str | None = None, include_revoked: bool = False) -> list[Worker]:
     query = select(Worker).order_by(Worker.worker_id)
+    if not include_revoked:
+        query = query.where(Worker.revoked_at.is_(None))
     if user_id is not None:
         query = query.where(Worker.user_id == user_id)
     return list(db.scalars(query).all())
 
 
-def get_worker_by_worker_id(db: Session, worker_id: str) -> Worker | None:
-    return db.scalar(select(Worker).where(Worker.worker_id == worker_id))
+def get_worker_by_worker_id(db: Session, worker_id: str, include_revoked: bool = False) -> Worker | None:
+    query = select(Worker).where(Worker.worker_id == worker_id)
+    if not include_revoked:
+        query = query.where(Worker.revoked_at.is_(None))
+    return db.scalar(query)
 
 
 def bind_worker(db: Session, worker_id: str, user_id: str | None) -> Worker | None:
@@ -135,6 +170,42 @@ def bind_worker(db: Session, worker_id: str, user_id: str | None) -> Worker | No
     if not worker:
         return None
     worker.user_id = user_id
+    db.commit()
+    db.refresh(worker)
+    return worker
+
+
+def delete_worker(db: Session, worker_id: str) -> Worker | None:
+    worker = get_worker_by_worker_id(db, worker_id, include_revoked=True)
+    if not worker:
+        return None
+    if _effective_worker_status(worker) in {"online", "busy"}:
+        raise ValueError("Cannot delete an online Worker. Stop it first and wait for it to go offline.")
+
+    now = now_utc()
+    commands = list(
+        db.scalars(
+            select(WorkerCommand).where(
+                WorkerCommand.worker_id == worker.worker_id,
+                WorkerCommand.status.in_(ACTIVE_COMMAND_STATES),
+            )
+        ).all()
+    )
+    for command in commands:
+        command.status = "cancelled"
+        command.finished_at = command.finished_at or now
+        command.lease_id = ""
+        command.lease_expires_at = None
+        command.error = "Worker was deleted by an administrator."
+        command.message = command.error
+
+    worker.user_id = None
+    worker.token_hash = ""
+    worker.status = "revoked"
+    worker.busy = False
+    worker.current_stage = "deleted"
+    worker.current_window_title = ""
+    worker.revoked_at = worker.revoked_at or now
     db.commit()
     db.refresh(worker)
     return worker
@@ -258,13 +329,27 @@ def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) ->
         return None, "missing"
     if command.status == "cancelled":
         if payload.status != "cancelled":
+            if _can_accept_late_send_prompt_success(command, payload):
+                command.status = "completed"
+                command.finished_at = now_utc()
+                command.lease_id = ""
+                command.lease_expires_at = None
+                command.message = payload.message
+                command.result = payload.data
+                command.error = payload.error or ""
+                db.commit()
+                db.refresh(command)
+                return command, "late_send_prompt_success"
             db.commit()
             db.refresh(command)
             return command, "stale_lease"
+        data = payload.data if isinstance(payload.data, dict) else {}
+        has_stop_report = isinstance(data.get("stop_report"), dict)
         if command.lease_id and not _lease_matches(command, payload.lease_id):
-            db.commit()
-            db.refresh(command)
-            return command, "stale_lease"
+            if not has_stop_report:
+                db.commit()
+                db.refresh(command)
+                return command, "stale_lease"
     elif command.status in TERMINAL_COMMAND_STATES:
         db.commit()
         db.refresh(command)
@@ -275,6 +360,9 @@ def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) ->
         return command, "stale_lease"
     if command.status == "cancelled":
         command.finished_at = command.finished_at or now_utc()
+        data = payload.data if isinstance(payload.data, dict) else {}
+        if isinstance(data.get("stop_report"), dict):
+            command.status = "completed"
     elif payload.status in {"ok", "success", "completed"}:
         command.status = "completed"
     elif payload.status in {"failed", "manual_required", "cancelled"}:
@@ -290,6 +378,24 @@ def finish_worker_command(db: Session, worker_id: str, payload: WorkerResult) ->
     db.commit()
     db.refresh(command)
     return command, "ok"
+
+
+def _can_accept_late_send_prompt_success(command: WorkerCommand, payload: WorkerResult) -> bool:
+    if command.command_type != WorkerCommandType.SEND_PROMPT.value:
+        return False
+    if payload.status not in {"ok", "success", "completed"}:
+        return False
+    if command.error != "Worker command run lease expired; worker likely crashed or lost contact.":
+        return False
+    if not command.finished_at:
+        return False
+    current = now_utc()
+    finished_at = command.finished_at
+    if finished_at.tzinfo is None and current.tzinfo is not None:
+        current = current.replace(tzinfo=None)
+    elif finished_at.tzinfo is not None and current.tzinfo is None:
+        finished_at = finished_at.replace(tzinfo=None)
+    return current - finished_at <= timedelta(seconds=LATE_SEND_PROMPT_GRACE_SECONDS)
 
 
 def expire_worker_command_leases(db: Session, worker_id: str | None = None) -> dict[str, int]:

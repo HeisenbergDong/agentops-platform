@@ -24,10 +24,11 @@ from app.db.repositories.rules import active_rule_version
 from app.db.repositories.workers import create_worker_command, expire_worker_command_leases, get_worker_by_worker_id
 from app.db.session import SessionLocal, get_db
 from app.services.orchestrator.states import JobState
-from app.services.orchestrator.directions import DEFAULT_DAILY_TARGET, normalize_job_directions
+from app.services.orchestrator.directions import DEFAULT_DAILY_TARGET, build_range_plan, normalize_job_directions
 from app.services.orchestrator.intent import resolve_job_intent
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
+    append_windows_command_note,
     generate_round_prompt,
     mark_prompt_generation_failed,
 )
@@ -44,6 +45,7 @@ from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerComma
 router = APIRouter()
 
 RETRYABLE_COMMAND_STATES = {"failed", "manual_required", "cancelled"}
+RESUMABLE_COMMAND_STATES = RETRYABLE_COMMAND_STATES | {"completed"}
 ACTIVE_WORKER_COMMAND_STATES = {"queued", "claimed", "running"}
 RETRY_STAGE_BY_COMMAND_TYPE = {
     WorkerCommandType.SEND_PROMPT.value: JobState.SENDING_TO_WORKER,
@@ -55,6 +57,12 @@ RETRY_STAGE_BY_COMMAND_TYPE = {
     WorkerCommandType.RUN_COMMAND.value: JobState.PRODUCT_REVIEWING,
     WorkerCommandType.BROWSER_ACCEPTANCE.value: JobState.BROWSER_ACCEPTING,
     WorkerCommandType.GIT_SUBMIT.value: JobState.GITHUB_SUBMITTING,
+}
+RESUME_OBSERVE_STAGES = {
+    JobState.WAITING_TRAE,
+    JobState.AWAITING_CONTINUE,
+    JobState.COLLECTING_TRACE,
+    JobState.TRACE_VALIDATING,
 }
 
 
@@ -80,6 +88,8 @@ def start_job(payload: StartJobRequest, user: User = Depends(current_user), db: 
     rule_version = active_rule_version(db)
     run_mode = "test" if payload.run_mode == "test" else "normal"
     intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions, run_mode=run_mode)
+    intent["start_mode"] = "fresh_start"
+    intent["range_plan"] = build_range_plan(directions, daily_target=DEFAULT_DAILY_TARGET)
     job = create_job(
         db,
         user_id=user.id,
@@ -183,6 +193,8 @@ def reopen_job(
     rule_version = active_rule_version(db)
     run_mode = "test" if payload.run_mode == "test" else "normal"
     intent = resolve_job_intent(db, user, scope_text=scope_text, directions=directions, run_mode=run_mode)
+    intent["start_mode"] = "fresh_start"
+    intent["range_plan"] = build_range_plan(directions, daily_target=DEFAULT_DAILY_TARGET)
     round_, reset = reset_job_for_reopen(
         db,
         job,
@@ -336,15 +348,12 @@ def continue_job(
         previous = latest_resumable_worker_command(db, job.id, round_.id if round_ else None)
         if previous:
             stop_command = latest_stop_worker_command(db, job.id, round_.id if round_ else None)
-            if _stop_requires_resume_prompt(stop_command):
-                _queue_resume_after_trae_stop(db, user, job, round_, previous, stop_command)
-                db.commit()
-                db.refresh(job)
-                return serialize_job(db, job)
-            _resume_worker_command(db, user, job, round_, previous)
+            _queue_resume_observation(db, user, job, round_, previous, stop_command)
             db.commit()
             db.refresh(job)
-            return serialize_job(db, job)
+            response = serialize_job(db, job)
+            response["message"] = "继续请求已交给调度，Worker 会先截图并诊断 Trae 当前状态，再决定从哪里恢复。"
+            return response
     add_log(
         db,
         job_id=job.id,
@@ -478,6 +487,7 @@ def stop_job(
     previous_round_status = str(round_.status) if round_ else ""
     if round_:
         round_.status = JobState.PAUSED
+    runtime_context = current_job_runtime_context(db, job, round_)
     add_log(
         db,
         job_id=job.id,
@@ -487,6 +497,8 @@ def stop_job(
         extra={
             "previous_job_status": previous_job_status,
             "previous_round_status": previous_round_status,
+            "scheduler_intent": "user_pause",
+            "display_message": "已收到暂停请求，调度已暂停当前作业，正在通知 Worker 停止本机动作。",
         },
     )
     stop_worker_id = latest_active_worker_id(db, job.id, round_.id if round_ else None)
@@ -499,14 +511,21 @@ def stop_job(
             stage="worker_commands_cancelled",
             message="Active worker commands for this job were cancelled before stop propagation.",
             level="warning",
-            extra={"cancelled_commands": cancelled_commands},
+            extra={
+                "cancelled_commands": cancelled_commands,
+                "display_message": f"已取消 {cancelled_commands} 个正在排队或执行的 Worker 命令，正在等待 Worker 回传停止确认。",
+            },
         )
     command = enqueue_stop_worker_command(
         db,
         user.id,
         job.id,
         round_.id if round_ else None,
-        runtime_context=current_job_runtime_context(db, job, round_),
+        runtime_context={
+            **runtime_context,
+            "previous_job_status": previous_job_status,
+            "previous_round_status": previous_round_status,
+        },
         preferred_worker_id=stop_worker_id,
         allow_stale_preferred_worker=True,
     )
@@ -517,7 +536,12 @@ def stop_job(
             round_id=round_.id if round_ else None,
             stage="worker_stop_command",
             message="Stop command queued for bound worker.",
-            extra={"worker_id": command.worker_id, "command_id": command.id},
+            extra={
+                "worker_id": command.worker_id,
+                "command_id": command.id,
+                "scheduler_intent": "user_pause",
+                "display_message": "停止命令已下发给绑定的 Worker，等待 Worker 确认 Trae 和本地进程已停止。",
+            },
         )
     else:
         add_log(
@@ -527,10 +551,17 @@ def stop_job(
             stage="worker_stop_command",
             message="No bound worker found; scheduler state stopped only.",
             level="warning",
+            extra={"display_message": "当前没有可通知的绑定 Worker，调度已暂停；如本机仍在执行，请先手动停止 Worker 或 Trae。"},
         )
     db.commit()
     db.refresh(job)
-    return serialize_job(db, job)
+    response = serialize_job(db, job)
+    response["message"] = (
+        "暂停请求已交给调度，停止命令已下发给 Worker，正在等待停止确认。"
+        if command
+        else "暂停请求已交给调度，但没有找到可通知的绑定 Worker。"
+    )
+    return response
 
 
 @router.get("/current")
@@ -709,12 +740,24 @@ def latest_active_worker_id(db: Session, job_id: str, round_id: str | None) -> s
 def latest_resumable_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
     query = select(WorkerCommand).where(
         WorkerCommand.job_id == job_id,
-        WorkerCommand.status.in_(RETRYABLE_COMMAND_STATES),
+        WorkerCommand.status.in_(RESUMABLE_COMMAND_STATES),
         WorkerCommand.command_type.in_(set(RETRY_STAGE_BY_COMMAND_TYPE.keys())),
     )
     if round_id:
         query = query.where(WorkerCommand.round_id == round_id)
-    return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+    for command in db.scalars(query.order_by(WorkerCommand.created_at.desc()).limit(20)).all():
+        if command.status in RETRYABLE_COMMAND_STATES:
+            return command
+        if _command_has_stop_report(command):
+            return command
+    return None
+
+
+def _command_has_stop_report(command: WorkerCommand | None) -> bool:
+    if not command or not isinstance(command.result, dict):
+        return False
+    data = command.result.get("data") if isinstance(command.result.get("data"), dict) else command.result
+    return isinstance(data, dict) and isinstance(data.get("stop_report"), dict)
 
 
 def latest_stop_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
@@ -727,16 +770,7 @@ def latest_stop_worker_command(db: Session, job_id: str, round_id: str | None) -
     return db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
 
 
-def _stop_requires_resume_prompt(command: WorkerCommand | None) -> bool:
-    if not command or command.status != "completed":
-        return False
-    result = command.result if isinstance(command.result, dict) else {}
-    data = result.get("data") if isinstance(result.get("data"), dict) else {}
-    report = data.get("stop_report") if isinstance(data.get("stop_report"), dict) else {}
-    return bool(report.get("requires_resume_prompt") or report.get("trae_stop_clicked"))
-
-
-def _queue_resume_after_trae_stop(
+def _queue_resume_observation(
     db: Session,
     user: User,
     job: Job,
@@ -753,68 +787,114 @@ def _queue_resume_after_trae_stop(
     if not worker or worker.user_id != user.id:
         raise HTTPException(status_code=400, detail="Configured worker is not available for continue.")
     project_context = ensure_round_project_context(db, job, round_, worker_settings, settings.get("github", {}))
-    prompt = _resume_after_stop_prompt(job)
+    previous_stage = _resume_previous_stage(previous, stop_command)
+    resume_payload = {
+        "prompt": round_.prompt or previous.payload.get("prompt", ""),
+        "trae_workspace_path": project_context["workspace_path"],
+        "workspace_path": project_context["workspace_path"],
+        "workspace_root": project_context["workspace_root"],
+        "project_name": project_context["project_name"],
+        "project_slug": project_context["project_name"],
+        "browser_url": worker_settings.get("browser_url", ""),
+        "job_id": job.id,
+        "round_id": round_.id,
+        "round_index": round_.round_index,
+        "directions": job.directions,
+        "github_remote_url": project_context.get("github_remote_url", ""),
+        "github_repo_name": project_context["project_name"],
+        "github_branch": str(worker_settings.get("github_branch") or "main"),
+        "timeout_seconds": 12,
+        "scroll_bottom": True,
+        "use_ai_ui_analyst": True,
+        "resume_after_stop": True,
+        "resume_strategy": "observe_then_decide",
+        "previous_stage": previous_stage,
+        "previous_command_type": previous.command_type,
+        "resume_previous_payload": previous.payload,
+        "retry_of_command_id": previous.id,
+        "stop_command_id": stop_command.id if stop_command else "",
+        "continue_attempts": previous.payload.get("continue_attempts", 0),
+        "max_continue_attempts": previous.payload.get("max_continue_attempts", 20),
+        "wait_observation_attempts": previous.payload.get("wait_observation_attempts", 0),
+        "max_wait_observation_attempts": previous.payload.get(
+            "max_wait_observation_attempts",
+            10,
+        ),
+    }
+    for key in (
+        "sent_at_epoch",
+        "sent_at",
+        "prompt_sent_at_epoch",
+        "prompt_sent_at",
+        "wait_timeout_seconds",
+        "stable_seconds",
+        "poll_interval_seconds",
+        "intervention_idle_seconds",
+        "max_interventions",
+        "copy_timeout_seconds",
+        "continue_timeout_seconds",
+        "browser_acceptance_timeout_seconds",
+        "github_timeout_seconds",
+    ):
+        if key in previous.payload and key not in resume_payload:
+            resume_payload[key] = previous.payload[key]
     command = create_worker_command(
         db,
         worker_id=worker.worker_id,
         user_id=user.id,
         payload=CreateWorkerCommandRequest(
-            type=WorkerCommandType.SEND_PROMPT,
+            type=WorkerCommandType.DIAGNOSE_UI,
             job_id=job.id,
             round_id=round_.id,
-            payload={
-                "prompt": prompt,
-                "trae_workspace_path": project_context["workspace_path"],
-                "workspace_path": project_context["workspace_path"],
-                "workspace_root": project_context["workspace_root"],
-                "project_name": project_context["project_name"],
-                "project_slug": project_context["project_name"],
-                "browser_url": worker_settings.get("browser_url", ""),
-                "job_id": job.id,
-                "round_id": round_.id,
-                "round_index": round_.round_index,
-                "directions": job.directions,
-                "github_remote_url": project_context.get("github_remote_url", ""),
-                "github_repo_name": project_context["project_name"],
-                "github_branch": str(worker_settings.get("github_branch") or "main"),
-                "verify_submission": True,
-                "strict_submission_verification": True,
-                "submission_timeout_seconds": 30,
-                "resume_after_stop": True,
-                "retry_of_command_id": previous.id,
-                "stop_command_id": stop_command.id if stop_command else "",
-            },
+            payload=resume_payload,
         ),
     )
-    job.status = JobState.SENDING_TO_WORKER
-    round_.status = JobState.SENDING_TO_WORKER
+    job.status = JobState.WAITING_TRAE if previous_stage in RESUME_OBSERVE_STAGES else JobState.SENDING_TO_WORKER
+    round_.status = job.status
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id,
-        stage="resume_after_trae_stop",
-        message="Continue requested after Worker stopped Trae generation; a resume prompt was queued first.",
+        stage="resume_after_pause",
+        message="Continue requested after pause; scheduler queued Trae state diagnosis before resuming work.",
         level="warning",
         extra={
             "previous_command_id": previous.id,
             "stop_command_id": stop_command.id if stop_command else "",
             "new_command_id": command.id,
             "worker_id": worker.worker_id,
-            "prompt_preview": prompt[:160],
+            "previous_stage": str(previous_stage),
+            "previous_command_type": previous.command_type,
+            "resume_strategy": "observe_then_decide",
+            "display_message": "已收到继续请求，调度会先让 Worker 截图并分析 Trae 日志/界面状态，再决定继续等待、复制轨迹或发送恢复提示。",
         },
     )
     return command
 
 
+def _resume_previous_stage(previous: WorkerCommand, stop_command: WorkerCommand | None) -> str:
+    payload_stage = str(previous.payload.get("previous_stage") or previous.payload.get("stage") or "").strip()
+    if payload_stage:
+        return payload_stage
+    if stop_command and isinstance(stop_command.payload, dict):
+        previous_round_status = str(stop_command.payload.get("previous_round_status") or "").strip()
+        previous_job_status = str(stop_command.payload.get("previous_job_status") or "").strip()
+        if previous_round_status:
+            return previous_round_status
+        if previous_job_status:
+            return previous_job_status
+    return str(RETRY_STAGE_BY_COMMAND_TYPE.get(previous.command_type) or JobState.WAITING_TRAE)
+
+
 def _resume_after_stop_prompt(job: Job) -> str:
     intent = job.intent if isinstance(job.intent, dict) else {}
     if intent.get("run_mode") == "test":
-        return (
+        return append_windows_command_note(
             "继续刚才被暂停的测试任务，从中断处往下完成。不要重建项目，保留已有文件和结构；"
             "本轮重点是快速完成可复查的最小结果，方便平台继续验证日志轨迹、GitHub 提交和飞书写入。"
             "不要主动执行耗时自测、长时间构建或完整浏览器验收，完成后简短说明即可。"
         )
-    return (
+    return append_windows_command_note(
         "继续刚才被暂停的任务，从中断处往下完成。不要重建项目，保留已有文件和结构；"
         "补完剩余工作后简短说明完成内容、关键文件和最小验证情况。"
     )
@@ -954,6 +1034,11 @@ def enqueue_stop_worker_command(
         return None
     if is_worker_offline(worker) and not (allow_stale_preferred_worker and preferred_worker_id):
         return None
+    stop_payload = {
+        "reason": reason,
+        "use_ai_ui_analyst": True,
+        **(runtime_context or {}),
+    }
     return create_worker_command(
         db,
         worker_id=worker.worker_id,
@@ -962,7 +1047,7 @@ def enqueue_stop_worker_command(
             type=WorkerCommandType.STOP_CURRENT_TASK,
             job_id=job_id,
             round_id=round_id,
-            payload={"reason": reason, **(runtime_context or {})},
+            payload=stop_payload,
         ),
     )
 
@@ -983,6 +1068,11 @@ def current_job_runtime_context(db: Session, job: Job, round_: TaskRound | None 
     if project.workspace_path:
         result["workspace_path"] = project.workspace_path
         result["trae_workspace_path"] = project.workspace_path
+    worker_settings = load_user_settings(db, job.user_id).get("worker", {})
+    browser_url = str(worker_settings.get("browser_url") or "").strip()
+    if browser_url:
+        result["browser_url"] = browser_url
+        result["url"] = browser_url
     return result
 
 

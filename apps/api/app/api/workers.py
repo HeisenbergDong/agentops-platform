@@ -1,8 +1,13 @@
 from datetime import timedelta
+import base64
+import hashlib
+import hmac
+import json
 from pathlib import Path
 import re
+import time
 
-from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Response, UploadFile
 from fastapi.responses import FileResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -36,6 +41,11 @@ from app.worker_gateway.contracts import (
 )
 
 router = APIRouter()
+
+WORKER_PACKAGE_DOWNLOAD_TOKEN_TTL_SECONDS = 120
+WORKER_PACKAGE_MISSING_DETAIL = (
+    "Worker package is not available. Ask an administrator to upload or build agentops-worker-windows.zip."
+)
 
 
 @router.post("/register")
@@ -72,16 +82,59 @@ def get_workers(user: User = Depends(current_user), db: Session = Depends(get_db
 
 @router.get("/package")
 def download_worker_package(user: User = Depends(current_user)) -> FileResponse:
+    return _download_worker_package_response()
+
+
+@router.head("/package")
+def head_worker_package(user: User = Depends(current_user)) -> Response:
+    return _worker_package_head_response()
+
+
+@router.post("/package-ticket")
+def create_worker_package_ticket(user: User = Depends(current_user)) -> dict:
     package = _worker_package_path()
     if not package:
-        raise HTTPException(
-            status_code=404,
-            detail="Worker package is not available. Ask an administrator to upload or build agentops-worker-windows.zip.",
-        )
+        raise HTTPException(status_code=404, detail=WORKER_PACKAGE_MISSING_DETAIL)
+    return {
+        "download_url": f"/api/workers/package-download/{_create_worker_package_download_token(user.id)}",
+        "expires_in": WORKER_PACKAGE_DOWNLOAD_TOKEN_TTL_SECONDS,
+        "filename": package.name,
+    }
+
+
+@router.get("/package-download/{download_token}")
+def download_worker_package_by_ticket(download_token: str) -> FileResponse:
+    _verify_worker_package_download_token(download_token)
+    return _download_worker_package_response()
+
+
+@router.head("/package-download/{download_token}")
+def head_worker_package_by_ticket(download_token: str) -> Response:
+    _verify_worker_package_download_token(download_token)
+    return _worker_package_head_response()
+
+
+def _download_worker_package_response() -> FileResponse:
+    package = _worker_package_path()
+    if not package:
+        raise HTTPException(status_code=404, detail=WORKER_PACKAGE_MISSING_DETAIL)
     return FileResponse(
         package,
         media_type="application/zip",
         filename=package.name,
+    )
+
+
+def _worker_package_head_response() -> Response:
+    package = _worker_package_path()
+    if not package:
+        raise HTTPException(status_code=404, detail=WORKER_PACKAGE_MISSING_DETAIL)
+    return Response(
+        headers={
+            "content-disposition": f'attachment; filename="{package.name}"',
+            "content-length": str(package.stat().st_size),
+            "content-type": "application/zip",
+        }
     )
 
 
@@ -314,12 +367,14 @@ def assigned_worker_config(db: Session, worker: Worker) -> dict:
         return {}
     return {
         "trae_workspace_path": worker_settings.get("trae_workspace_path", ""),
+        "trae_exe_path": worker_settings.get("trae_exe_path", ""),
         "browser_url": worker_settings.get("browser_url", ""),
     }
 
 
 def serialize_worker(item: Worker) -> dict:
     status = effective_worker_status(item)
+    online = status in {"online", "busy"}
     return {
         "id": item.id,
         "worker_id": item.worker_id,
@@ -332,10 +387,13 @@ def serialize_worker(item: Worker) -> dict:
         "supported_apps": item.supported_apps,
         "capabilities": item.capabilities,
         "status": status,
+        "online": online,
+        "registered": bool(item.registered_at),
         "current_stage": item.current_stage,
         "current_window_title": item.current_window_title,
-        "busy": item.busy,
-        "last_seen_at": item.last_seen_at.isoformat(),
+        "runtime_status": item.runtime_status or {},
+        "busy": bool(item.busy) if online else False,
+        "last_seen_at": item.last_seen_at.isoformat() if item.last_seen_at else None,
         "registered_at": item.registered_at.isoformat() if item.registered_at else None,
         "revoked": bool(item.revoked_at),
     }
@@ -414,6 +472,51 @@ def _unique_path(path: Path) -> Path:
         if not candidate.exists():
             return candidate
     return path.with_name(f"{stem}-{now_utc().strftime('%Y%m%d%H%M%S%f')}{suffix}")
+
+
+def _create_worker_package_download_token(user_id: str) -> str:
+    payload = {
+        "sub": user_id,
+        "purpose": "worker_package_download",
+        "exp": int(time.time()) + WORKER_PACKAGE_DOWNLOAD_TOKEN_TTL_SECONDS,
+    }
+    body = _urlsafe_b64encode(json.dumps(payload, separators=(",", ":")).encode("utf-8"))
+    signature = _sign_worker_package_download_token(body)
+    return f"v1.{body}.{signature}"
+
+
+def _verify_worker_package_download_token(token: str) -> dict:
+    try:
+        version, body, signature = token.split(".", 2)
+        if version != "v1" or not hmac.compare_digest(
+            signature,
+            _sign_worker_package_download_token(body),
+        ):
+            raise ValueError("Invalid token signature")
+        payload = json.loads(_urlsafe_b64decode(body).decode("utf-8"))
+        if payload.get("purpose") != "worker_package_download":
+            raise ValueError("Invalid token purpose")
+        if int(payload.get("exp", 0)) < int(time.time()):
+            raise ValueError("Token expired")
+        if not str(payload.get("sub") or "").strip():
+            raise ValueError("Missing token subject")
+        return payload
+    except Exception as exc:
+        raise HTTPException(status_code=401, detail="Invalid or expired download ticket") from exc
+
+
+def _sign_worker_package_download_token(body: str) -> str:
+    digest = hmac.new(settings.app_secret_key.encode("utf-8"), body.encode("ascii"), hashlib.sha256).digest()
+    return _urlsafe_b64encode(digest)
+
+
+def _urlsafe_b64encode(raw: bytes) -> str:
+    return base64.urlsafe_b64encode(raw).decode("ascii").rstrip("=")
+
+
+def _urlsafe_b64decode(encoded: str) -> bytes:
+    padding = "=" * (-len(encoded) % 4)
+    return base64.urlsafe_b64decode(f"{encoded}{padding}")
 
 
 def _worker_package_path() -> Path | None:

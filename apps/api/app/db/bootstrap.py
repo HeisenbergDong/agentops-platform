@@ -22,6 +22,8 @@ def ensure_schema_extensions() -> None:
     inspector = inspect(engine)
     if "users" not in inspector.get_table_names():
         return
+    json_empty_default = "'{}'::json" if engine.dialect.name == "postgresql" else "'{}'"
+    json_array_default = "'[]'::json" if engine.dialect.name == "postgresql" else "'[]'"
     columns = {item["name"] for item in inspector.get_columns("users")}
     statements: list[str] = []
     if "password_hash" not in columns:
@@ -45,13 +47,18 @@ def ensure_schema_extensions() -> None:
         if "version" not in worker_columns:
             statements.append("alter table workers add column version varchar(64) not null default ''")
         if "capabilities" not in worker_columns:
-            statements.append("alter table workers add column capabilities json not null default '[]'::json")
+            statements.append(f"alter table workers add column capabilities json not null default {json_array_default}")
         if "status" not in worker_columns:
-            statements.append("alter table workers add column status varchar(32) not null default 'online'")
+            statements.append("alter table workers add column status varchar(32) not null default 'offline'")
         if "registered_at" not in worker_columns:
             statements.append("alter table workers add column registered_at timestamp with time zone not null default now()")
         if "revoked_at" not in worker_columns:
             statements.append("alter table workers add column revoked_at timestamp with time zone null")
+        if "runtime_status" not in worker_columns:
+            statements.append(f"alter table workers add column runtime_status json not null default {json_empty_default}")
+        if "last_seen_at" in worker_columns:
+            statements.append("alter table workers alter column last_seen_at drop not null")
+            statements.append("alter table workers alter column last_seen_at drop default")
     if "worker_commands" in inspector.get_table_names():
         command_columns = {item["name"] for item in inspector.get_columns("worker_commands")}
         if "lease_id" not in command_columns:
@@ -63,7 +70,7 @@ def ensure_schema_extensions() -> None:
         if "scope_text" not in job_columns:
             statements.append("alter table jobs add column scope_text text not null default ''")
         if "intent" not in job_columns:
-            statements.append("alter table jobs add column intent json not null default '{}'::json")
+            statements.append(f"alter table jobs add column intent json not null default {json_empty_default}")
     if not statements:
         return
     with engine.begin() as connection:

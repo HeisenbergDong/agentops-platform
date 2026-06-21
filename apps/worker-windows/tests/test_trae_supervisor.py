@@ -91,6 +91,23 @@ def test_supervisor_waits_on_pending_ui_until_idle_ready_even_with_recent_activi
     assert decision["reason"] == "pending_intervention_visible"
 
 
+def test_supervisor_treats_waiting_delete_card_as_pending_intervention():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c\n\u5220\u9664 startup.log\n\u4fdd\u7559\n\u5220\u9664",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "missing", "reason": "no_completed_turn_after_prompt_send"},
+            idle_seconds=31,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+        )
+    )
+
+    assert decision["action"] == "apply_pending_ui"
+    assert decision["reason"] == "pending_intervention_visible"
+    assert decision["completion_gate"]["reason"] == "pending_intervention_visible"
+
+
 def test_supervisor_recovers_3003_even_with_recent_activity():
     decision = decide_next_action(
         SupervisorObservation(

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.5-trae-run-vision"
+WORKER_VERSION = "0.1.13-stop-session-browser"
 
 
 class WorkerSettings(BaseSettings):
@@ -71,6 +71,13 @@ def apply_assigned_config(
         if worker_settings.workspace_root != workspace_root:
             worker_settings.workspace_root = workspace_root
             changes["workspace_root"] = str(workspace_root)
+
+    trae_exe_value = _first_non_empty(assigned_config, "trae_exe_path")
+    if trae_exe_value is not None:
+        trae_exe_path = Path(str(trae_exe_value)).expanduser()
+        if worker_settings.trae_exe_path != trae_exe_path:
+            worker_settings.trae_exe_path = trae_exe_path
+            changes["trae_exe_path"] = str(trae_exe_path)
 
     if "browser_url" in assigned_config:
         browser_url = str(assigned_config.get("browser_url") or "").strip()

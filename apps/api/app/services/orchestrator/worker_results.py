@@ -43,9 +43,11 @@ IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
 RECOVERABLE_COPY_GATE_REASONS = {
     "awaiting_continuation",
     "awaiting_current_continuation",
+    "manual_stopped",
     "service_interrupted",
     "no_completed_turn_after_prompt_send",
 }
+MANUAL_STOP_REASONS = {"manual_stopped", "generation_interrupted"}
 TRACE_COPY_RETRY_REASONS = {
     "empty_trace",
     "trace_too_short",
@@ -55,14 +57,30 @@ TRACE_COPY_RETRY_REASONS = {
     "copy_command_failed",
 }
 DEFAULT_MAX_TRACE_COPY_ATTEMPTS = 5
+DEFAULT_MAX_SEND_PROMPT_VISUAL_RECOVERY_ATTEMPTS = 3
+DEFAULT_MAX_TRACE_RECOVERY_DIAGNOSIS_ATTEMPTS = 2
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
 DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
 TRACE_UNAVAILABLE_AFTER_COMPLETION = "trace_unavailable_after_completed"
+INVALID_BUSINESS_TRACE_PATTERNS = (
+    re.compile(r"^\s*Trae raw execution trace for session\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*Trae structured execution trace collected locally\b", re.IGNORECASE | re.MULTILINE),
+    re.compile(r"^\s*TEST MODE TRACE EXCEPTION\b", re.IGNORECASE | re.MULTILINE),
+)
+TRAE_SESSION_DISPLAY_RE = re.compile(
+    r"^\.[0-9A-Za-z]+:"
+    r"[0-9a-f]{8,64}_[0-9a-f]{8,64}\.[0-9a-f]{8,64}\.[0-9a-f]{8,64}"
+    r":Trae CN\.T\([^)]+\)$"
+)
 
 
 def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
+    if result.status == "cancelled" and _stop_report_from_result(result):
+        _handle_stop_result(db, command, result)
+        db.commit()
+        return
     if _should_ignore_worker_result(db, command, result):
         db.commit()
         return
@@ -72,6 +90,10 @@ def handle_worker_result(db: Session, command: WorkerCommand, result: WorkerResu
         return
     if command.command_type == WorkerCommandType.WAIT_COMPLETION.value:
         _handle_wait_completion_result(db, command, result)
+        db.commit()
+        return
+    if command.command_type == WorkerCommandType.DIAGNOSE_UI.value:
+        _handle_diagnose_ui_result(db, command, result)
         db.commit()
         return
     if command.command_type == WorkerCommandType.COPY_LATEST_REPLY.value:
@@ -117,6 +139,15 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
     if result.status in {"ok", "success", "completed"}:
         unconfirmed_reason = _prompt_submission_unconfirmed_reason(result.data)
         if unconfirmed_reason:
+            if _queue_send_prompt_visual_diagnosis(
+                db,
+                command,
+                job,
+                round_,
+                "Worker clicked/pasted in Trae but did not confirm that Trae received a new prompt; asking Worker to screenshot and diagnose before deciding.",
+                {**extra, "unconfirmed_reason": unconfirmed_reason},
+            ):
+                return
             _mark_manual_required(
                 db,
                 job,
@@ -170,6 +201,16 @@ def _handle_send_prompt_result(db: Session, command: WorkerCommand, result: Work
         )
         return
 
+    if _queue_send_prompt_visual_diagnosis(
+        db,
+        command,
+        job,
+        round_,
+        "Worker could not send the prompt automatically; asking Worker to screenshot Trae and diagnose the composer before deciding.",
+        extra,
+    ):
+        return
+
     _mark_manual_required(
         db,
         job,
@@ -190,6 +231,92 @@ def _prompt_submission_unconfirmed_reason(data: dict) -> str:
     if automation.get("submission_verified") is False:
         return "submission_not_verified"
     return ""
+
+
+def _queue_send_prompt_visual_diagnosis(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    attempts = int(source_command.payload.get("send_prompt_visual_recovery_attempts") or 0) + 1
+    max_attempts = int(
+        source_command.payload.get("max_send_prompt_visual_recovery_attempts")
+        or DEFAULT_MAX_SEND_PROMPT_VISUAL_RECOVERY_ATTEMPTS
+    )
+    if attempts > max_attempts:
+        return False
+
+    job.status = JobState.SENDING_TO_WORKER
+    if round_:
+        round_.status = JobState.SENDING_TO_WORKER
+    recovery_reason = _send_prompt_recovery_reason(extra)
+    retry_payload = {
+        **source_command.payload,
+        "send_prompt_visual_recovery_attempts": attempts,
+        "max_send_prompt_visual_recovery_attempts": max_attempts,
+        "retry_of_command_id": source_command.id,
+        "verify_submission": True,
+        "strict_submission_verification": True,
+        "verify_visual_submission": True,
+        "submission_timeout_seconds": max(30, int(source_command.payload.get("submission_timeout_seconds") or 30)),
+    }
+    result_data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    if result_data.get("sent_at_epoch") and not retry_payload.get("sent_at_epoch"):
+        retry_payload["sent_at_epoch"] = result_data.get("sent_at_epoch")
+    if result_data.get("sent_at") and not retry_payload.get("sent_at"):
+        retry_payload["sent_at"] = result_data.get("sent_at")
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.SENDING_TO_WORKER,
+        message=message,
+        level="info",
+        extra={
+            **extra,
+            "send_prompt_visual_recovery_attempts": attempts,
+            "max_send_prompt_visual_recovery_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "display_message": (
+                f"Worker 发送提示词未确认成功，调度先让 Worker 截图交给视觉诊断，"
+                f"再决定重试或继续观察（第 {attempts}/{max_attempts} 次）。"
+            ),
+        },
+    )
+    diagnose_command = _enqueue_worker_command(
+        db,
+        source_command,
+        WorkerCommandType.DIAGNOSE_UI,
+        {
+            "task": "find_prompt_input_and_send_button",
+            "timeout_seconds": source_command.payload.get("diagnose_timeout_seconds", 10),
+            "scroll_bottom": False,
+            "previous_command_type": WorkerCommandType.SEND_PROMPT.value,
+            "resume_previous_payload": retry_payload,
+            "retry_of_command_id": source_command.id,
+            "send_prompt_visual_recovery_attempts": attempts,
+            "max_send_prompt_visual_recovery_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "use_ai_ui_analyst": source_command.payload.get("use_ai_ui_analyst", True),
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.SENDING_TO_WORKER,
+        message="diagnose_ui worker command queued for send_prompt visual recovery.",
+        extra={
+            "worker_id": diagnose_command.worker_id,
+            "command_id": diagnose_command.id,
+            "recovery_reason": recovery_reason,
+            "display_message": "已安排 Worker 截图诊断 Trae 输入框/发送按钮和提示词是否已经发出。",
+        },
+    )
+    return True
 
 
 def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -236,6 +363,394 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
     )
 
 
+def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
+    job, round_ = _load_job_round(db, command)
+    if not job:
+        return
+
+    extra = _result_extra(command, result)
+    if result.status not in {"ok", "success", "completed"}:
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            "Worker could not diagnose Trae current state after continue; manual inspection is required.",
+            result.status,
+            extra,
+        )
+        return
+
+    state = str(result.data.get("state") or "").strip()
+    output_probe = result.data.get("output_probe") if isinstance(result.data.get("output_probe"), dict) else {}
+    suggested = result.data.get("suggested_intervention") if isinstance(result.data.get("suggested_intervention"), dict) else {}
+    diagnostic_extra = {
+        **extra,
+        "diagnosis_state": state,
+        "diagnosis_reason": str(result.data.get("reason") or ""),
+        "output_probe": output_probe,
+        "suggested_intervention": suggested,
+        "resume_strategy": command.payload.get("resume_strategy", ""),
+        "display_message": _diagnose_resume_display_message(state, result.data),
+    }
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage="resume_state_diagnosed",
+        message="Worker diagnosed Trae state after continue; scheduler is choosing the next step.",
+        extra=diagnostic_extra,
+    )
+    if str(suggested.get("mode") or "") == "manual-required" or str(suggested.get("risk") or "") == "blocked":
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            str(suggested.get("manual_message") or "Trae is waiting for a manual decision after continue."),
+            state or "manual_required",
+            diagnostic_extra,
+        )
+        return
+    previous_command_type = str(command.payload.get("previous_command_type") or "").strip()
+    if previous_command_type == WorkerCommandType.SEND_PROMPT.value:
+        _handle_send_prompt_visual_diagnosis(db, command, job, round_, result.data, diagnostic_extra)
+        return
+    if previous_command_type and previous_command_type not in {
+        WorkerCommandType.WAIT_COMPLETION.value,
+        WorkerCommandType.CLICK_CONTINUE.value,
+        WorkerCommandType.COPY_LATEST_REPLY.value,
+        WorkerCommandType.SEND_PROMPT.value,
+    }:
+        _queue_resume_previous_worker_step(db, command, job, round_, previous_command_type, diagnostic_extra)
+        return
+    if state == "completed":
+        _queue_trace_collection_after_wait(
+            db,
+            command,
+            job,
+            round_,
+            diagnostic_extra,
+            {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_completed"}},
+            message="Continue diagnosis says Trae is complete; collecting the full assistant trace.",
+        )
+        return
+    if state in {"needs_scroll_inner_panel", "service_interrupted", "awaiting_continuation", "awaiting_terminal_input"} or suggested:
+        _queue_continue_recovery(
+            db,
+            command,
+            job,
+            round_,
+            "Continue diagnosis found a recoverable Trae UI state; scheduler will ask Worker to recover safely.",
+            diagnostic_extra,
+        )
+        return
+    if _diagnose_output_probe_can_collect_trace(output_probe):
+        _queue_trace_collection_after_wait(
+            db,
+            command,
+            job,
+            round_,
+            diagnostic_extra,
+            {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_trace_probe_ok"}},
+            message="Continue diagnosis found a complete-looking Trae reply; collecting trace before more recovery.",
+        )
+        return
+    _queue_wait_observation_retry(
+        db,
+        command,
+        job,
+        round_,
+        "Continue diagnosis did not prove completion yet; scheduler will observe Trae before taking more action.",
+        diagnostic_extra,
+    )
+
+
+def _handle_send_prompt_visual_diagnosis(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    data: dict,
+    diagnostic_extra: dict,
+) -> None:
+    if _visual_diagnosis_blocked(data):
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            _visual_manual_message(data) or "Visual diagnosis found a blocked Trae state while sending the prompt.",
+            "manual_required",
+            diagnostic_extra,
+        )
+        return
+
+    visual_state = _send_prompt_visual_state(data)
+    if visual_state in {"completed"} or _diagnose_output_probe_can_collect_trace(diagnostic_extra.get("output_probe", {})):
+        _queue_trace_collection_after_wait(
+            db,
+            command,
+            job,
+            round_,
+            {**diagnostic_extra, "send_prompt_visual_state": visual_state},
+            {"supervisor_decision": {"action": "collect_trace", "reason": "send_prompt_visual_diagnosis_completed"}},
+            message="Visual diagnosis says Trae already processed the prompt; collecting the assistant trace.",
+        )
+        return
+    if visual_state in {"prompt_submitted", "generating", "still_generating", "awaiting_action"}:
+        job.status = JobState.WAITING_TRAE
+        if round_:
+            round_.status = JobState.WAITING_TRAE
+        wait_extra = _send_prompt_wait_context_from_diagnosis(command)
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.WAITING_TRAE,
+            message="Visual diagnosis indicates the prompt was submitted; scheduler will observe Trae instead of failing the run.",
+            extra={
+                **diagnostic_extra,
+                "send_prompt_visual_state": visual_state,
+                "display_message": "视觉诊断显示提示词已进入 Trae 或 Trae 正在处理，调度继续观察收口。",
+            },
+        )
+        wait_command = _enqueue_worker_command(
+            db,
+            command,
+            WorkerCommandType.WAIT_COMPLETION,
+            _wait_completion_payload(command, round_, wait_extra),
+        )
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.WAITING_TRAE,
+            message="wait_completion worker command queued after send_prompt visual diagnosis.",
+            extra={"worker_id": wait_command.worker_id, "command_id": wait_command.id},
+        )
+        return
+
+    resume_payload = command.payload.get("resume_previous_payload")
+    if isinstance(resume_payload, dict) and resume_payload.get("prompt"):
+        job.status = JobState.SENDING_TO_WORKER
+        if round_:
+            round_.status = JobState.SENDING_TO_WORKER
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.SENDING_TO_WORKER,
+            message="Visual diagnosis did not confirm prompt submission; scheduler is retrying send_prompt with visual targeting enabled.",
+            extra={
+                **diagnostic_extra,
+                "send_prompt_visual_state": visual_state,
+                "display_message": "视觉诊断未确认提示词已发出，调度重试一次发送提示词并继续启用视觉定位。",
+            },
+        )
+        next_command = _enqueue_worker_command(db, command, WorkerCommandType.SEND_PROMPT, resume_payload)
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.SENDING_TO_WORKER,
+            message="send_prompt worker command requeued after visual diagnosis.",
+            extra={"worker_id": next_command.worker_id, "command_id": next_command.id},
+        )
+        return
+
+    _mark_manual_required(
+        db,
+        job,
+        round_,
+        "Visual diagnosis could not decide how to recover prompt submission; manual inspection is required.",
+        "manual_required",
+        {**diagnostic_extra, "send_prompt_visual_state": visual_state},
+    )
+
+
+def _queue_resume_previous_worker_step(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    previous_command_type: str,
+    extra: dict,
+) -> None:
+    try:
+        command_type = WorkerCommandType(previous_command_type)
+    except ValueError:
+        _queue_wait_observation_retry(
+            db,
+            source_command,
+            job,
+            round_,
+            "Continue diagnosis could not map the paused worker command; scheduler will observe Trae instead.",
+            extra,
+        )
+        return
+    payload = source_command.payload.get("resume_previous_payload")
+    if not isinstance(payload, dict):
+        payload = {}
+    resume_payload = {
+        **payload,
+        "retry_of_command_id": source_command.payload.get("retry_of_command_id", ""),
+        "resume_after_pause": True,
+        "resume_diagnosis_state": extra.get("diagnosis_state", ""),
+    }
+    stage = _resume_stage_for_worker_command(command_type)
+    job.status = stage
+    if round_:
+        round_.status = stage
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=stage,
+        message="Continue diagnosis completed; scheduler is resuming the paused worker step.",
+        extra={
+            **extra,
+            "previous_command_type": previous_command_type,
+            "display_message": "Trae 当前状态已诊断，调度会按暂停前的阶段继续执行下一步。",
+        },
+    )
+    next_command = _enqueue_worker_command(db, source_command, command_type, resume_payload)
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=stage,
+        message="Paused worker step requeued after continue diagnosis.",
+        extra={
+            "worker_id": next_command.worker_id,
+            "command_id": next_command.id,
+            "command_type": previous_command_type,
+            "display_message": "已重新下发暂停前的 Worker 步骤。",
+        },
+    )
+
+
+def _resume_stage_for_worker_command(command_type: WorkerCommandType) -> JobState:
+    return {
+        WorkerCommandType.CAPTURE_SCREENSHOT: JobState.SCREENSHOT_CAPTURING,
+        WorkerCommandType.SCAN_PROJECT: JobState.PRODUCT_REVIEWING,
+        WorkerCommandType.RUN_COMMAND: JobState.PRODUCT_REVIEWING,
+        WorkerCommandType.BROWSER_ACCEPTANCE: JobState.BROWSER_ACCEPTING,
+        WorkerCommandType.GIT_SUBMIT: JobState.GITHUB_SUBMITTING,
+    }.get(command_type, JobState.WAITING_TRAE)
+
+
+def _diagnose_output_probe_can_collect_trace(output_probe: dict) -> bool:
+    if not isinstance(output_probe, dict):
+        return False
+    if output_probe.get("complete_like") is True:
+        return True
+    return str(output_probe.get("reason") or "") == "ok"
+
+
+def _send_prompt_recovery_reason(extra: dict) -> str:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    for source in (
+        data,
+        data.get("automation") if isinstance(data.get("automation"), dict) else {},
+        data.get("submission") if isinstance(data.get("submission"), dict) else {},
+        data.get("submission_probe") if isinstance(data.get("submission_probe"), dict) else {},
+        extra,
+    ):
+        if isinstance(source, dict) and str(source.get("stage") or "").strip():
+            return str(source.get("stage")).strip()
+        if isinstance(source, dict) and str(source.get("reason") or "").strip():
+            return str(source.get("reason")).strip()
+        if isinstance(source, dict) and str(source.get("status") or "").strip() in {
+            "unconfirmed",
+            "failed",
+            "manual_required",
+        }:
+            return str(source.get("status")).strip()
+    error = str(extra.get("error") or "").strip()
+    if "could not locate" in error.lower() or "prompt controls" in error.lower():
+        return "prompt_controls_not_found"
+    if error:
+        return "send_prompt_failed"
+    return "prompt_submission_unconfirmed"
+
+
+def _visual_diagnosis_blocked(data: dict) -> bool:
+    suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    return (
+        str(suggested.get("mode") or "") == "manual-required"
+        or str(suggested.get("risk") or "") == "blocked"
+        or str(ai_analysis.get("risk") or "") == "blocked"
+        or (
+            str(ai_analysis.get("recommended_action") or "") == "do_not_click"
+            and str(ai_analysis.get("screen_state") or "") == "manual_required"
+        )
+    )
+
+
+def _visual_manual_message(data: dict) -> str:
+    suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    return str(
+        suggested.get("manual_message")
+        or ai_analysis.get("blocked_reason")
+        or ai_analysis.get("reason")
+        or ""
+    )
+
+
+def _send_prompt_visual_state(data: dict) -> str:
+    state = str(data.get("state") or "").strip()
+    if state == "completed":
+        return "completed"
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    status = str(visual.get("status") or "").strip()
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    screen_state = str(ai_analysis.get("screen_state") or "").strip()
+    recommended = str(ai_analysis.get("recommended_action") or "").strip()
+    if status in {"completed", "prompt_submitted"}:
+        return "prompt_submitted" if status == "prompt_submitted" else "completed"
+    if screen_state in {"prompt_submitted", "generating", "still_generating"}:
+        return screen_state
+    if recommended in {"wait", "collect_trace_candidate"}:
+        return "generating"
+    if screen_state in {"prompt_still_in_composer", "prompt_not_submitted"}:
+        return screen_state
+    if status in {"prompt_ready", "found", "partial"}:
+        return "prompt_ready"
+    if state in {"service_interrupted", "awaiting_continuation", "awaiting_terminal_input", "needs_scroll_inner_panel"}:
+        return "awaiting_action"
+    return state or status or screen_state or "unknown"
+
+
+def _send_prompt_wait_context_from_diagnosis(command: WorkerCommand) -> dict:
+    resume_payload = command.payload.get("resume_previous_payload")
+    source = resume_payload if isinstance(resume_payload, dict) else command.payload
+    sent_at_epoch = source.get("sent_at_epoch") or source.get("prompt_sent_at_epoch")
+    return {
+        "sent_at_epoch": sent_at_epoch,
+        "sent_at": source.get("sent_at") or source.get("prompt_sent_at") or "",
+        "send_prompt_visual_recovery_attempts": source.get("send_prompt_visual_recovery_attempts", 0),
+        "max_send_prompt_visual_recovery_attempts": source.get(
+            "max_send_prompt_visual_recovery_attempts",
+            DEFAULT_MAX_SEND_PROMPT_VISUAL_RECOVERY_ATTEMPTS,
+        ),
+    }
+
+
+def _diagnose_resume_display_message(state: str, data: dict) -> str:
+    if state == "completed":
+        return "Worker 已截图并诊断 Trae 当前状态：看起来已经完成，调度会先获取回复轨迹。"
+    suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    if str(suggested.get("mode") or "") == "manual-required" or str(suggested.get("risk") or "") == "blocked":
+        return "Worker 已截图并诊断 Trae 当前状态：界面需要人工确认，调度已停止自动点击。"
+    if suggested:
+        return "Worker 已截图并诊断 Trae 当前状态：发现可恢复操作，调度会让 Worker 安全恢复后继续观察。"
+    if state:
+        return f"Worker 已截图并诊断 Trae 当前状态：{state}，调度会继续观察。"
+    return "Worker 已截图并诊断 Trae 当前状态，调度会继续观察。"
+
+
 def _queue_trace_collection_after_wait(
     db: Session,
     command: WorkerCommand,
@@ -266,7 +781,7 @@ def _queue_trace_collection_after_wait(
             "prompt": round_.prompt if round_ and round_.prompt else command.payload.get("prompt", ""),
             "trace_copy_attempts": command.payload.get("trace_copy_attempts", 0),
             "max_trace_copy_attempts": command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
-            "allow_local_trace_fallback": True,
+            "allow_local_trace_fallback": False,
             "completion_observation": wait_extra,
         },
     )
@@ -287,6 +802,15 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
 
     extra = _result_extra(command, result)
     if result.status not in {"ok", "success", "completed"}:
+        if _queue_trace_recovery_diagnosis(
+            db,
+            command,
+            job,
+            round_,
+            "Worker did not copy a complete Trae assistant trace; scheduler will screenshot and diagnose Trae before deciding recovery.",
+            {**extra, "validation": {"valid": False, "reason": "copy_command_failed"}},
+        ):
+            return
         if _queue_trace_copy_retry(
             db,
             command,
@@ -311,9 +835,30 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
     raw_trace = str(result.data.get("raw_text") or "")
     worker_probe = result.data.get("trace_probe") if isinstance(result.data, dict) else None
     probe_reason = str(worker_probe.get("reason") or "") if isinstance(worker_probe, dict) else ""
+    if probe_reason in MANUAL_STOP_REASONS:
+        if round_:
+            round_.trace_status = probe_reason
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            "Trae generation appears to have been manually stopped; manual inspection is required before retrying this round.",
+            result.status,
+            {**extra, "trace_probe": worker_probe, "trace_chars": len(raw_trace), "recovery_reason": probe_reason},
+        )
+        return
     if probe_reason in RECOVERABLE_COPY_GATE_REASONS:
         if round_:
             round_.trace_status = probe_reason
+        if _queue_trace_recovery_diagnosis(
+            db,
+            command,
+            job,
+            round_,
+            f"Trae copied reply still needs recovery ({probe_reason}); scheduler will screenshot and diagnose Trae before acting.",
+            {**extra, "trace_probe": worker_probe, "trace_chars": len(raw_trace)},
+        ):
+            return
         _queue_continue_recovery(
             db,
             command,
@@ -333,7 +878,40 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
     if round_:
         round_.trace_status = "valid" if validation["valid"] else validation["reason"]
 
+    if validation["valid"] and _is_invalid_business_trace(raw_trace):
+        validation = {"valid": False, "reason": "local_trace_not_business_trace"}
+        trace_extra["validation"] = validation
+        if round_:
+            round_.trace_status = validation["reason"]
+        _mark_trace_missing_abort(
+            db,
+            job,
+            round_,
+            "Copied trace was rejected because it is a local/test trace, not the real Trae assistant reply body.",
+            trace_extra,
+        )
+        return
+
     if not validation["valid"] and is_recoverable_trace_reason(validation["reason"]):
+        if validation["reason"] in MANUAL_STOP_REASONS:
+            _mark_manual_required(
+                db,
+                job,
+                round_,
+                "Trae generation appears to have been manually stopped; manual inspection is required before retrying this round.",
+                result.status,
+                {**trace_extra, "recovery_reason": validation["reason"]},
+            )
+            return
+        if validation["reason"] in TRACE_COPY_RETRY_REASONS and _queue_trace_recovery_diagnosis(
+            db,
+            command,
+            job,
+            round_,
+            f"Trae copied reply is not a complete raw tool trace yet ({validation['reason']}); scheduler will screenshot and diagnose Trae before retrying.",
+            trace_extra,
+        ):
+            return
         if validation["reason"] in TRACE_COPY_RETRY_REASONS and _queue_trace_copy_retry(
             db,
             command,
@@ -358,30 +936,65 @@ def _handle_copy_latest_reply_result(db: Session, command: WorkerCommand, result
     if validation["valid"]:
         gate = _copy_current_turn_gate(result.data)
         trace_extra["current_turn_gate"] = gate
+        gate_overridden = False
         if not gate["passed"]:
-            if round_:
-                round_.trace_status = gate["reason"]
-            if gate["recoverable"]:
-                if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra, raw_trace=raw_trace):
-                    return
-                _queue_continue_recovery(
+            if _valid_copy_can_override_current_turn_gate(gate, result.data):
+                gate_overridden = True
+                trace_extra["current_turn_gate_overridden"] = True
+                trace_extra["current_turn_gate_override_reason"] = "validated_complete_copy"
+                if round_:
+                    round_.trace_status = "valid"
+                add_log(
                     db,
-                    command,
+                    job_id=job.id,
+                    round_id=round_.id if round_ else None,
+                    stage=JobState.TRACE_VALIDATING,
+                    message=(
+                        "Worker copied a complete Trae trace; local turn-status probe was recoverable, "
+                        "so the validated copy is accepted."
+                    ),
+                    level="warning",
+                    extra=trace_extra,
+                )
+            else:
+                if round_:
+                    round_.trace_status = gate["reason"]
+                if gate["recoverable"]:
+                    if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra, raw_trace=raw_trace):
+                        return
+                    if _queue_trace_recovery_diagnosis(
+                        db,
+                        command,
+                        job,
+                        round_,
+                        f"Current Trae turn is not complete yet ({gate['reason']}); scheduler will screenshot and diagnose Trae before recovery.",
+                        trace_extra,
+                    ):
+                        return
+                    _queue_continue_recovery(
+                        db,
+                        command,
+                        job,
+                        round_,
+                        f"Current Trae turn is not complete yet ({gate['reason']}); retrying recovery before trace collection.",
+                        trace_extra,
+                    )
+                    return
+                _mark_trace_missing_abort(
+                    db,
                     job,
                     round_,
-                    f"Current Trae turn is not complete yet ({gate['reason']}); retrying recovery before trace collection.",
+                    f"Copied Trae reply was rejected because it does not belong to the current completed turn ({gate['reason']}).",
                     trace_extra,
                 )
                 return
-            _mark_trace_missing_abort(
-                db,
-                job,
-                round_,
-                f"Copied Trae reply was rejected because it does not belong to the current completed turn ({gate['reason']}).",
-                trace_extra,
-            )
-            return
-        _store_trae_turn_metadata(db, job, round_, result.data.get("trae_turn"))
+        _store_trae_turn_metadata(
+            db,
+            job,
+            round_,
+            _trae_turn_metadata_from_copy_result(result.data, allow_candidate=gate_overridden),
+            allow_non_completed=gate_overridden,
+        )
         trace_attachment = _record_trace_attachment(db, command, raw_trace)
         job.status = JobState.SCREENSHOT_CAPTURING
         if round_:
@@ -691,21 +1304,21 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
         return
 
     if _product_review_has_blocking(product_review):
-        _record_product_review_dissatisfaction(
+        _record_product_review_evidence(
             db,
             job,
             round_,
             command,
             "Static product review found blocking issues and no automated build/test command was available.",
-            product_review,
             extra,
+            product_review=product_review,
         )
         _advance_to_browser_accepting(
             db,
             command,
             job,
             round_,
-            "Static product review found issues; dissatisfaction reason was generated and browser acceptance will continue for evidence.",
+            "Static product review found issues; browser acceptance will continue before generating the final dissatisfaction reason.",
             level="warning",
             extra=extra,
         )
@@ -759,21 +1372,21 @@ def _handle_run_command_result(db: Session, command: WorkerCommand, result: Work
 
         product_review = command.payload.get("product_review") if isinstance(command.payload, dict) else {}
         if _product_review_has_blocking(product_review):
-            _record_product_review_dissatisfaction(
+            _record_product_review_evidence(
                 db,
                 job,
                 round_,
                 command,
                 "Product review build/test command passed, but static review still found blocking issues.",
-                product_review,
                 extra,
+                product_review=product_review,
             )
             _advance_to_browser_accepting(
                 db,
                 command,
                 job,
                 round_,
-                "Build/test command passed, but static review still found issues; browser acceptance will continue for evidence.",
+                "Build/test command passed, but static review still found issues; browser acceptance will continue before the final dissatisfaction reason.",
                 level="warning",
                 extra=extra,
             )
@@ -789,22 +1402,21 @@ def _handle_run_command_result(db: Session, command: WorkerCommand, result: Work
         )
         return
 
-    _record_dissatisfaction(
+    _record_product_review_evidence(
         db,
         job,
         round_,
         command,
-        result,
-        JobState.PRODUCT_REVIEWING,
         "Product review build/test command failed; manual review or dissatisfaction reason generation is required.",
         extra,
+        result=result,
     )
     _advance_to_browser_accepting(
         db,
         command,
         job,
         round_,
-        "Product review build/test command failed; dissatisfaction reason was generated and browser acceptance will continue for evidence.",
+        "Product review build/test command failed; browser acceptance will continue before generating the final dissatisfaction reason.",
         level="warning",
         extra=extra,
     )
@@ -839,6 +1451,28 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
                 job,
                 round_,
                 "Browser acceptance passed; test mode forced dissatisfaction and GitHub submission will continue for chain validation.",
+                extra,
+                level="warning",
+            )
+            return
+        if _has_pending_product_review_evidence(db, job.id, round_.id if round_ else None):
+            review_result, review_extra = _merge_product_review_evidence_for_final_reason(db, job, round_, command, result, extra)
+            _record_dissatisfaction(
+                db,
+                job,
+                round_,
+                command,
+                review_result,
+                JobState.BROWSER_ACCEPTING,
+                "Browser acceptance passed, but earlier product review evidence still found blocking issues.",
+                review_extra,
+            )
+            _advance_to_github_submitting(
+                db,
+                command,
+                job,
+                round_,
+                "Browser acceptance passed after product review issues; final dissatisfaction reason was generated and GitHub submission will continue.",
                 extra,
                 level="warning",
             )
@@ -1125,6 +1759,7 @@ def _mark_feishu_failed(
         level="error",
         extra=extra,
     )
+    _notify_feishu_write_failed(db, job, round_, message, extra)
 
 
 def _advance_after_feishu_success(
@@ -1186,6 +1821,7 @@ def _advance_after_feishu_success(
 
 def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[str, object]:
     daily_target_reached = bool(job.daily_target and job.submitted_count >= job.daily_target)
+    range_target = _current_range_target_rounds(job)
     if satisfied:
         if int(job.submitted_count or 0) <= 0:
             return {"action": "complete_project", "reason": "satisfied_without_submission", "accepted_satisfied": False}
@@ -1197,7 +1833,7 @@ def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[s
                     "accepted_satisfied": False,
                     "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
                 }
-            if round_.round_index >= MAX_ROUNDS_PER_PROJECT:
+            if round_.round_index >= range_target:
                 return {
                     "action": "complete_project",
                     "reason": "max_round_reached_after_satisfied_ratio_cap",
@@ -1212,12 +1848,19 @@ def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[s
             }
         if daily_target_reached:
             return {"action": "complete_project", "reason": "daily_target_reached", "accepted_satisfied": True}
-        return {"action": "complete_project", "reason": "satisfied", "accepted_satisfied": True}
+        if _should_continue_after_satisfied(job, round_):
+            return {
+                "action": "continue_project",
+                "reason": "satisfied_expand_next_module",
+                "accepted_satisfied": True,
+                "range_target_rounds": range_target,
+            }
+        return {"action": "complete_project", "reason": "satisfied", "accepted_satisfied": True, "range_target_rounds": range_target}
     if daily_target_reached:
         return {"action": "complete_project", "reason": "daily_target_reached"}
-    if round_.round_index >= MAX_ROUNDS_PER_PROJECT:
-        return {"action": "complete_project", "reason": "max_round_reached"}
-    return {"action": "continue_project", "reason": "dissatisfied_followup"}
+    if round_.round_index >= range_target:
+        return {"action": "complete_project", "reason": "range_target_reached", "range_target_rounds": range_target}
+    return {"action": "continue_project", "reason": "dissatisfied_followup", "range_target_rounds": range_target}
 
 
 def _would_exceed_satisfied_ratio(job: Job) -> bool:
@@ -1228,14 +1871,54 @@ def _would_exceed_satisfied_ratio(job: Job) -> bool:
     return (next_satisfied / submitted) > MAX_SATISFIED_RATIO
 
 
+def _current_range_target_rounds(job: Job) -> int:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    plan = intent.get("range_plan") if isinstance(intent.get("range_plan"), dict) else {}
+    ranges = plan.get("ranges") if isinstance(plan.get("ranges"), list) else []
+    current_direction = _direction_queue(job)[0] if _direction_queue(job) else ""
+    for item in ranges:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_text") or "").strip() == current_direction:
+            try:
+                return min(MAX_ROUNDS_PER_PROJECT, max(1, int(item.get("target_rounds") or MAX_ROUNDS_PER_PROJECT)))
+            except (TypeError, ValueError):
+                return MAX_ROUNDS_PER_PROJECT
+    if ranges:
+        try:
+            return min(MAX_ROUNDS_PER_PROJECT, max(1, int(ranges[0].get("target_rounds") or MAX_ROUNDS_PER_PROJECT)))
+        except (AttributeError, TypeError, ValueError):
+            return MAX_ROUNDS_PER_PROJECT
+    return MAX_ROUNDS_PER_PROJECT
+
+
+def _should_continue_after_satisfied(job: Job, round_: TaskRound) -> bool:
+    if round_.round_index >= _current_range_target_rounds(job):
+        return False
+    if _has_unstarted_direction(job) and round_.round_index >= max(3, _current_range_target_rounds(job) // 2):
+        return False
+    return True
+
+
+def _has_unstarted_direction(job: Job) -> bool:
+    return len(_direction_queue(job)) > 1
+
+
 def _continue_project_message(decision: dict[str, object]) -> str:
     if decision.get("reason") == "satisfied_ratio_cap":
         return "Round completed; next project round prepared because the satisfied ratio cap would be exceeded."
+    if decision.get("reason") == "satisfied_expand_next_module":
+        return "Round completed satisfactorily; next range module round prepared by scheduler."
     return "Round completed; next project round prepared because the result is still dissatisfied."
 
 
 def _advance_to_next_direction(db: Session, job: Job, round_: TaskRound, decision: dict[str, object]) -> bool:
     directions = _direction_queue(job)
+    if len(directions) <= 1:
+        if _maybe_append_synthetic_direction(job, round_, decision):
+            directions = _direction_queue(job)
+        else:
+            return False
     if len(directions) <= 1:
         return False
 
@@ -1277,6 +1960,44 @@ def _advance_to_next_direction(db: Session, job: Job, round_: TaskRound, decisio
         extra={"previous_round_id": round_.id, "direction": remaining_directions[0]},
     )
     _auto_dispatch_next_round(db, job, next_round)
+    return True
+
+
+def _maybe_append_synthetic_direction(job: Job, round_: TaskRound, decision: dict[str, object]) -> bool:
+    if not job.daily_target or int(job.submitted_count or 0) >= int(job.daily_target or 0):
+        return False
+    reason = str(decision.get("reason") or "")
+    if reason not in {"range_target_reached", "satisfied", "max_round_reached_after_satisfied_ratio_cap"}:
+        return False
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    plan = intent.get("range_plan") if isinstance(intent.get("range_plan"), dict) else {}
+    policy = plan.get("synthetic_range_policy") if isinstance(plan.get("synthetic_range_policy"), dict) else {}
+    if policy.get("allowed") is not True:
+        return False
+    examples = [str(item).strip() for item in policy.get("examples") or [] if str(item).strip()]
+    if not examples:
+        examples = ["运营管理后台", "业务审核工作台", "数据统计看板", "异常处理中心"]
+    existing = set(_direction_queue(job))
+    choice = next((item for item in examples if item not in existing), "")
+    if not choice:
+        return False
+    synthetic = f"{choice}：作为前面范围的延展项目，继续做中等规模业务工作台，覆盖列表、详情、操作流、统计联动和异常反馈。"
+    job.directions = [*(_direction_queue(job) or []), synthetic]
+    plan_ranges = list(plan.get("ranges") if isinstance(plan.get("ranges"), list) else [])
+    remaining = max(1, int(job.daily_target or 100) - int(job.submitted_count or 0))
+    plan_ranges.append(
+        {
+            "range_id": f"synthetic_{len(plan_ranges) + 1}",
+            "title": choice,
+            "source_text": synthetic,
+            "target_rounds": min(MAX_ROUNDS_PER_PROJECT, remaining),
+            "completed_rounds": 0,
+            "status": "synthetic_pending",
+            "project_policy": "调度根据剩余轮次创建的新独立项目",
+            "module_map": ["系统骨架", "主列表", "详情视图", "新增编辑", "状态流转", "搜索筛选", "统计联动", "异常状态", "运行构建"],
+        }
+    )
+    job.intent = {**intent, "range_plan": {**plan, "ranges": plan_ranges}}
     return True
 
 
@@ -1571,6 +2292,17 @@ def _queue_continue_recovery(
             "continue_attempts": continue_attempts,
             "max_continue_attempts": max_continue_attempts,
             "recovery_reason": recovery_reason,
+            "trae_workspace_path": source_command.payload.get("trae_workspace_path")
+            or source_command.payload.get("workspace_path"),
+            "workspace_path": source_command.payload.get("workspace_path")
+            or source_command.payload.get("trae_workspace_path"),
+            "workspace_root": source_command.payload.get("workspace_root", ""),
+            "project_name": source_command.payload.get("project_name", ""),
+            "project_slug": source_command.payload.get("project_slug", ""),
+            "prompt": source_command.payload.get("prompt", ""),
+            "sent_at_epoch": source_command.payload.get("sent_at_epoch")
+            or source_command.payload.get("prompt_sent_at_epoch"),
+            "sent_at": source_command.payload.get("sent_at") or source_command.payload.get("prompt_sent_at", ""),
         },
     )
     add_log(
@@ -1588,6 +2320,91 @@ def _queue_continue_recovery(
             "display_message": "已安排 Worker 进行一次续写恢复，完成后会重新等待 Trae CN 回复收口。",
         },
     )
+
+
+def _queue_trace_recovery_diagnosis(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    attempts = int(source_command.payload.get("trace_recovery_diagnosis_attempts") or 0) + 1
+    max_attempts = int(
+        source_command.payload.get("max_trace_recovery_diagnosis_attempts")
+        or DEFAULT_MAX_TRACE_RECOVERY_DIAGNOSIS_ATTEMPTS
+    )
+    if attempts > max_attempts:
+        return False
+
+    job.status = JobState.AWAITING_CONTINUE
+    if round_:
+        round_.status = JobState.AWAITING_CONTINUE
+    recovery_reason = _trace_copy_retry_reason(extra)
+    resume_payload = {
+        "timeout_seconds": source_command.payload.get("copy_timeout_seconds", source_command.payload.get("timeout_seconds", 10)),
+        "trace_copy_attempts": source_command.payload.get("trace_copy_attempts", 0),
+        "max_trace_copy_attempts": source_command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
+        "trace_recovery_diagnosis_attempts": attempts,
+        "max_trace_recovery_diagnosis_attempts": max_attempts,
+        "prompt": round_.prompt if round_ and round_.prompt else source_command.payload.get("prompt", ""),
+        "allow_local_trace_fallback": False,
+        "completion_observation": source_command.payload.get("completion_observation", {}),
+    }
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.AWAITING_CONTINUE,
+        message=message,
+        level="info",
+        extra={
+            **extra,
+            "trace_recovery_diagnosis_attempts": attempts,
+            "max_trace_recovery_diagnosis_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "display_message": (
+                f"复制轨迹不完整，调度先让 Worker 截图给视觉诊断，判断该继续、等待还是重试复制"
+                f"（第 {attempts}/{max_attempts} 次）。"
+            ),
+        },
+    )
+    diagnose_command = _enqueue_worker_command(
+        db,
+        source_command,
+        WorkerCommandType.DIAGNOSE_UI,
+        {
+            "task": "find_reply_action_button",
+            "timeout_seconds": source_command.payload.get("diagnose_timeout_seconds", 10),
+            "scroll_bottom": True,
+            "previous_command_type": WorkerCommandType.COPY_LATEST_REPLY.value,
+            "resume_previous_payload": resume_payload,
+            "retry_of_command_id": source_command.id,
+            "trace_copy_attempts": source_command.payload.get("trace_copy_attempts", 0),
+            "max_trace_copy_attempts": source_command.payload.get("max_trace_copy_attempts", DEFAULT_MAX_TRACE_COPY_ATTEMPTS),
+            "copy_timeout_seconds": source_command.payload.get("copy_timeout_seconds", source_command.payload.get("timeout_seconds", 10)),
+            "completion_observation": source_command.payload.get("completion_observation", {}),
+            "trace_recovery_diagnosis_attempts": attempts,
+            "max_trace_recovery_diagnosis_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "use_ai_ui_analyst": source_command.payload.get("use_ai_ui_analyst", True),
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.AWAITING_CONTINUE,
+        message="diagnose_ui worker command queued for trace recovery decision.",
+        extra={
+            "worker_id": diagnose_command.worker_id,
+            "command_id": diagnose_command.id,
+            "recovery_reason": recovery_reason,
+            "display_message": "已安排 Worker 截图诊断 Trae 是否完成、是否需要续写或滚动。",
+        },
+    )
+    return True
 
 
 def _queue_wait_observation_retry(
@@ -1708,7 +2525,7 @@ def _queue_trace_copy_retry(
             "trace_copy_attempts": trace_copy_attempts,
             "max_trace_copy_attempts": max_trace_copy_attempts,
             "prompt": round_.prompt if round_ and round_.prompt else source_command.payload.get("prompt", ""),
-            "allow_local_trace_fallback": True,
+            "allow_local_trace_fallback": False,
             "completion_observation": source_command.payload.get("completion_observation", {}),
         },
     )
@@ -1987,27 +2804,21 @@ def _ensure_trae_session_gate(
     round_: TaskRound | None,
     command: WorkerCommand,
 ) -> bool:
+    if round_ and _is_trusted_trae_session_display_id(round_.trae_session_id):
+        return True
     if round_ and round_.trae_session_id:
-        return True
-    if round_ and _hydrate_trae_session_from_trace(db, job, round_):
-        return True
-    trace_text = _latest_trace_text_for_gate(db, job, round_, max_chars=18000) if round_ else ""
-    if round_ and _test_chain_allowed(job) and round_.trace_status in {"valid", "test_exception"} and trace_text.strip():
         add_log(
             db,
             job_id=job.id,
             round_id=round_.id,
-            stage="session_missing_test_exception",
-            message="Real Trae session id is missing, but test-chain trace evidence exists; test chain will continue with an explicit exception.",
+            stage="session_collected",
+            message="Short Trae chat/session id is not trusted as the Feishu Trae Session ID.",
             level="warning",
-            extra={
-                "command_id": command.id,
-                "command_type": command.command_type,
-                "trace_chars": len(trace_text),
-                "trace_status": round_.trace_status,
-            },
+            extra={"candidate": round_.trae_session_id, "reason": "not_canonical_display_id"},
         )
+    if round_ and _hydrate_trae_session_from_trace(db, job, round_):
         return True
+    session_probe = _latest_session_probe_context(db, job.id, round_.id if round_ else None)
     job.status = "session_missing_abort"
     if round_:
         round_.status = "session_missing_abort"
@@ -2018,50 +2829,27 @@ def _ensure_trae_session_gate(
         stage="session_missing_abort",
         message="Real Trae session id is missing; GitHub and Feishu submission were stopped.",
         level="error",
-        extra={"command_id": command.id, "command_type": command.command_type},
+        extra={
+            "command_id": command.id,
+            "command_type": command.command_type,
+            "session_probe": session_probe,
+            "display_message": _session_missing_display_message(session_probe),
+        },
     )
     return False
 
 
 def _hydrate_trae_session_from_trace(db: Session, job: Job, round_: TaskRound) -> bool:
-    trace_text = _latest_trace_text_for_gate(db, job, round_, max_chars=0)
-    if not trace_text.strip():
-        return False
-    ids = _extract_trae_ids_from_trace(trace_text)
-    session_id = str(ids.get("session_id") or "").strip()
-    if not session_id:
-        return False
-    round_.trae_session_id = session_id
-    round_.trae_user_message_id = str(ids.get("message_id") or "").strip()
-    round_.trae_task_id = str(ids.get("task_id") or "").strip()
-    round_.trae_trace_id = str(ids.get("trace_id") or "").strip()
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id,
         stage="session_collected",
-        message="Real Trae session metadata recovered from trace evidence.",
-        extra={
-            "session_id": round_.trae_session_id,
-            "user_message_id": round_.trae_user_message_id,
-            "task_id": round_.trae_task_id,
-            "trace_id": round_.trae_trace_id,
-            "source": "trace_evidence",
-        },
+        message="Trace text is not trusted as a Trae Session ID source; refusing session recovery from trace evidence.",
+        level="warning",
+        extra={"source": "trace_evidence_disabled"},
     )
-    return True
-
-
-def _extract_trae_ids_from_trace(trace_text: str) -> dict[str, str]:
-    result: dict[str, str] = {}
-    text = str(trace_text or "")
-    for key in ("session_id", "task_id", "message_id", "trace_id"):
-        pattern = rf'{key}=(?:"([^"]+)"|([0-9a-fA-F]{{16,64}}))'
-        for quoted, bare in re.findall(pattern, text):
-            value = (quoted or bare or "").strip()
-            if value:
-                result[key] = value
-    return result
+    return False
 
 
 def _copy_current_turn_gate(data: object) -> dict:
@@ -2097,6 +2885,22 @@ def _copy_current_turn_gate(data: object) -> dict:
         "session_id": str(turn.get("session_id") or ""),
         "user_message_id": str(turn.get("user_message_id") or ""),
     }
+
+
+def _valid_copy_can_override_current_turn_gate(gate: dict, data: object) -> bool:
+    if gate.get("passed") is True or not gate.get("recoverable"):
+        return False
+    reason = str(gate.get("reason") or "")
+    if not reason.startswith("trae_turn_not_completed:"):
+        return False
+    if not isinstance(data, dict):
+        return False
+    probe = data.get("trace_probe") if isinstance(data.get("trace_probe"), dict) else {}
+    if probe.get("complete_like") is not True or str(probe.get("reason") or "") != "ok":
+        return False
+    if str(data.get("raw_text") or "").strip():
+        return True
+    return False
 
 
 def _recoverable_copy_gate_reason(reason: str) -> bool:
@@ -2491,6 +3295,8 @@ def _store_trae_turn_metadata(
     job: Job,
     round_: TaskRound | None,
     turn: object,
+    *,
+    allow_non_completed: bool = False,
 ) -> None:
     if not round_ or not isinstance(turn, dict):
         return
@@ -2505,7 +3311,8 @@ def _store_trae_turn_metadata(
             extra={"probe": turn},
         )
         return
-    if str(turn.get("turn_status") or "") != "completed":
+    turn_status = str(turn.get("turn_status") or "")
+    if turn_status != "completed" and not allow_non_completed:
         add_log(
             db,
             job_id=job.id,
@@ -2516,10 +3323,33 @@ def _store_trae_turn_metadata(
             extra={"probe": turn},
         )
         return
-    session_id = str(turn.get("session_id") or "").strip()
-    if not session_id:
+    chat_session_id = str(turn.get("chat_session_id") or turn.get("session_id") or "").strip()
+    display_session_id = str(
+        turn.get("display_session_id")
+        or turn.get("trae_session_display_id")
+        or _build_trae_session_display_id(turn)
+    ).strip()
+    if not chat_session_id:
         return
-    round_.trae_session_id = session_id
+    if not _is_trusted_trae_session_display_id(display_session_id):
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="session_collected",
+            message="Worker found Trae turn metadata, but did not provide the canonical Feishu Trae Session ID.",
+            level="warning",
+            extra={
+                "candidate": display_session_id or chat_session_id,
+                "chat_session_id": chat_session_id,
+                "user_message_id": str(turn.get("user_message_id") or "").strip(),
+                "task_id": str(turn.get("task_id") or "").strip(),
+                "trace_id": str(turn.get("trace_id") or "").strip(),
+                "reason": "missing_canonical_display_id",
+            },
+        )
+        return
+    round_.trae_session_id = display_session_id
     round_.trae_user_message_id = str(turn.get("user_message_id") or "").strip()
     round_.trae_task_id = str(turn.get("task_id") or "").strip()
     round_.trae_trace_id = str(turn.get("trace_id") or "").strip()
@@ -2531,13 +3361,145 @@ def _store_trae_turn_metadata(
         message="Real Trae session metadata collected from worker local logs.",
         extra={
             "session_id": round_.trae_session_id,
+            "display_session_id": display_session_id,
+            "chat_session_id": chat_session_id,
             "user_message_id": round_.trae_user_message_id,
             "task_id": round_.trae_task_id,
             "trace_id": round_.trae_trace_id,
-            "turn_status": turn.get("turn_status"),
+            "turn_status": turn_status,
             "confidence": turn.get("confidence"),
+            "accepted_non_completed_turn": bool(allow_non_completed and turn_status != "completed"),
         },
     )
+
+
+def _trae_turn_metadata_from_copy_result(data: object, *, allow_candidate: bool = False) -> object:
+    if not isinstance(data, dict):
+        return {}
+    turn = data.get("trae_turn")
+    if isinstance(turn, dict) and turn.get("status") == "found":
+        return turn
+    gate = data.get("current_turn_gate") if isinstance(data.get("current_turn_gate"), dict) else {}
+    candidate = gate.get("candidate") if isinstance(gate.get("candidate"), dict) else {}
+    if gate.get("passed") is True and str(gate.get("reason") or "") == "completed_turn_candidate" and candidate:
+        return {**candidate, "status": "found", "turn_status": candidate.get("turn_status") or "completed"}
+    if allow_candidate and candidate:
+        return {**candidate, "status": "found", "turn_status": candidate.get("turn_status") or "candidate_only"}
+    turn_candidate = turn.get("candidate") if isinstance(turn, dict) and isinstance(turn.get("candidate"), dict) else {}
+    if allow_candidate and turn_candidate:
+        return {
+            **turn_candidate,
+            "status": "found",
+            "turn_status": turn_candidate.get("turn_status") or turn.get("reason") or "candidate_only",
+        }
+    if candidate:
+        return {"status": "missing", "reason": gate.get("reason") or "candidate_only", "candidate": candidate}
+    return turn or {}
+
+
+def _build_trae_session_display_id(turn: dict[str, object]) -> str:
+    trace_ids = turn.get("trace_ids") if isinstance(turn.get("trace_ids"), list) else []
+    task_ids = turn.get("task_ids") if isinstance(turn.get("task_ids"), list) else []
+    trace_id = str(turn.get("trace_id") or (trace_ids[0] if trace_ids else "") or "").strip()
+    session_id = str(turn.get("chat_session_id") or turn.get("session_id") or "").strip()
+    task_id = str(turn.get("task_id") or (task_ids[0] if task_ids else "") or "").strip()
+    message_id = str(turn.get("user_message_id") or "").strip()
+    end_time = _format_trae_session_time(str(turn.get("end_time") or turn.get("start_time") or "").strip())
+    if not all([trace_id, session_id, task_id, message_id, end_time]):
+        return ""
+    return f".696467687743947:{trace_id}_{session_id}.{task_id}.{message_id}:Trae CN.T({end_time})"
+
+
+def _format_trae_session_time(value: str) -> str:
+    if not value:
+        return ""
+    text = value[:-1] + "+00:00" if value.endswith("Z") else value
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return value
+    return f"{parsed.year}/{parsed.month}/{parsed.day} {parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d}"
+
+
+def _is_trusted_trae_session_display_id(value: str) -> bool:
+    return bool(TRAE_SESSION_DISPLAY_RE.match(str(value or "").strip()))
+
+
+def _latest_session_probe_context(db: Session, job_id: str, round_id: str | None) -> dict:
+    query = select(RuntimeLog).where(
+        RuntimeLog.job_id == job_id,
+        RuntimeLog.stage.in_(["session_collected", "trace_validating", "collecting_trace"]),
+    )
+    if round_id:
+        query = query.where(RuntimeLog.round_id == round_id)
+    logs = db.scalars(query.order_by(RuntimeLog.created_at.desc()).limit(12)).all()
+    for log in logs:
+        extra = log.extra if isinstance(log.extra, dict) else {}
+        probe = extra.get("probe") if isinstance(extra.get("probe"), dict) else {}
+        if probe:
+            return _session_probe_summary(probe)
+        data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+        for source in (
+            data.get("trae_turn"),
+            data.get("current_turn_gate"),
+            extra.get("current_turn_gate"),
+            data.get("trace_probe"),
+            extra.get("trace_probe"),
+        ):
+            summary = _session_probe_summary(source)
+            if summary:
+                return summary
+    return {}
+
+
+def _session_probe_summary(source: object) -> dict:
+    if not isinstance(source, dict):
+        return {}
+    candidate = source.get("candidate") if isinstance(source.get("candidate"), dict) else {}
+    probe = candidate or source
+    keys = [
+        "status",
+        "reason",
+        "session_id",
+        "user_message_id",
+        "task_id",
+        "trace_id",
+        "turn_status",
+        "workspace_folder",
+        "workspace_storage_id",
+        "match_score",
+        "confidence",
+        "probe_scope",
+        "log_files_scanned",
+        "workspace_count",
+        "sent_after_epoch",
+    ]
+    summary = {key: probe.get(key) for key in keys if probe.get(key) not in (None, "")}
+    if candidate:
+        summary["candidate_from"] = str(source.get("reason") or source.get("source") or "candidate")
+    return summary
+
+
+def _session_missing_display_message(session_probe: dict) -> str:
+    if not session_probe:
+        return "没有获取到真实 Trae Session ID，本轮不能提交 GitHub 或写入飞书；请检查 Worker 是否能读取 Trae 本地日志。"
+    reason = str(session_probe.get("reason") or "").strip()
+    session_id = str(session_probe.get("session_id") or "").strip()
+    workspace = str(session_probe.get("workspace_folder") or "").strip()
+    score = session_probe.get("match_score")
+    pieces = ["没有获取到可信的真实 Trae Session ID，本轮不能提交 GitHub 或写入飞书。"]
+    details: list[str] = []
+    if reason:
+        details.append(f"原因：{reason}")
+    if session_id:
+        details.append(f"候选：{session_id}")
+    if workspace:
+        details.append(f"工作区：{workspace}")
+    if score not in (None, ""):
+        details.append(f"匹配分：{score}")
+    if details:
+        pieces.append("；".join(details))
+    return "".join(pieces)
 
 
 def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResult) -> None:
@@ -2546,6 +3508,15 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
         return
     extra = _result_extra(command, result)
     stop_report = _stop_report_from_result(result)
+    if stop_report and command.status == "cancelled":
+        command.status = "completed"
+        command.finished_at = command.finished_at or datetime.now(timezone.utc)
+        command.result = result.data
+        command.message = result.message or command.message
+    if str(job.status) == str(JobState.PAUSED):
+        if round_:
+            round_.status = JobState.PAUSED
+        job.status = JobState.PAUSED
     add_log(
         db,
         job_id=job.id,
@@ -2555,6 +3526,20 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
         level="info" if result.status in {"ok", "success", "completed"} else "warning",
         extra={**extra, "stop_report_summary": _stop_report_summary(stop_report)},
     )
+    if str(job.status) == str(JobState.PAUSED):
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="pause_confirmed",
+            message="User pause completed; scheduler will not issue more work until continue is requested.",
+            level="info",
+            extra={
+                **extra,
+                "stop_report_summary": _stop_report_summary(stop_report),
+                "display_message": _pause_confirmed_display_message(stop_report),
+            },
+        )
 
 
 def _stop_report_from_result(result: WorkerResult) -> dict:
@@ -2583,16 +3568,31 @@ def _stop_report_summary(report: dict) -> dict:
 def _stop_result_message(report: dict) -> str:
     summary = _stop_report_summary(report)
     if summary.get("local_process_kill_errors"):
-        return "Worker received the stop command and paused scheduling, but local process cleanup reported warnings."
+        return "Worker 已收到暂停请求，但本地进程清理有告警，请检查是否仍有残留执行。"
     if summary.get("trae_stop_clicked") and summary.get("trae_ui_stopped_verified"):
-        return "Worker stopped local activity, paused Trae generation, and confirmed the stop."
+        return "Worker 已停止本机动作，并确认 Trae 生成已停止。"
     if summary.get("trae_stop_clicked"):
-        return "Worker clicked Trae stop and stopped local activity; continue will send a resume prompt first."
+        return "Worker 已点击 Trae 停止并清理本机动作，继续时会先发送恢复提示词。"
     if summary.get("local_processes_killed"):
-        return "Worker stopped local project/sandbox activity; Trae UI stop button was not clicked."
+        return "Worker 已停止本地项目或沙箱进程，但未点击到 Trae 的停止按钮。"
     if summary.get("stop_confirmed"):
-        return "Worker received the stop command and confirmed there was no matching local activity to clean."
-    return "Worker stop command finished with no explicit confirmation."
+        return "Worker 已确认停止：没有发现仍需清理的本地动作。"
+    return "Worker 停止命令已结束，但没有拿到明确停止确认。"
+
+
+def _pause_confirmed_display_message(report: dict) -> str:
+    summary = _stop_report_summary(report)
+    if summary.get("local_process_kill_errors"):
+        return "暂停已生效：调度已停止继续下发任务，但本地清理有告警，请检查是否还有残留进程。"
+    if summary.get("trae_stop_clicked") and summary.get("trae_ui_stopped_verified"):
+        return "已经停了：调度已暂停，Worker 已确认 Trae 生成和本地进程都停止。"
+    if summary.get("trae_stop_clicked"):
+        return "已经停了：调度已暂停，Worker 已点击 Trae 停止并完成本地清理；继续时会先诊断当前状态。"
+    if summary.get("local_processes_killed"):
+        return "已经停了：调度已暂停，Worker 已停止相关本地项目进程；继续时会先诊断当前状态。"
+    if summary.get("stop_confirmed"):
+        return "已经停了：调度已暂停，Worker 没有发现仍需清理的本地动作。"
+    return "暂停已生效：调度不会继续下发任务，但 Worker 没有拿到完整停止确认。"
 
 
 def _should_ignore_worker_result(db: Session, command: WorkerCommand, result: WorkerResult) -> bool:
@@ -2680,6 +3680,7 @@ def _enqueue_worker_command(
     payload: dict,
 ) -> WorkerCommand:
     payload = _merge_context(source_command, payload)
+    payload = _merge_round_project_context(db, source_command, payload)
     return create_worker_command(
         db,
         worker_id=source_command.worker_id,
@@ -2705,6 +3706,7 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "job_id",
         "round_id",
         "round_index",
+        "open_new_task",
         "directions",
         "url",
         "browser_url",
@@ -2738,7 +3740,41 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
     ):
         if key in source_command.payload and key not in result:
             result[key] = source_command.payload[key]
+    _normalize_workspace_context(result)
     return result
+
+
+def _merge_round_project_context(db: Session, source_command: WorkerCommand, payload: dict) -> dict:
+    result = dict(payload)
+    if result.get("trae_workspace_path") or result.get("workspace_path"):
+        _normalize_workspace_context(result)
+        return result
+
+    round_id = source_command.round_id or result.get("round_id")
+    if not round_id:
+        return result
+    round_ = db.get(TaskRound, str(round_id))
+    if not round_ or not round_.project_id:
+        return result
+    project = db.get(Project, round_.project_id)
+    workspace_path = str(project.workspace_path or "").strip() if project else ""
+    if not workspace_path:
+        return result
+    result.setdefault("workspace_path", workspace_path)
+    result.setdefault("trae_workspace_path", workspace_path)
+    if project:
+        result.setdefault("project_name", project.name)
+    result.setdefault("round_index", round_.round_index)
+    _normalize_workspace_context(result)
+    return result
+
+
+def _normalize_workspace_context(payload: dict) -> None:
+    workspace_path = str(payload.get("trae_workspace_path") or payload.get("workspace_path") or "").strip()
+    if not workspace_path:
+        return
+    payload.setdefault("trae_workspace_path", workspace_path)
+    payload.setdefault("workspace_path", workspace_path)
 
 
 def _recommended_commands(data: dict) -> list[list[str]]:
@@ -2775,25 +3811,169 @@ def _product_review_has_blocking(product_review: dict | None) -> bool:
     return isinstance(issues, list) and bool(issues)
 
 
-def _record_product_review_dissatisfaction(
+def _record_product_review_evidence(
     db: Session,
     job: Job,
     round_: TaskRound | None,
     command: WorkerCommand,
     message: str,
-    product_review: dict,
     extra: dict,
+    *,
+    product_review: dict | None = None,
+    result: WorkerResult | None = None,
 ) -> None:
+    data = dict(result.data) if result and isinstance(result.data, dict) else {}
+    if product_review:
+        data["product_review"] = product_review
     review_data = {
         "status": "static_review_failed",
         "message": message,
-        "product_review": product_review,
-        "issues": product_review.get("issues") if isinstance(product_review, dict) else [],
-        "warnings": product_review.get("warnings") if isinstance(product_review, dict) else [],
-        "evidence": product_review.get("evidence") if isinstance(product_review, dict) else [],
+        "product_review": product_review or data.get("product_review") or {},
+        "issues": (product_review or {}).get("issues") if isinstance(product_review, dict) else [],
+        "warnings": (product_review or {}).get("warnings") if isinstance(product_review, dict) else [],
+        "evidence": (product_review or {}).get("evidence") if isinstance(product_review, dict) else [],
+        "data": data,
     }
-    context = {**extra, "command_type": command.command_type, "result_status": "static_review_failed", "data": review_data}
-    _record_dissatisfaction_from_context(db, job, round_, JobState.PRODUCT_REVIEWING, message, context)
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage="product_review_issue_evidence",
+        message=message,
+        level="warning",
+        extra={**extra, "command_type": command.command_type, "result_status": "static_review_failed", "data": review_data},
+    )
+
+
+def _has_pending_product_review_evidence(db: Session, job_id: str, round_id: str | None) -> bool:
+    if not round_id:
+        return False
+    return bool(
+        db.scalar(
+            select(RuntimeLog.id)
+            .where(
+                RuntimeLog.job_id == job_id,
+                RuntimeLog.round_id == round_id,
+                RuntimeLog.stage == "product_review_issue_evidence",
+            )
+            .limit(1)
+        )
+    )
+
+
+def _latest_product_review_evidence(db: Session, job_id: str, round_id: str | None) -> RuntimeLog | None:
+    if not round_id:
+        return None
+    return db.scalar(
+        select(RuntimeLog)
+        .where(
+            RuntimeLog.job_id == job_id,
+            RuntimeLog.round_id == round_id,
+            RuntimeLog.stage == "product_review_issue_evidence",
+        )
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
+    )
+
+
+def _merge_product_review_evidence_for_final_reason(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    command: WorkerCommand,
+    result: WorkerResult,
+    extra: dict,
+) -> tuple[WorkerResult, dict]:
+    evidence = _latest_product_review_evidence(db, job.id, round_.id if round_ else None)
+    if not evidence or not isinstance(evidence.extra, dict):
+        return result, extra
+    evidence_data = evidence.extra.get("data") if isinstance(evidence.extra.get("data"), dict) else {}
+    review_data = evidence_data.get("data") if isinstance(evidence_data.get("data"), dict) else {}
+    merged_data = dict(review_data)
+    merged_data["browser_acceptance"] = dict(result.data or {})
+    if evidence_data.get("product_review") and "product_review" not in merged_data:
+        merged_data["product_review"] = evidence_data["product_review"]
+    merged_result = WorkerResult(
+        command_id=result.command_id,
+        worker_id=result.worker_id,
+        lease_id=result.lease_id,
+        status="failed",
+        message=result.message,
+        error=result.error,
+        data=merged_data,
+    )
+    merged_extra = {
+        **extra,
+        "product_review_issue_evidence_log_id": evidence.id,
+        "data": merged_data,
+    }
+    return merged_result, merged_extra
+
+
+def _notify_feishu_write_failed(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> None:
+    webhook_config = dict(load_user_settings(db, job.user_id).get("webhook", {}))
+    if not webhook_config.get("url"):
+        return
+    if round_ and db.scalar(
+        select(RuntimeLog.id)
+        .where(
+            RuntimeLog.job_id == job.id,
+            RuntimeLog.round_id == round_.id,
+            RuntimeLog.stage == "feishu_failure_notification",
+        )
+        .limit(1)
+    ):
+        return
+    text = _feishu_failure_notification_text(job, round_, message, extra)
+    try:
+        result = notify_text(webhook_config, text)
+    except WebhookNotifyError as exc:
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage="feishu_failure_notification",
+            message="Feishu failure webhook notification failed.",
+            level="warning",
+            extra={"error": str(exc)},
+        )
+        return
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage="feishu_failure_notification",
+        message="Feishu failure webhook notification sent.",
+        level="warning",
+        extra=result,
+    )
+
+
+def _feishu_failure_notification_text(job: Job, round_: TaskRound | None, message: str, extra: dict) -> str:
+    prompt = str(round_.prompt or "").strip() if round_ else ""
+    operation = str(extra.get("operation") or "")
+    status = str(extra.get("http_status") or "")
+    code = str(extra.get("feishu_code") or "")
+    lines = [
+        "AgentOps 飞书写入失败，需要处理",
+        f"Job: {job.id}",
+        f"Round: {round_.id if round_ else '-'}",
+        f"原因: {message}",
+    ]
+    if operation:
+        lines.append(f"飞书接口步骤: {operation}")
+    if status or code:
+        lines.append(f"状态码: HTTP {status or '-'} / code {code or '-'}")
+    if prompt:
+        lines.append(f"需求: {prompt[:500]}")
+    lines.append("处理建议: 检查当前用户飞书 App ID/Secret、OAuth token、Base/Table 协作者和可编辑权限后重试。")
+    return "\n".join(lines)
 
 
 def _browser_acceptance_url(command: WorkerCommand, extra: dict) -> str:
@@ -2884,23 +4064,19 @@ def _feishu_trace_field_and_attachments(db: Session, job: Job, round_: TaskRound
             "This row was written only to validate AgentOps GitHub/Feishu automation.\n\n"
             f"{text}"
         )
+    if _is_invalid_business_trace(text):
+        return "", []
     if len(text) > LOG_TRACE_FIELD_SOFT_LIMIT:
         return LOG_TRACE_OVERFLOW_TEXT, [str(path)]
     return text, []
 
 
+def _is_invalid_business_trace(text: str) -> bool:
+    return any(pattern.search(str(text or "")) for pattern in INVALID_BUSINESS_TRACE_PATTERNS)
+
+
 def _latest_trace_text(db: Session, job_id: str, round_id: str, max_chars: int = 18000) -> str:
     attachment = _latest_attachment(db, job_id, round_id, "trace")
-    if not attachment:
-        return ""
-    return _attachment_text(attachment, max_chars=max_chars)
-
-
-def _latest_trace_text_for_gate(db: Session, job: Job, round_: TaskRound, max_chars: int = 18000) -> str:
-    text = _latest_trace_text(db, job.id, round_.id, max_chars=max_chars)
-    if text.strip() or not _test_chain_allowed(job):
-        return text
-    attachment = _latest_attachment(db, job.id, round_.id, "test_trace_exception")
     if not attachment:
         return ""
     return _attachment_text(attachment, max_chars=max_chars)
@@ -2979,7 +4155,10 @@ def _normalize_github_clone_url(value: str) -> str:
 
 
 def _session_id(job: Job, round_: TaskRound) -> str:
-    return round_.trae_session_id or ""
+    session_id = round_.trae_session_id or ""
+    if not _is_trusted_trae_session_display_id(session_id):
+        raise FeishuWriteError("Canonical Trae Session ID is missing; refusing to write Feishu business record.")
+    return session_id
 
 
 def _first_direction(job: Job) -> str:
@@ -2992,10 +4171,13 @@ def _round_label(round_index: int) -> str:
     labels = ["第一轮", "第二轮", "第三轮", "第四轮", "第五轮"]
     if 1 <= round_index <= len(labels):
         return labels[round_index - 1]
-    return labels[-1]
+    return f"第{round_index}轮"
 
 
 def _infer_feishu_task_type(job: Job, round_: TaskRound) -> str:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    if round_.round_index <= 1 and intent.get("start_mode") == "fresh_start":
+        return "0-1代码生成"
     text = f"{_first_direction(job)} {round_.prompt or ''}".lower()
     if any(item in text for item in ["bug", "修复", "报错", "异常"]):
         return "Bug修复"

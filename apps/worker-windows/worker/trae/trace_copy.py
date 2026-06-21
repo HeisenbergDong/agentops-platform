@@ -1,9 +1,11 @@
 import ctypes
 import time
-from typing import Callable
+from typing import Any, Callable
 
 from worker.system.clipboard import ClipboardError, get_clipboard_text, set_clipboard_text
 from worker.trae.local_trace import collect_local_trace
+from worker.trae.screenshot import capture_screenshot
+from worker.trae.ui_locator import target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
 COPY_BUTTON_MARKERS = ("\u590d\u5236", "Copy", "copy")
@@ -44,6 +46,14 @@ SERVICE_INTERRUPTION_MARKERS = (
     "interrupted",
     "something went wrong",
 )
+MANUAL_STOP_MARKERS = (
+    "\u624b\u52a8\u7ec8\u6b62\u8f93\u51fa",
+    "\u5f53\u524d\u4efb\u52a1\u88ab\u624b\u52a8\u4e2d\u65ad",
+    "\u624b\u52a8\u4e2d\u65ad",
+    "manually stopped",
+    "manual stop",
+    "stopped manually",
+)
 SCROLL_CONTROL_TYPES = ("Document", "Pane", "List", "Group", "Custom")
 
 
@@ -53,12 +63,13 @@ def copy_latest_reply(
     trae_turn: dict | None = None,
     prompt: str = "",
     workspace_path: str = "",
-    allow_local_fallback: bool = True,
+    allow_local_fallback: bool = False,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     _raise_if_cancelled(cancellation_check)
-    focus_trae(timeout_seconds=timeout_seconds)
+    focus_trae(timeout_seconds=timeout_seconds, workspace_path=workspace_path or None, require_workspace_match=bool(workspace_path))
     _raise_if_cancelled(cancellation_check)
-    window = find_trae_window(timeout_seconds=timeout_seconds)
+    window = find_trae_window(timeout_seconds=timeout_seconds, workspace_path=workspace_path or None, require_workspace_match=bool(workspace_path))
     scroll_result = scroll_assistant_to_bottom(window)
     sentinel = f"agentops-copy-sentinel-{time.time_ns()}"
     failures: list[dict] = []
@@ -97,6 +108,38 @@ def copy_latest_reply(
                 "trace_probe": probe,
                 "scroll": scroll_result,
                 "copy_candidates": _candidate_summaries(candidates),
+            }
+
+    visual_result = _try_visual_copy_trace(
+        window,
+        before=sentinel,
+        timeout_seconds=timeout_seconds,
+        ui_analyst=ui_analyst,
+        cancellation_check=cancellation_check,
+        failures=failures,
+        workspace_path=workspace_path,
+    )
+    if visual_result:
+        candidates.append(
+            {
+                "raw_text": visual_result["raw_text"],
+                "chars": visual_result["chars"],
+                "button_text": "visual copy_trace_button",
+                "trace_probe": visual_result["trace_probe"],
+            }
+        )
+        if _is_preferred_trace(visual_result["trace_probe"]):
+            return {
+                "status": "copied",
+                "raw_text": visual_result["raw_text"],
+                "chars": visual_result["chars"],
+                "copy_method": "ai_visual_trace_copy_button",
+                "button_text": "visual copy_trace_button",
+                "trace_probe": visual_result["trace_probe"],
+                "scroll": scroll_result,
+                "visual_copy": visual_result["visual_copy"],
+                "copy_candidates": _candidate_summaries(candidates),
+                "copy_failures": failures[-5:],
             }
 
     best = _best_copy_candidate(candidates) if candidates else {}
@@ -143,6 +186,182 @@ def copy_latest_reply(
     raise TraeAutomationError(f"No Trae assistant reply copy button produced clipboard text. failures={failures[-3:]}")
 
 
+def _try_visual_copy_trace(
+    window,
+    *,
+    before: str,
+    timeout_seconds: float,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    cancellation_check: Callable[[], None] | None,
+    failures: list[dict],
+    workspace_path: str = "",
+) -> dict | None:
+    if not ui_analyst:
+        failures.append({"stage": "visual_copy_trace", "error": "ui_analyst_unavailable"})
+        return None
+    _raise_if_cancelled(cancellation_check)
+    try:
+        screenshot = capture_screenshot(target="trae_window", timeout_seconds=timeout_seconds, workspace_path=workspace_path or None)
+        bounds = ((screenshot.get("capture") or {}).get("bounds") or {}) if isinstance(screenshot, dict) else {}
+        rect = _bounds_tuple(bounds)
+        response = ui_analyst(
+            str(screenshot["path"]),
+            _visual_trace_copy_context(bounds, str(window.window_text() or "")),
+        )
+        analysis = response.get("analysis") if isinstance(response, dict) else {}
+        if not isinstance(analysis, dict):
+            analysis = {}
+        target = target_for_action(analysis, "copy_trace_button", min_confidence=0.70)
+        opened_more = {}
+        if not target:
+            opened_more = _open_visual_more_actions(
+                window,
+                screenshot=screenshot,
+                analysis=analysis,
+                rect=rect,
+                timeout_seconds=timeout_seconds,
+                ui_analyst=ui_analyst,
+                cancellation_check=cancellation_check,
+                failures=failures,
+                workspace_path=workspace_path,
+            )
+            target = opened_more.get("target") if isinstance(opened_more.get("target"), dict) else None
+            if opened_more.get("screenshot"):
+                screenshot = opened_more["screenshot"]
+            if opened_more.get("analysis"):
+                analysis = opened_more["analysis"]
+            if opened_more.get("rect"):
+                rect = opened_more["rect"]
+        if not target:
+            failures.append(
+                {
+                    "stage": "visual_copy_trace",
+                    "error": "no_visual_target",
+                    "screenshot": _screenshot_summary(screenshot),
+                    "analysis": _analysis_summary(analysis),
+                }
+            )
+            return None
+        ok, reason = validate_target(target, "copy_trace_button", rect, min_confidence=0.70)
+        if not ok:
+            failures.append(
+                {
+                    "stage": "visual_copy_trace",
+                    "error": reason,
+                    "screenshot": _screenshot_summary(screenshot),
+                    "analysis": _analysis_summary(analysis),
+                }
+            )
+            return None
+        before_text = before if _set_clipboard_text(before) else _read_clipboard_text()
+        _mouse_click_target(target)
+        raw_text = _wait_for_clipboard_change(before_text, timeout_seconds=timeout_seconds)
+        probe = probe_trace(raw_text)
+        if not raw_text.strip():
+            failures.append(
+                {
+                    "stage": "visual_copy_trace",
+                    "error": "clipboard_unchanged",
+                    "screenshot": _screenshot_summary(screenshot),
+                    "analysis": _analysis_summary(analysis),
+                    "target": _target_summary(target),
+                }
+            )
+            return None
+        return {
+            "raw_text": raw_text,
+            "chars": len(raw_text),
+            "trace_probe": probe,
+            "visual_copy": {
+                "screenshot": _screenshot_summary(screenshot),
+                "analysis": _analysis_summary(analysis),
+                "target": _target_summary(target),
+                "overflow_menu": opened_more.get("overflow_menu") if opened_more else {},
+            },
+        }
+    except Exception as exc:
+        failures.append({"stage": "visual_copy_trace", "error": str(exc)})
+        return None
+
+
+def _open_visual_more_actions(
+    window,
+    *,
+    screenshot: dict[str, Any],
+    analysis: dict[str, Any],
+    rect: tuple[int, int, int, int] | None,
+    timeout_seconds: float,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    cancellation_check: Callable[[], None] | None,
+    failures: list[dict],
+    workspace_path: str = "",
+) -> dict[str, Any]:
+    more_target = target_for_action(analysis, "more_actions_button", min_confidence=0.68)
+    if not more_target:
+        return {}
+    ok, reason = validate_target(more_target, "more_actions_button", rect, min_confidence=0.68)
+    if not ok:
+        failures.append(
+            {
+                "stage": "visual_open_more_actions",
+                "error": reason,
+                "screenshot": _screenshot_summary(screenshot),
+                "analysis": _analysis_summary(analysis),
+                "target": _target_summary(more_target),
+            }
+        )
+        return {}
+    _raise_if_cancelled(cancellation_check)
+    _mouse_click_target(more_target)
+    time.sleep(0.35)
+    _raise_if_cancelled(cancellation_check)
+    try:
+        menu_screenshot = capture_screenshot(target="trae_window", timeout_seconds=timeout_seconds, workspace_path=workspace_path or None)
+        bounds = ((menu_screenshot.get("capture") or {}).get("bounds") or {}) if isinstance(menu_screenshot, dict) else {}
+        menu_rect = _bounds_tuple(bounds)
+        response = ui_analyst(
+            str(menu_screenshot["path"]),
+            _visual_trace_copy_context(bounds, str(window.window_text() or ""), overflow_menu_open=True),
+        )
+        menu_analysis = response.get("analysis") if isinstance(response, dict) else {}
+        if not isinstance(menu_analysis, dict):
+            menu_analysis = {}
+        copy_target = target_for_action(menu_analysis, "copy_trace_button", min_confidence=0.70)
+        if not copy_target:
+            failures.append(
+                {
+                    "stage": "visual_open_more_actions",
+                    "error": "copy_target_not_found_in_more_menu",
+                    "screenshot": _screenshot_summary(menu_screenshot),
+                    "analysis": _analysis_summary(menu_analysis),
+                    "more_target": _target_summary(more_target),
+                }
+            )
+            return {"overflow_menu": {"opened": True, "more_target": _target_summary(more_target)}}
+        return {
+            "target": copy_target,
+            "screenshot": menu_screenshot,
+            "analysis": menu_analysis,
+            "rect": menu_rect,
+            "overflow_menu": {
+                "opened": True,
+                "more_target": _target_summary(more_target),
+                "copy_target": _target_summary(copy_target),
+            },
+        }
+    except Exception as exc:
+        failures.append(
+            {
+                "stage": "visual_open_more_actions",
+                "error": str(exc),
+                "screenshot": _screenshot_summary(screenshot),
+                "analysis": _analysis_summary(analysis),
+                "more_target": _target_summary(more_target),
+            }
+        )
+        return {}
+
+
 def scroll_assistant_to_bottom(window, wheel_steps: int = 14) -> dict:
     """Best-effort scroll of Trae's assistant reply pane before copying."""
     result = {
@@ -180,6 +399,44 @@ def scroll_assistant_to_bottom(window, wheel_steps: int = 14) -> dict:
     return result
 
 
+def scroll_inner_reply_panel(window, wheel_steps: int = 8) -> dict:
+    """Best-effort scroll for nested cards inside the assistant reply area."""
+    result = {
+        "status": "not_scrolled",
+        "attempted": True,
+        "wheel_steps": wheel_steps,
+        "method": "nested_reply_panel",
+        "methods": [],
+        "errors": [],
+    }
+    coordinate_result = _scroll_window_inner_reply_area(window, wheel_steps)
+    result["methods"].append(coordinate_result)
+    if coordinate_result["status"] != "scrolled":
+        result["errors"].append(str(coordinate_result.get("error") or "coordinate_inner_scroll_failed"))
+
+    scrolled_controls = []
+    window_rect = _control_rect_tuple(window)
+    for control in _inner_scroll_candidates(window, window_rect):
+        try:
+            control.set_focus()
+        except Exception as exc:
+            result["errors"].append(f"focus:{type(exc).__name__}")
+        try:
+            for _ in range(max(1, int(wheel_steps))):
+                control.wheel_mouse_input(wheel_dist=-4)
+                time.sleep(0.03)
+            scrolled_controls.append(_control_summary(control))
+            if len(scrolled_controls) >= 3:
+                break
+        except Exception as exc:
+            result["errors"].append(f"wheel:{type(exc).__name__}:{exc}")
+    if scrolled_controls:
+        result["methods"].append({"status": "scrolled", "method": "uia_inner_scrollable_controls", "controls": scrolled_controls})
+    if any(item.get("status") == "scrolled" for item in result["methods"] if isinstance(item, dict)):
+        result["status"] = "scrolled"
+    return result
+
+
 def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
     hwnd = int(getattr(window, "hwnd", 0) or 0)
     if hwnd <= 0:
@@ -212,21 +469,25 @@ def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
 
     width = max(1, int(rect.right - rect.left))
     height = max(1, int(rect.bottom - rect.top))
-    # Same target family as the legacy D:\adbz automation: left conversation pane,
-    # above the prompt input. Multiple hover points handle Trae layouts where the
-    # actual scroll container is narrower than the visible assistant pane.
+    # Focus only the assistant reply body. The lower toolbar/input strip can
+    # contain Stop/Send controls while Trae is generating.
     points = [
-        (0.32, 0.72),
-        (0.265, 0.735),
-        (0.38, 0.72),
-        (0.22, 0.68),
+        (0.30, 0.58),
+        (0.24, 0.54),
+        (0.38, 0.58),
+        (0.31, 0.46),
     ]
     clicked_points = []
+    skipped_points = []
     try:
         for ratio_x, ratio_y in points:
             x = int(rect.left + width * ratio_x)
             y = int(rect.top + height * ratio_y)
-            clicked_points.append({"x": x, "y": y, "ratio_x": ratio_x, "ratio_y": ratio_y})
+            point = {"x": x, "y": y, "ratio_x": ratio_x, "ratio_y": ratio_y}
+            if not _is_safe_reply_scroll_point(ratio_x, ratio_y):
+                skipped_points.append({**point, "reason": "unsafe_reply_scroll_point"})
+                continue
+            clicked_points.append(point)
             user32.SetCursorPos(x, y)
             time.sleep(0.06)
             user32.mouse_event(0x0002, 0, 0, 0, 0)
@@ -251,8 +512,85 @@ def _scroll_window_reply_area(window, wheel_steps: int) -> dict:
         "attempted": True,
         "method": "win32_reply_area",
         "points": clicked_points,
+        "skipped_points": skipped_points,
         "wheel_steps": wheel_steps,
     }
+
+
+def _scroll_window_inner_reply_area(window, wheel_steps: int) -> dict:
+    hwnd = int(getattr(window, "hwnd", 0) or 0)
+    if hwnd <= 0:
+        return {"status": "not_scrolled", "attempted": True, "method": "win32_inner_reply_area", "error": "missing_hwnd"}
+    user32 = ctypes.windll.user32
+
+    class RECT(ctypes.Structure):
+        _fields_ = [
+            ("left", ctypes.c_long),
+            ("top", ctypes.c_long),
+            ("right", ctypes.c_long),
+            ("bottom", ctypes.c_long),
+        ]
+
+    try:
+        user32.SetProcessDPIAware()
+    except Exception:
+        pass
+    try:
+        focus_trae(timeout_seconds=2.0)
+    except Exception:
+        pass
+    rect = RECT()
+    if not user32.GetWindowRect(hwnd, ctypes.byref(rect)):
+        return {"status": "not_scrolled", "attempted": True, "method": "win32_inner_reply_area", "error": "GetWindowRect failed"}
+
+    width = max(1, int(rect.right - rect.left))
+    height = max(1, int(rect.bottom - rect.top))
+    # Nested Trae confirmation cards sit inside the left assistant pane. Hovering
+    # the card body, not the global chat scrollbar, lets the wheel reach the
+    # small inner panel that can hide action details.
+    points = [
+        (0.31, 0.60),
+        (0.36, 0.58),
+        (0.28, 0.58),
+        (0.41, 0.60),
+    ]
+    scrolled_points = []
+    skipped_points = []
+    try:
+        for ratio_x, ratio_y in points:
+            x = int(rect.left + width * ratio_x)
+            y = int(rect.top + height * ratio_y)
+            point = {"x": x, "y": y, "ratio_x": ratio_x, "ratio_y": ratio_y}
+            if not _is_safe_reply_scroll_point(ratio_x, ratio_y):
+                skipped_points.append({**point, "reason": "unsafe_inner_reply_scroll_point"})
+                continue
+            scrolled_points.append(point)
+            user32.SetCursorPos(x, y)
+            time.sleep(0.08)
+            for _ in range(max(1, int(wheel_steps))):
+                user32.mouse_event(0x0800, 0, 0, ctypes.c_uint((-120 * 3) & 0xFFFFFFFF).value, 0)
+                time.sleep(0.035)
+            _press_key(user32, 0x22)  # PageDown
+            time.sleep(0.05)
+    except Exception as exc:
+        return {
+            "status": "not_scrolled",
+            "attempted": True,
+            "method": "win32_inner_reply_area",
+            "error": str(exc),
+        }
+    return {
+        "status": "scrolled",
+        "attempted": True,
+        "method": "win32_inner_reply_area",
+        "points": scrolled_points,
+        "skipped_points": skipped_points,
+        "wheel_steps": wheel_steps,
+    }
+
+
+def _is_safe_reply_scroll_point(ratio_x: float, ratio_y: float) -> bool:
+    return 0.12 <= float(ratio_x) <= 0.46 and 0.18 <= float(ratio_y) <= 0.64
 
 
 def _press_key(user32, virtual_key: int) -> None:
@@ -279,6 +617,13 @@ def _scroll_candidates(window) -> list[object]:
         unique.append(candidate)
     window_rect = _control_rect_tuple(window)
     return sorted(unique, key=lambda control: _scroll_candidate_sort_key(control, window_rect))
+
+
+def _inner_scroll_candidates(window, window_rect: tuple[int, int, int, int] | None) -> list[object]:
+    controls = _scroll_candidates(window)
+    if not window_rect:
+        return controls
+    return [control for control in controls if _looks_like_inner_reply_control(control, window_rect)]
 
 
 def _control_rect_tuple(control) -> tuple[int, int, int, int] | None:
@@ -321,6 +666,26 @@ def _scroll_candidate_sort_key(control, window_rect: tuple[int, int, int, int] |
     if composer_like:
         rank += 2
     return (rank, abs(ratio_x - 0.30), -height, -area)
+
+
+def _looks_like_inner_reply_control(control, window_rect: tuple[int, int, int, int]) -> bool:
+    rect = _control_rect_tuple(control)
+    if not rect:
+        return False
+    left, top, right, bottom = rect
+    window_left, window_top, window_right, window_bottom = window_rect
+    window_width = max(1, window_right - window_left)
+    window_height = max(1, window_bottom - window_top)
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    center_x = (left + right) / 2
+    center_y = (top + bottom) / 2
+    ratio_x = (center_x - window_left) / window_width
+    ratio_y = (center_y - window_top) / window_height
+    in_assistant_pane = 0.10 <= ratio_x <= 0.46 and 0.20 <= ratio_y <= 0.82
+    not_whole_window = width < window_width * 0.78 and height < window_height * 0.82
+    not_composer = ratio_y < 0.82
+    return in_assistant_pane and not_whole_window and not_composer
 
 
 def _control_summary(control) -> str:
@@ -396,11 +761,110 @@ def _set_clipboard_text(value: str) -> bool:
         return False
 
 
+def _mouse_click_target(target: dict[str, Any]) -> None:
+    import ctypes
+
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    x = int(float(center.get("x")))
+    y = int(float(center.get("y")))
+    user32 = ctypes.windll.user32
+    user32.SetCursorPos(x, y)
+    time.sleep(0.05)
+    user32.mouse_event(0x0002, 0, 0, 0, 0)
+    time.sleep(0.03)
+    user32.mouse_event(0x0004, 0, 0, 0, 0)
+
+
+def _bounds_tuple(bounds: dict[str, Any]) -> tuple[int, int, int, int] | None:
+    try:
+        left = int(bounds.get("left"))
+        top = int(bounds.get("top"))
+        right = int(bounds.get("right"))
+        bottom = int(bounds.get("bottom"))
+    except (TypeError, ValueError, AttributeError):
+        return None
+    if right <= left or bottom <= top:
+        return None
+    return left, top, right, bottom
+
+
+def _visual_trace_copy_context(
+    bounds: dict[str, Any],
+    window_title: str,
+    *,
+    overflow_menu_open: bool = False,
+) -> dict[str, Any]:
+    instruction = (
+        "Find the safest copy button/icon for the latest completed assistant reply or execution trace. "
+        "Prefer the bottom toolbar copy button for the assistant message, not code-block copy buttons, "
+        "editor toolbar icons, file explorer controls, or window chrome. "
+        "If the assistant reply toolbar is narrow and only exposes a '...' / more / overflow button, "
+        "return that target as more_actions_button so the worker can open it and inspect the menu."
+    )
+    if overflow_menu_open:
+        instruction = (
+            "The assistant reply overflow menu has just been opened. Find the Copy item in that menu "
+            "only if it belongs to the latest assistant reply toolbar. Do not choose code-block, editor, "
+            "file explorer, or window chrome copy controls."
+        )
+    return {
+        "task": "copy_latest_reply_trace",
+        "instruction": instruction,
+        "desired_action": "copy_trace_button",
+        "window": {"title": window_title, "bounds": bounds},
+        "allowed_actions": ["copy_trace_button", "more_actions_button"],
+        "overflow_menu_open": overflow_menu_open,
+    }
+
+
+def _screenshot_summary(screenshot: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "path": str(screenshot.get("path") or ""),
+        "filename": str(screenshot.get("filename") or ""),
+        "status": str(screenshot.get("status") or ""),
+        "size_bytes": int(screenshot.get("size_bytes") or 0),
+    }
+
+
+def _analysis_summary(analysis: dict[str, Any]) -> dict[str, Any]:
+    targets = analysis.get("targets") if isinstance(analysis.get("targets"), list) else []
+    return {
+        "status": str(analysis.get("status") or ""),
+        "screen_state": str(analysis.get("screen_state") or ""),
+        "recommended_action": str(analysis.get("recommended_action") or ""),
+        "confidence": float(analysis.get("confidence") or 0),
+        "risk": str(analysis.get("risk") or ""),
+        "targets": [_target_summary(item) for item in targets[:5] if isinstance(item, dict)],
+        "reason": str(analysis.get("reason") or ""),
+        "blocked_reason": str(analysis.get("blocked_reason") or ""),
+    }
+
+
+def _target_summary(target: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "action": str(target.get("action") or ""),
+        "label": str(target.get("label") or ""),
+        "center": target.get("center") if isinstance(target.get("center"), dict) else {},
+        "ratio": target.get("ratio") if isinstance(target.get("ratio"), dict) else {},
+        "confidence": float(target.get("confidence") or 0),
+        "risk": str(target.get("risk") or ""),
+        "reason": str(target.get("reason") or ""),
+    }
+
+
 def probe_trace(text: str) -> dict:
     normalized = str(text or "").strip()
     if not normalized:
         return {"complete_like": False, "reason": "empty_trace"}
     tail = normalized[-1600:].lower()
+    manual_stop_marker = _first_marker(normalized[-2400:], MANUAL_STOP_MARKERS)
+    if manual_stop_marker:
+        return {
+            "complete_like": False,
+            "reason": "manual_stopped",
+            "chars": len(normalized),
+            "marker": manual_stop_marker,
+        }
     if any(marker.lower() in tail for marker in CONTINUE_MARKERS):
         return {"complete_like": False, "reason": "awaiting_continuation", "chars": len(normalized)}
     tail_lines = [line.strip().lower() for line in normalized.splitlines()[-8:] if line.strip()]
@@ -419,6 +883,13 @@ def probe_trace(text: str) -> dict:
         return {"complete_like": False, "reason": "missing_tool_trace_markers", "chars": len(normalized)}
     if "toolName:" in normalized and "status:" not in normalized:
         return {"complete_like": False, "reason": "missing_status_marker", "chars": len(normalized)}
+    if _looks_like_single_tool_fragment(normalized):
+        return {
+            "complete_like": False,
+            "reason": "partial_tool_trace",
+            "chars": len(normalized),
+            "marker_count": marker_count,
+        }
     return {"complete_like": len(normalized) >= 800, "reason": "ok", "chars": len(normalized), "marker_count": marker_count}
 
 
@@ -428,6 +899,28 @@ def _first_marker(text: str, markers: tuple[str, ...]) -> str:
         if marker.lower() in normalized:
             return marker
     return ""
+
+
+def _looks_like_single_tool_fragment(text: str) -> bool:
+    tool_count = text.count("toolName:")
+    status_count = text.count("status:")
+    lower = text.lower()
+    has_finish_language = any(
+        marker.lower() in lower
+        for marker in (
+            "任务完成",
+            "构建完成",
+            "验证完成",
+            "completed",
+            "finished",
+            "Todos updated:",
+        )
+    )
+    if tool_count <= 1 and status_count <= 2 and not has_finish_language:
+        return True
+    if "toolName: view_folder" in text and tool_count <= 1:
+        return True
+    return False
 
 
 def _is_preferred_trace(probe: dict) -> bool:

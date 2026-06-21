@@ -1,5 +1,6 @@
 from dataclasses import dataclass
 from typing import Any
+from urllib.parse import parse_qs, urlparse
 
 from sqlalchemy.orm import Session
 
@@ -26,6 +27,8 @@ DEPRECATED_FIELDS = {
 }
 
 DISPLAY_SUFFIXES = ("_configured", "_mask")
+
+FEISHU_WRITE_URL_FIELDS = ("write_url", "bitable_url", "resource_url")
 
 
 @dataclass(frozen=True)
@@ -58,7 +61,10 @@ def save_user_settings(
 
     for category in CATEGORIES:
         merged = _strip_deprecated(category, dict(existing.get(category, {})))
-        for key, value in incoming.get(category, {}).items():
+        incoming_category = dict(incoming.get(category, {}) or {})
+        if category == "feishu":
+            incoming_category = _normalize_feishu_config(incoming_category)
+        for key, value in incoming_category.items():
             if _is_display_field(key) or key in DEPRECATED_FIELDS.get(category, set()):
                 continue
             if key in SECRET_FIELDS.get(category, set()):
@@ -69,6 +75,8 @@ def save_user_settings(
             if key in INTERNAL_FIELDS.get(category, set()) and not allow_internal:
                 continue
             merged[key] = value
+        if category == "feishu":
+            merged = _normalize_feishu_config(merged)
         upsert_user_config(db, user_id, category, merged)
 
 
@@ -110,6 +118,7 @@ def readiness(configs: dict[str, dict[str, Any]]) -> dict[str, Any]:
         ReadinessItem("feishu.app_token", "飞书 Base/App Token", bool(feishu.get("app_token"))),
         ReadinessItem("feishu.table_id", "飞书 Table ID", bool(feishu.get("table_id"))),
         ReadinessItem("worker.worker_id", "关联 Worker", bool(worker.get("worker_id"))),
+        ReadinessItem("worker.trae_exe_path", "Trae 安装路径", bool(worker.get("trae_exe_path"))),
         ReadinessItem("worker.trae_workspace_path", "Trae 工作目录", bool(worker.get("trae_workspace_path"))),
         ReadinessItem("worker.browser_url", "浏览器验收 URL", bool(worker.get("browser_url"))),
         ReadinessItem(
@@ -149,3 +158,50 @@ def _strip_deprecated(category: str, data: dict[str, Any]) -> dict[str, Any]:
 
 def _is_display_field(key: str) -> bool:
     return any(key.endswith(suffix) for suffix in DISPLAY_SUFFIXES)
+
+
+def _normalize_feishu_config(data: dict[str, Any]) -> dict[str, Any]:
+    result = dict(data)
+    write_url = _first_text(result, FEISHU_WRITE_URL_FIELDS)
+    if not write_url:
+        return result
+
+    parsed = _parse_feishu_write_url(write_url)
+    result["write_url"] = write_url
+    result.update(parsed)
+    return result
+
+
+def _first_text(data: dict[str, Any], keys: tuple[str, ...]) -> str:
+    for key in keys:
+        value = data.get(key)
+        if value is None:
+            continue
+        text = str(value).strip()
+        if text:
+            return text
+    return ""
+
+
+def _parse_feishu_write_url(write_url: str) -> dict[str, str]:
+    parsed = urlparse(write_url)
+    parts = [part for part in parsed.path.split("/") if part]
+    result: dict[str, str] = {}
+    if "base" in parts:
+        index = parts.index("base")
+        if len(parts) > index + 1:
+            result["app_token"] = parts[index + 1]
+
+    query = parse_qs(parsed.query)
+    table_id = _first_query_value(query, "table")
+    view_id = _first_query_value(query, "view")
+    if table_id:
+        result["table_id"] = table_id
+    if view_id:
+        result["view_id"] = view_id
+    return result
+
+
+def _first_query_value(query: dict[str, list[str]], key: str) -> str:
+    values = query.get(key) or []
+    return str(values[0]).strip() if values else ""

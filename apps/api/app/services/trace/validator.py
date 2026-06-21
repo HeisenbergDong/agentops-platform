@@ -31,6 +31,14 @@ SERVICE_INTERRUPTION_MARKERS = (
     "failed to generate",
     "something went wrong",
 )
+MANUAL_STOP_MARKERS = (
+    "\u624b\u52a8\u7ec8\u6b62\u8f93\u51fa",
+    "\u5f53\u524d\u4efb\u52a1\u88ab\u624b\u52a8\u4e2d\u65ad",
+    "\u624b\u52a8\u4e2d\u65ad",
+    "manually stopped",
+    "manual stop",
+    "stopped manually",
+)
 FINAL_SUMMARY_MARKERS = (
     "\u6784\u5efa\u5b8c\u6210",
     "\u4fee\u590d\u5b8c\u6210",
@@ -49,6 +57,7 @@ RECOVERABLE_TRACE_REASONS = {
     "empty_trace",
     "trace_too_short",
     "awaiting_continuation",
+    "manual_stopped",
     "service_interrupted",
     "partial_code_copy",
     "final_summary_only",
@@ -64,6 +73,8 @@ def validate_full_trace(text: str) -> dict:
         return {"valid": False, "reason": "final_summary_only"}
     if _needs_continue(normalized):
         return {"valid": False, "reason": "awaiting_continuation"}
+    if _looks_like_manual_stop(normalized):
+        return {"valid": False, "reason": "manual_stopped"}
     if _looks_like_service_interruption(normalized):
         return {"valid": False, "reason": "service_interrupted"}
     if _looks_like_partial_code_copy(normalized):
@@ -78,6 +89,8 @@ def validate_full_trace(text: str) -> dict:
         return {"valid": False, "reason": "missing_tool_trace_markers"}
     if "toolName:" in normalized and "status:" not in normalized:
         return {"valid": False, "reason": "missing_tool_trace_markers"}
+    if _looks_like_single_tool_fragment(normalized):
+        return {"valid": False, "reason": "partial_tool_trace"}
     return {"valid": True, "reason": "ok"}
 
 
@@ -96,6 +109,11 @@ def _needs_continue(text: str) -> bool:
 def _looks_like_service_interruption(text: str) -> bool:
     tail = text[-2400:].lower()
     return any(marker.lower() in tail for marker in SERVICE_INTERRUPTION_MARKERS)
+
+
+def _looks_like_manual_stop(text: str) -> bool:
+    tail = text[-2400:].lower()
+    return any(marker.lower() in tail for marker in MANUAL_STOP_MARKERS)
 
 
 def _looks_like_final_summary_only(text: str) -> bool:
@@ -124,3 +142,24 @@ def _looks_like_partial_code_copy(text: str) -> bool:
         or line.startswith(("<", "</"))
     )
     return fenced or (len(lines) <= 120 and codeish >= max(6, len(lines) // 3))
+
+
+def _looks_like_single_tool_fragment(text: str) -> bool:
+    tool_count = text.count("toolName:")
+    status_count = text.count("status:")
+    has_finish_language = any(
+        marker.lower() in text.lower()
+        for marker in (
+            "任务完成",
+            "构建完成",
+            "验证完成",
+            "completed",
+            "finished",
+            "Todos updated:",
+        )
+    )
+    if tool_count <= 1 and status_count <= 2 and not has_finish_language:
+        return True
+    if "toolName: view_folder" in text and tool_count <= 1:
+        return True
+    return False

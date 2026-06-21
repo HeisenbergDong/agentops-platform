@@ -48,30 +48,50 @@ def test_write_feishu_record_updates_explicit_uid_with_allowed_overwrite(monkeyp
 
 
 def test_write_feishu_record_skips_duplicate_by_prompt_round(monkeypatch):
-    _patch_feishu_dependencies(
-        monkeypatch,
-        records=[
-            {
-                "record_id": "rec-1",
-                "fields": {
-                    "UID": "1",
-                    writer.SESSION_FIELD: "existing-session",
-                    "User Prompt": "订单系统补筛选",
-                    "轮次": "第二轮",
-                    "任务类型": "Bug修复",
-                    "业务领域": "全栈Web应用",
-                },
-            },
-            {
-                "record_id": "rec-2",
-                "fields": {
-                    "UID": "2",
-                    writer.SESSION_FIELD: "",
-                },
-            },
+    calls = []
+    monkeypatch.setattr(writer, "get_feishu_access_token", lambda _config: ("cached-token", None, "tenant"))
+    monkeypatch.setattr(
+        writer,
+        "_list_fields",
+        lambda _token, _app, _table: [
+            {"field_name": writer.SESSION_FIELD},
+            {"field_name": "轮次"},
+            {"field_name": "User Prompt"},
+            {"field_name": "任务类型"},
+            {"field_name": "业务领域"},
         ],
     )
 
+    def fake_request_json(method, url, access_token, params=None, json=None):
+        calls.append((method, url, json))
+        if method == "POST" and url.endswith("/records/search"):
+            conditions = (((json or {}).get("filter") or {}).get("conditions") or [])
+            field_names = [condition.get("field_name") for condition in conditions]
+            if field_names == [writer.SESSION_FIELD]:
+                return {"code": 0, "data": {"items": []}}
+            if field_names == ["User Prompt", "轮次"]:
+                return {
+                    "code": 0,
+                    "data": {
+                        "items": [
+                            {
+                                "record_id": "rec-1",
+                                "fields": {
+                                    "UID": "1",
+                                    writer.SESSION_FIELD: "existing-session",
+                                    "User Prompt": "订单系统补筛选",
+                                    "轮次": "第二轮",
+                                    "任务类型": "Bug修复",
+                                    "业务领域": "全栈Web应用",
+                                },
+                            }
+                        ]
+                    },
+                }
+            return {"code": 0, "data": {"items": [{"record_id": "rec-2", "fields": {"UID": "2", writer.SESSION_FIELD: ""}}]}}
+        raise AssertionError(f"unexpected request: {method} {url}")
+
+    monkeypatch.setattr(writer, "_request_json", fake_request_json)
     result = writer.write_feishu_record(
         {
             "app_token": "app-token",
@@ -90,6 +110,7 @@ def test_write_feishu_record_skips_duplicate_by_prompt_round(monkeypatch):
     assert result["status"] == "skipped_duplicate"
     assert result["record_id"] == "rec-1"
     assert result["duplicate_existing_uid"] == "1"
+    assert len([body for method, url, body in calls if method == "POST" and url.endswith("/records/search")]) >= 3
 
 
 def test_task_type_test_prefix_normalizes_to_allowed_option():
@@ -116,6 +137,7 @@ def test_write_feishu_record_fails_when_required_payload_field_is_missing_from_t
         lambda _token, _app, _table: [
             {"field_name": writer.SESSION_FIELD},
             {"field_name": "User Prompt"},
+            {"field_name": "轮次"},
         ],
     )
 
@@ -148,6 +170,7 @@ def test_write_feishu_record_uses_search_instead_of_listing_all_records(monkeypa
         lambda _token, _app, _table: [
             {"field_name": writer.SESSION_FIELD},
             {"field_name": "User Prompt"},
+            {"field_name": "轮次"},
         ],
     )
 
@@ -167,7 +190,7 @@ def test_write_feishu_record_uses_search_instead_of_listing_all_records(monkeypa
             "table_id": "table-id",
             "token_cache": {"tenant_access_token": "cached-token", "expires_at": 4102444800},
         },
-        {writer.SESSION_FIELD: "session-1", "User Prompt": "prompt"},
+        {writer.SESSION_FIELD: "session-1", "User Prompt": "prompt", "轮次": "第一轮"},
     )
 
     assert result["status"] == "written"
@@ -175,7 +198,8 @@ def test_write_feishu_record_uses_search_instead_of_listing_all_records(monkeypa
     assert not any(method == "GET" and url.endswith("/records") for method, url, _json in calls)
     search_bodies = [body for method, url, body in calls if method == "POST" and url.endswith("/records/search")]
     assert search_bodies
-    assert all(body.get("field_names") == ["UID", writer.SESSION_FIELD] for body in search_bodies)
+    assert search_bodies[0].get("field_names") == ["UID", writer.SESSION_FIELD]
+    assert any(body.get("field_names") == ["UID", writer.SESSION_FIELD, "User Prompt", "轮次", "任务类型", "业务领域"] for body in search_bodies)
 
 
 def test_feishu_error_message_identifies_permission_and_field_mapping():

@@ -67,6 +67,7 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
                 "job_id": job.id,
                 "round_id": round_.id,
                 "round_index": round_.round_index,
+                "open_new_task": _should_open_new_trae_task(round_),
                 "directions": job.directions,
                 "github_remote_url": project_context.get("github_remote_url", ""),
                 "github_repo_name": project_context["project_name"],
@@ -91,9 +92,14 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
             "prompt_chars": len(round_.prompt),
             "project_name": project_context["project_name"],
             "workspace_path": project_context["workspace_path"],
+            "open_new_task": _should_open_new_trae_task(round_),
         },
     )
     return command
+
+
+def _should_open_new_trae_task(round_: TaskRound) -> bool:
+    return int(round_.round_index or 1) <= 1
 
 
 def ensure_round_project_context(

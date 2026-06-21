@@ -10,8 +10,11 @@ class FeishuDiscoveryError(RuntimeError):
     pass
 
 
-def discover_feishu_resources(feishu_config: dict[str, Any]) -> dict[str, Any]:
-    access_token, refreshed_cache, auth_mode = get_feishu_access_token(feishu_config)
+def discover_feishu_resources(feishu_config: dict[str, Any], *, require_user_oauth: bool = False) -> dict[str, Any]:
+    access_token, refreshed_cache, auth_mode = get_feishu_access_token(
+        feishu_config,
+        require_user_oauth=require_user_oauth,
+    )
     app_token = str(feishu_config.get("app_token") or "").strip()
     table_id = str(feishu_config.get("table_id") or "").strip()
 
@@ -21,6 +24,7 @@ def discover_feishu_resources(feishu_config: dict[str, Any]) -> dict[str, Any]:
         "views": [],
         "fields": [],
         "auth_mode": auth_mode,
+        "message": "飞书用户授权已验证，资源信息已更新。" if auth_mode == "user_oauth" else "飞书应用授权已验证，资源信息已更新。",
     }
     if app_token:
         resources["tables"] = _get_items(

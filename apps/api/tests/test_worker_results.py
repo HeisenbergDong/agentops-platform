@@ -14,10 +14,14 @@ from app.services.orchestrator.worker_results import handle_worker_result
 from app.services import webhook_notifier
 from app.worker_gateway.contracts import WorkerCommandType, WorkerResult
 
-VALID_TRAE_SESSION_ID = "41867a07a0b34471bd185ecc93ebf73b"
+VALID_TRAE_CHAT_SESSION_ID = "41867a07a0b34471bd185ecc93ebf73b"
 VALID_TRAE_USER_MESSAGE_ID = "6a26227be4db5ceccde3e54e"
 VALID_TRAE_TASK_ID = "7a26227be4db5ceccde3e54f"
 VALID_TRAE_TRACE_ID = "8f0bce1835c9654e637c14de711bd35b"
+VALID_TRAE_SESSION_ID = (
+    f".696467687743947:{VALID_TRAE_TRACE_ID}_{VALID_TRAE_CHAT_SESSION_ID}."
+    f"{VALID_TRAE_TASK_ID}.{VALID_TRAE_USER_MESSAGE_ID}:Trae CN.T(2026/6/8 10:03:01)"
+)
 
 
 def test_send_prompt_success_advances_job_to_waiting_trae():
@@ -44,7 +48,12 @@ def test_send_prompt_success_advances_job_to_waiting_trae():
     assert logs[0].display_message == "Worker 已把提示词输入 Trae CN 并发送。"
 
 
-def test_send_prompt_unconfirmed_result_marks_manual_required():
+def test_round_label_does_not_cap_at_fifth_round():
+    assert worker_results._round_label(5) == "第五轮"
+    assert worker_results._round_label(6) == "第6轮"
+
+
+def test_send_prompt_unconfirmed_result_queues_visual_diagnosis():
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
 
@@ -69,18 +78,150 @@ def test_send_prompt_unconfirmed_result_marks_manual_required():
     db.refresh(job)
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value))
+    diagnose_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert next_command is None
+    assert diagnose_command is not None
+    assert diagnose_command.payload["task"] == "find_prompt_input_and_send_button"
+    assert diagnose_command.payload["previous_command_type"] == WorkerCommandType.SEND_PROMPT.value
+    assert diagnose_command.payload["resume_previous_payload"]["send_prompt_visual_recovery_attempts"] == 1
+    assert diagnose_command.payload["resume_previous_payload"]["verify_visual_submission"] is True
+    assert diagnose_command.payload["resume_previous_payload"]["strict_submission_verification"] is True
+    assert db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED)) is None
+
+
+def test_send_prompt_visual_diagnosis_retries_prompt_when_not_submitted():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.SEND_PROMPT.value,
+        "resume_previous_payload": {
+            "prompt": "demo prompt",
+            "send_prompt_visual_recovery_attempts": 1,
+            "max_send_prompt_visual_recovery_attempts": 3,
+        },
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "idle_or_running",
+                "visual": {
+                    "status": "prompt_ready",
+                    "ai_analysis": {
+                        "screen_state": "prompt_still_in_composer",
+                        "recommended_action": "do_not_click",
+                        "risk": "safe",
+                    },
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = _latest_command(db, WorkerCommandType.SEND_PROMPT)
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert next_command.id != command.id
+    assert next_command.payload["prompt"] == "demo prompt"
+    assert next_command.payload["send_prompt_visual_recovery_attempts"] == 1
+
+
+def test_send_prompt_visual_diagnosis_waits_when_prompt_submitted():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.SEND_PROMPT.value,
+        "resume_previous_payload": {
+            "prompt": "demo prompt",
+            "sent_at_epoch": 12345.0,
+            "send_prompt_visual_recovery_attempts": 1,
+            "max_send_prompt_visual_recovery_attempts": 3,
+        },
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "idle_or_running",
+                "visual": {
+                    "status": "prompt_submitted",
+                    "ai_analysis": {
+                        "screen_state": "prompt_submitted",
+                        "recommended_action": "wait",
+                        "risk": "safe",
+                    },
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    wait_command = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert wait_command.payload["sent_at_epoch"] == 12345.0
+
+
+def test_send_prompt_visual_diagnosis_blocks_destructive_manual_state():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.SEND_PROMPT.value,
+        "resume_previous_payload": {"prompt": "demo prompt"},
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "awaiting_delete_confirmation",
+                "suggested_intervention": {
+                    "mode": "manual-required",
+                    "risk": "blocked",
+                    "manual_message": "Delete confirmation is visible.",
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
     log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED))
     assert job.status == JobState.MANUAL_REQUIRED
     assert round_.status == JobState.MANUAL_REQUIRED
-    assert next_command is None
     assert log is not None
-    assert log.extra["unconfirmed_reason"] == "Prompt was pasted/submitted, but no new Trae user turn was detected."
+    assert "Delete confirmation" in log.message
 
 
 def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
     round_.round_index = 2
+    job.daily_target = 5
     job.submitted_count = 4
     job.satisfied_count = 0
     command.payload = {
@@ -195,11 +336,12 @@ def test_full_worker_result_failure_path_generates_reason_after_trace_gate(tmp_p
     db.refresh(job)
     db.refresh(round_)
     reason = _latest_dissatisfaction_reason(db)
+    evidence = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "product_review_issue_evidence"))
     assert job.status == JobState.BROWSER_ACCEPTING
     assert round_.status == JobState.BROWSER_ACCEPTING
-    assert reason is not None
-    assert "src/app.ts:10 build failed" in reason.extra["reason"]
-    assert reason.extra["evidence_summary"]["trace_chars"] > 0
+    assert reason is None
+    assert evidence is not None
+    assert "src/app.ts:10 build failed" in str(evidence.extra)
     assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value)) is not None
 
 
@@ -228,9 +370,11 @@ def test_run_command_failure_reason_includes_structured_diagnostics(tmp_path):
     )
 
     reason = _latest_dissatisfaction_reason(db)
-    assert reason is not None
-    assert "src/App.tsx:12" in reason.extra["reason"]
-    assert "type_error" in reason.extra["reason"]
+    evidence = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "product_review_issue_evidence"))
+    assert reason is None
+    assert evidence is not None
+    assert "src/App.tsx" in str(evidence.extra)
+    assert "type_error" in str(evidence.extra)
 
 
 def test_wait_completion_success_queues_trace_copy():
@@ -386,7 +530,7 @@ def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
     assert job.status == JobState.COLLECTING_TRACE
     assert round_.status == JobState.COLLECTING_TRACE
     assert copy_command is not None
-    assert copy_command.payload["allow_local_trace_fallback"] is True
+    assert copy_command.payload["allow_local_trace_fallback"] is False
     assert copy_command.payload["completion_observation"]["supervisor_decision"]["action"] == "collect_trace"
     assert click_command is None
 
@@ -478,9 +622,58 @@ def test_stop_current_task_result_logs_structured_stop_confirmation():
     log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.PAUSED).order_by(RuntimeLog.created_at.desc()).limit(1))
 
     assert log is not None
-    assert log.message == "Worker received the stop command and confirmed there was no matching local activity to clean."
+    assert log.message == "Worker 已确认停止：没有发现仍需清理的本地动作。"
     assert log.extra["stop_report_summary"]["stop_confirmed"] is True
     assert log.extra["stop_report_summary"]["cleanup_status"] == "no_matching_processes"
+
+
+def test_cancelled_active_command_with_stop_report_logs_stop_confirmation():
+    db = _test_session()
+    job = Job(id="job1", user_id="user1", status=JobState.PAUSED, directions=["demo"])
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.PAUSED)
+    command = WorkerCommand(
+        id="wait1",
+        worker_id="worker1",
+        user_id="user1",
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"reason": "user_stop"},
+        status="cancelled",
+    )
+    db.add_all([job, round_, command])
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="cancelled",
+            data={
+                "stopped": True,
+                "stop_report": {
+                    "stop_confirmed": True,
+                    "trae_stop_clicked": True,
+                    "trae_ui_stopped_verified": True,
+                    "cleanup_status": "no_matching_processes",
+                    "local_processes_matched": 0,
+                    "local_processes_killed": 0,
+                    "local_process_kill_errors": 0,
+                },
+            },
+        ),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.PAUSED).order_by(RuntimeLog.created_at.desc()).limit(1))
+
+    db.refresh(command)
+    assert log is not None
+    assert command.status == "completed"
+    assert log.message == "Worker 已停止本机动作，并确认 Trae 生成已停止。"
+    assert log.extra["stop_report_summary"]["stop_confirmed"] is True
+    assert log.extra["stop_report_summary"]["trae_stop_clicked"] is True
 
 
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):
@@ -512,6 +705,37 @@ def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatc
     assert next_command.status == "queued"
 
 
+def test_copy_latest_reply_rejects_local_raw_log_trace(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    trace = (
+        f"Trae raw execution trace for session {VALID_TRAE_CHAT_SESSION_ID}, user message {VALID_TRAE_USER_MESSAGE_ID}.\n"
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: pytest\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+    monkeypatch.setattr(worker_results.settings, "attachment_root", tmp_path / "storage")
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"raw_text": trace, "trae_turn": _valid_trae_turn()},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    screenshot_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CAPTURE_SCREENSHOT.value))
+    assert job.status == JobState.TRACE_MISSING_ABORT
+    assert round_.status == JobState.TRACE_MISSING_ABORT
+    assert round_.trace_status == "local_trace_not_business_trace"
+    assert screenshot_command is None
+    assert db.scalar(select(Attachment).where(Attachment.kind == "trace")) is None
+
+
 def test_copy_latest_reply_does_not_store_uncompleted_trae_turn(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
@@ -531,13 +755,57 @@ def test_copy_latest_reply_does_not_store_uncompleted_trae_turn(monkeypatch, tmp
 
     db.refresh(job)
     db.refresh(round_)
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
     assert job.status == JobState.AWAITING_CONTINUE
     assert round_.status == JobState.AWAITING_CONTINUE
     assert round_.trace_status == "trae_turn_not_completed:interrupted"
     assert round_.trae_session_id == ""
     assert next_command is not None
     assert next_command.status == "queued"
+    assert next_command.payload["previous_command_type"] == WorkerCommandType.COPY_LATEST_REPLY.value
+
+
+def test_copy_latest_reply_accepts_valid_copy_when_turn_probe_is_interrupted(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    trace = _valid_trace()
+    monkeypatch.setattr(worker_results.settings, "attachment_root", tmp_path / "storage")
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": trace,
+                "trace_probe": {"complete_like": True, "reason": "ok", "chars": len(trace)},
+                "current_turn_gate": {
+                    "passed": False,
+                    "reason": "trae_turn_not_completed:interrupted",
+                    "recoverable": True,
+                    "candidate": {**_valid_trae_turn(), "turn_status": "interrupted"},
+                },
+                "trae_turn": {
+                    "status": "missing",
+                    "reason": "trae_turn_not_completed:interrupted",
+                    "candidate": {**_valid_trae_turn(), "turn_status": "interrupted"},
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CAPTURE_SCREENSHOT.value))
+    trace_attachment = db.scalar(select(Attachment).where(Attachment.kind == "trace"))
+    assert job.status == JobState.SCREENSHOT_CAPTURING
+    assert round_.status == JobState.SCREENSHOT_CAPTURING
+    assert round_.trace_status == "valid"
+    assert round_.trae_session_id == VALID_TRAE_SESSION_ID
+    assert next_command is not None
+    assert trace_attachment is not None
 
 
 def test_copy_latest_reply_rejects_context_mismatched_old_turn(monkeypatch, tmp_path):
@@ -592,14 +860,47 @@ def test_copy_latest_reply_service_interruption_queues_continue_recovery():
 
     db.refresh(job)
     db.refresh(round_)
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
     assert job.status == JobState.AWAITING_CONTINUE
     assert round_.status == JobState.AWAITING_CONTINUE
     assert round_.trace_status == "service_interrupted"
     assert next_command is not None
+    assert next_command.payload["previous_command_type"] == WorkerCommandType.COPY_LATEST_REPLY.value
+    assert next_command.payload["trace_recovery_diagnosis_attempts"] == 1
 
 
-def test_copy_latest_reply_recoverable_current_turn_gate_queues_continue(tmp_path, monkeypatch):
+def test_copy_latest_reply_manual_stop_marks_manual_required():
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "raw_text": "当前任务被手动中断\n手动终止输出",
+                "trace_probe": {"complete_like": False, "reason": "manual_stopped"},
+                "trae_turn": _valid_trae_turn(),
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
+    error = db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required"))
+    assert job.status == JobState.MANUAL_REQUIRED
+    assert round_.status == JobState.MANUAL_REQUIRED
+    assert round_.trace_status == "manual_stopped"
+    assert next_command is None
+    assert error is not None
+    assert error.details["recovery_reason"] == "manual_stopped"
+
+
+def test_copy_latest_reply_recoverable_current_turn_gate_queues_visual_diagnosis(tmp_path, monkeypatch):
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
     trace = _valid_trace()
@@ -632,11 +933,13 @@ def test_copy_latest_reply_recoverable_current_turn_gate_queues_continue(tmp_pat
 
     db.refresh(job)
     db.refresh(round_)
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
     assert job.status == JobState.AWAITING_CONTINUE
     assert round_.status == JobState.AWAITING_CONTINUE
     assert round_.trace_status == "awaiting_current_continuation"
     assert next_command is not None
+    assert next_command.payload["previous_command_type"] == WorkerCommandType.COPY_LATEST_REPLY.value
+    assert next_command.payload["trace_recovery_diagnosis_attempts"] == 1
     recovery_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.AWAITING_CONTINUE).limit(1))
     assert recovery_log is not None
     assert recovery_log.extra["data"]["supervisor_decision"]["action"] == "continue_output"
@@ -870,11 +1173,13 @@ def test_scan_project_without_commands_continues_after_static_review_issues():
     db.refresh(round_)
     browser_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value))
     reason = _latest_dissatisfaction_reason(db)
+    evidence = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "product_review_issue_evidence"))
     assert job.status == JobState.BROWSER_ACCEPTING
     assert round_.status == JobState.BROWSER_ACCEPTING
     assert browser_command is not None
-    assert reason is not None
-    assert "函数体为空" in reason.extra["reason"]
+    assert reason is None
+    assert evidence is not None
+    assert "函数体为空" in str(evidence.extra)
 
 
 def test_run_command_success_advances_to_browser_accepting():
@@ -921,11 +1226,13 @@ def test_run_command_success_with_static_review_issues_continues_to_browser_acce
     db.refresh(round_)
     browser_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value))
     reason = _latest_dissatisfaction_reason(db)
+    evidence = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "product_review_issue_evidence"))
     assert job.status == JobState.BROWSER_ACCEPTING
     assert round_.status == JobState.BROWSER_ACCEPTING
     assert browser_command is not None
-    assert reason is not None
-    assert "事件绑定为空" in reason.extra["reason"]
+    assert reason is None
+    assert evidence is not None
+    assert "事件绑定为空" in str(evidence.extra)
 
 
 def test_run_command_failure_generates_reason_and_continues_to_browser_acceptance():
@@ -949,10 +1256,10 @@ def test_run_command_failure_generates_reason_and_continues_to_browser_acceptanc
     assert round_.status == JobState.BROWSER_ACCEPTING
     assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.BROWSER_ACCEPTANCE.value)) is not None
     reason = _latest_dissatisfaction_reason(db)
-    assert reason is not None
-    assert "产物不满意：" in reason.extra["reason"]
-    assert "过程不满意：" in reason.extra["reason"]
-    assert "build failed" in reason.extra["reason"]
+    evidence = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "product_review_issue_evidence"))
+    assert reason is None
+    assert evidence is not None
+    assert "build failed" in str(evidence.extra)
 
 
 def test_browser_acceptance_success_advances_to_github_submitting_after_first_round():
@@ -981,6 +1288,38 @@ def test_browser_acceptance_success_advances_to_github_submitting_after_first_ro
     assert next_command is not None
     assert next_command.status == "queued"
     assert next_command.payload["commit_message"].startswith("AgentOps: demo")
+
+
+def test_browser_acceptance_pass_after_product_review_issue_generates_single_final_reason():
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    round_.round_index = 2
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage="product_review_issue_evidence",
+            message="Product review build/test command failed.",
+            level="warning",
+            extra={"data": {"data": {"returncode": 1, "stderr": "build failed"}}},
+        )
+    )
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"status": "passed"}),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    reasons = list(db.scalars(select(RuntimeLog).where(RuntimeLog.stage == "dissatisfaction_reason")).all())
+    assert job.status == JobState.GITHUB_SUBMITTING
+    assert round_.status == JobState.GITHUB_SUBMITTING
+    assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value)) is not None
+    assert len(reasons) == 1
+    assert "build failed" in reasons[0].extra["reason"]
 
 
 def test_first_round_satisfied_is_discarded_without_github_submission():
@@ -1074,7 +1413,7 @@ def test_browser_acceptance_blocks_without_real_trae_session():
     assert next_command is None
 
 
-def test_browser_acceptance_recovers_real_trae_session_from_trace_attachment():
+def test_browser_acceptance_does_not_recover_session_from_trace_attachment():
     db = _test_session()
     job, round_, command = _create_browser_acceptance_rows(db)
     round_.trae_session_id = ""
@@ -1094,16 +1433,16 @@ def test_browser_acceptance_recovers_real_trae_session_from_trace_attachment():
     db.refresh(job)
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
-    assert job.status == JobState.GITHUB_SUBMITTING
-    assert round_.status == JobState.GITHUB_SUBMITTING
-    assert round_.trae_session_id == VALID_TRAE_SESSION_ID
+    assert job.status == "session_missing_abort"
+    assert round_.status == "session_missing_abort"
+    assert round_.trae_session_id == ""
     assert round_.trae_user_message_id == VALID_TRAE_USER_MESSAGE_ID
     assert round_.trae_task_id == VALID_TRAE_TASK_ID
     assert round_.trae_trace_id == VALID_TRAE_TRACE_ID
-    assert next_command is not None
+    assert next_command is None
 
 
-def test_test_browser_acceptance_allows_valid_trace_without_session_id():
+def test_test_browser_acceptance_stops_without_session_id():
     db = _test_session()
     job, round_, command = _create_browser_acceptance_rows(db)
     job.intent = {"run_mode": "test", "downstream_policy": "test_chain_allowed", "trace_gate_policy": "test_exception"}
@@ -1127,13 +1466,13 @@ def test_test_browser_acceptance_allows_valid_trace_without_session_id():
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
     log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "session_missing_test_exception"))
-    assert job.status == JobState.GITHUB_SUBMITTING
-    assert round_.status == JobState.GITHUB_SUBMITTING
-    assert next_command is not None
-    assert log is not None
+    assert job.status == "session_missing_abort"
+    assert round_.status == "session_missing_abort"
+    assert next_command is None
+    assert log is None
 
 
-def test_test_browser_acceptance_recovers_session_from_test_trace_exception():
+def test_test_browser_acceptance_does_not_recover_session_from_test_trace_exception():
     db = _test_session()
     job, round_, command = _create_browser_acceptance_rows(db)
     job.intent = {"run_mode": "test", "downstream_policy": "test_chain_allowed", "trace_gate_policy": "test_exception"}
@@ -1163,13 +1502,13 @@ def test_test_browser_acceptance_recovers_session_from_test_trace_exception():
     db.refresh(job)
     db.refresh(round_)
     next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
-    assert job.status == JobState.GITHUB_SUBMITTING
-    assert round_.status == JobState.GITHUB_SUBMITTING
-    assert round_.trae_session_id == VALID_TRAE_SESSION_ID
-    assert round_.trae_user_message_id == VALID_TRAE_USER_MESSAGE_ID
-    assert round_.trae_task_id == VALID_TRAE_TASK_ID
-    assert round_.trae_trace_id == VALID_TRAE_TRACE_ID
-    assert next_command is not None
+    assert job.status == "session_missing_abort"
+    assert round_.status == "session_missing_abort"
+    assert round_.trae_session_id == ""
+    assert round_.trae_user_message_id == ""
+    assert round_.trae_task_id == ""
+    assert round_.trae_trace_id == ""
+    assert next_command is None
 
 
 def test_browser_acceptance_missing_url_generates_reason_and_continues_to_github():
@@ -1254,6 +1593,7 @@ def test_git_submit_success_advances_to_feishu_preparing():
 def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)
+    job.daily_target = 5
     job.submitted_count = 4
     job.satisfied_count = 0
     _create_feishu_config(db, job.user_id)
@@ -1454,8 +1794,8 @@ def test_daily_target_stops_after_feishu_success(monkeypatch, tmp_path):
 def test_max_round_stops_when_result_remains_unsatisfied(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)
-    round_.round_index = 5
-    job.submitted_count = 4
+    round_.round_index = 50
+    job.submitted_count = 49
     _create_feishu_config(db, job.user_id)
     _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
     db.add(
@@ -1498,7 +1838,8 @@ def test_completed_project_advances_to_next_direction(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)
     job.directions = ["first direction", "second direction"]
-    job.submitted_count = 4
+    round_.round_index = 50
+    job.submitted_count = 49
     job.satisfied_count = 0
     project = Project(
         id="project1",
@@ -1539,6 +1880,58 @@ def test_completed_project_advances_to_next_direction(monkeypatch, tmp_path):
     assert project.status == "completed"
     assert next_round is not None
     assert next_round.project_id is None
+
+
+def test_completed_project_can_append_synthetic_direction_when_policy_allows(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    job.daily_target = 100
+    job.submitted_count = 49
+    job.satisfied_count = 0
+    job.intent = {
+        "range_plan": {
+            "synthetic_range_policy": {
+                "allowed": True,
+                "examples": ["运营复盘中心"],
+            },
+            "ranges": [
+                {
+                    "range_id": "r1",
+                    "title": "demo",
+                    "source_text": "demo",
+                    "target_rounds": 50,
+                }
+            ],
+        }
+    }
+    round_.round_index = 50
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    db.commit()
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id, TaskRound.round_index == 1)
+        .limit(1)
+    )
+    db.refresh(job)
+    assert job.status == JobState.GENERATING_PROMPT
+    assert len(job.directions) == 1
+    assert job.directions[0].startswith("运营复盘中心：")
+    assert job.intent["range_plan"]["ranges"][-1]["source_text"] == job.directions[0]
+    assert next_round is not None
 
 
 def test_git_submit_feishu_payload_uses_trace_overflow_attachment(monkeypatch, tmp_path):
@@ -1719,7 +2112,7 @@ def test_capture_screenshot_failure_marks_manual_required():
     assert round_.status == JobState.MANUAL_REQUIRED
 
 
-def test_copy_latest_reply_incomplete_trace_retries_copy_before_recovery():
+def test_copy_latest_reply_incomplete_trace_queues_visual_diagnosis_before_retry():
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
 
@@ -1731,22 +2124,26 @@ def test_copy_latest_reply_incomplete_trace_retries_copy_before_recovery():
 
     db.refresh(job)
     db.refresh(round_)
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value).where(WorkerCommand.id != command.id))
-    assert job.status == JobState.COLLECTING_TRACE
-    assert round_.status == JobState.COLLECTING_TRACE
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
     assert round_.trace_status == "trace_too_short"
     assert next_command is not None
     assert next_command.status == "queued"
-    assert next_command.payload["trace_copy_attempts"] == 1
-    assert next_command.payload["max_trace_copy_attempts"] == worker_results.DEFAULT_MAX_TRACE_COPY_ATTEMPTS
+    assert next_command.payload["task"] == "find_reply_action_button"
+    assert next_command.payload["previous_command_type"] == WorkerCommandType.COPY_LATEST_REPLY.value
+    assert next_command.payload["resume_previous_payload"]["trace_copy_attempts"] == 0
+    assert next_command.payload["trace_recovery_diagnosis_attempts"] == 1
     recovery_log = db.scalar(
         select(RuntimeLog)
-        .where(RuntimeLog.stage == JobState.COLLECTING_TRACE)
+        .where(RuntimeLog.stage == JobState.AWAITING_CONTINUE)
         .order_by(RuntimeLog.created_at)
         .limit(1)
     )
     assert recovery_log is not None
     assert recovery_log.level == "info"
+    assert recovery_log.extra["trace_recovery_diagnosis_attempts"] == 1
+    return
     assert "先重试滚底和复制" in recovery_log.display_message
     assert "人工处理" not in recovery_log.display_message
 
@@ -1796,6 +2193,8 @@ def test_completed_trace_copy_failure_stops_without_continue_after_max_copy_atte
     command.payload = {
         "trace_copy_attempts": 5,
         "max_trace_copy_attempts": 5,
+        "trace_recovery_diagnosis_attempts": 2,
+        "max_trace_recovery_diagnosis_attempts": 2,
         "completion_observation": {
             "supervisor_decision": {"action": "collect_trace", "reason": "visual_completion_detected"}
         },
@@ -1834,6 +2233,8 @@ def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypa
     command.payload = {
         "trace_copy_attempts": 5,
         "max_trace_copy_attempts": 5,
+        "trace_recovery_diagnosis_attempts": 2,
+        "max_trace_recovery_diagnosis_attempts": 2,
         "completion_observation": {
             "supervisor_decision": {"action": "collect_trace", "reason": "visual_completion_detected"}
         },
@@ -1871,7 +2272,7 @@ def test_test_mode_completed_trace_copy_failure_continues_to_screenshot(monkeypa
     assert click_command is None
     assert trace is None
     assert exception_attachment is not None
-    assert VALID_TRAE_SESSION_ID in Path(exception_attachment.path).read_text(encoding="utf-8")
+    assert VALID_TRAE_CHAT_SESSION_ID in Path(exception_attachment.path).read_text(encoding="utf-8")
 
 
 def test_incomplete_trace_stops_after_copy_and_continue_limits():
@@ -1880,6 +2281,8 @@ def test_incomplete_trace_stops_after_copy_and_continue_limits():
     command.payload = {
         "trace_copy_attempts": 5,
         "max_trace_copy_attempts": 5,
+        "trace_recovery_diagnosis_attempts": 2,
+        "max_trace_recovery_diagnosis_attempts": 2,
         "continue_attempts": 2,
         "max_continue_attempts": 2,
     }
@@ -2035,7 +2438,31 @@ def test_feishu_payload_keeps_standard_task_type_in_test_mode(tmp_path):
     assert fields["日志轨迹"] == "full trae trace"
 
 
-def test_feishu_payload_allows_test_trace_exception_in_test_mode(tmp_path):
+def test_feishu_task_type_fresh_start_first_round_overrides_feature_keywords(tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    job.intent = {"start_mode": "fresh_start", "run_mode": "normal"}
+    job.directions = ["新增 feature 迭代一个招聘平台"]
+    round_.prompt = "请新增模块，方便后续继续迭代"
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+
+    fields = worker_results._prepare_feishu_fields(
+        db,
+        job,
+        round_,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123"},
+        ),
+    )
+
+    assert fields["任务类型"] == "0-1代码生成"
+
+
+def test_feishu_payload_refuses_test_trace_exception_in_test_mode(tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)
     job.intent = {
@@ -2053,27 +2480,22 @@ def test_feishu_payload_allows_test_trace_exception_in_test_mode(tmp_path):
     db.commit()
     _create_test_trace_exception_attachment(db, job, round_, _valid_trace_with_ids())
 
-    fields = worker_results._prepare_feishu_fields(
-        db,
-        job,
-        round_,
-        command,
-        WorkerResult(
-            command_id=command.id,
-            worker_id=command.worker_id,
-            status="success",
-            data={"status": "pushed", "commit_sha": "abc123"},
-        ),
-    )
-
-    assert fields["任务类型"] == "0-1代码生成"
-    assert fields["Trae Session ID"] == VALID_TRAE_SESSION_ID
-    assert "TEST MODE TRACE EXCEPTION" in fields["日志轨迹"]
-    assert VALID_TRAE_SESSION_ID in fields["日志轨迹"]
-    assert "测试说明" in fields["不满意原因"]
+    with pytest.raises(worker_results.FeishuWriteError, match="Verified Trae assistant trace is missing"):
+        worker_results._prepare_feishu_fields(
+            db,
+            job,
+            round_,
+            command,
+            WorkerResult(
+                command_id=command.id,
+                worker_id=command.worker_id,
+                status="success",
+                data={"status": "pushed", "commit_sha": "abc123"},
+            ),
+        )
 
 
-def test_send_prompt_manual_required_marks_job_manual_required():
+def test_send_prompt_manual_required_queues_visual_diagnosis():
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
 
@@ -2090,19 +2512,19 @@ def test_send_prompt_manual_required_marks_job_manual_required():
 
     db.refresh(job)
     db.refresh(round_)
-    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED))
-    assert job.status == JobState.MANUAL_REQUIRED
-    assert round_.status == JobState.MANUAL_REQUIRED
-    assert log is not None
-    assert log.level == "warning"
-    error = db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required"))
-    assert error is not None
-    assert error.details["error"] == "Trae window was not found"
+    diagnose_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.DIAGNOSE_UI.value))
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert diagnose_command is not None
+    assert diagnose_command.payload["task"] == "find_prompt_input_and_send_button"
+    assert diagnose_command.payload["previous_command_type"] == WorkerCommandType.SEND_PROMPT.value
+    assert diagnose_command.payload["resume_previous_payload"]["send_prompt_visual_recovery_attempts"] == 1
+    assert db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required")) is None
 
 
 def test_manual_required_sends_webhook_notification(monkeypatch):
     db = _test_session()
-    job, _round, command = _create_send_prompt_rows(db)
+    job, _round, command = _create_capture_screenshot_rows(db)
     db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/webhook/test"}))
     db.commit()
     sent = {}
@@ -2126,9 +2548,9 @@ def test_manual_required_sends_webhook_notification(monkeypatch):
         WorkerResult(
             command_id=command.id,
             worker_id=command.worker_id,
-            status="manual_required",
-            error="Trae input not found",
-            data={"manual_hint": "check Trae composer"},
+            status="failed",
+            error="Trae screenshot failed",
+            data={"quality": {"ok": False}, "manual_hint": "check Trae screenshot"},
         ),
     )
 
@@ -2136,9 +2558,88 @@ def test_manual_required_sends_webhook_notification(monkeypatch):
     assert sent["url"] == "https://open.feishu.cn/webhook/test"
     assert sent["json"]["msg_type"] == "text"
     assert "AgentOps" in sent["json"]["content"]["text"]
-    assert "check Trae composer" in sent["json"]["content"]["text"]
+    assert "Trae screenshot failed" in sent["json"]["content"]["text"]
     assert log is not None
     assert log.level == "info"
+
+
+def test_flow_webhook_uses_title_reason_payload(monkeypatch):
+    sent = {}
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+
+        class Response:
+            status_code = 200
+            text = "ok"
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    result = webhook_notifier.notify_text(
+        {"url": "https://www.feishu.cn/flow/api/trigger-webhook/e8f6721fe9d87fc64b6f7e395847f03d"},
+        "AgentOps 飞书写入失败，需要处理\n原因: HTTP 403",
+    )
+
+    assert result["method"] == "flow_webhook"
+    assert sent["json"] == {"title": "AgentOps 飞书写入失败，需要处理", "reason": "原因: HTTP 403"}
+
+
+def test_feishu_failure_sends_flow_webhook_notification(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    db.add(
+        UserConfig(
+            user_id=job.user_id,
+            category="webhook",
+            data={"url": "https://www.feishu.cn/flow/api/trigger-webhook/e8f6721fe9d87fc64b6f7e395847f03d"},
+        )
+    )
+    db.commit()
+    sent = {}
+
+    def fail_write(_feishu_config, _fields):
+        raise worker_results.FeishuWriteError(
+            "HTTP 403: Feishu permission denied: code=91403, msg=Forbidden.",
+            status_code=403,
+            code=91403,
+            operation="list_fields",
+        )
+
+    def fake_post(url, json, timeout):
+        sent["url"] = url
+        sent["json"] = json
+
+        class Response:
+            status_code = 200
+            text = "ok"
+
+        return Response()
+
+    monkeypatch.setattr(worker_results, "write_feishu_record", fail_write)
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "feishu_failure_notification"))
+    assert sent["json"]["title"] == "AgentOps 飞书写入失败，需要处理"
+    assert "HTTP 403" in sent["json"]["reason"]
+    assert "list_fields" in sent["json"]["reason"]
+    assert log is not None
+    assert log.extra["method"] == "flow_webhook"
 
 
 def test_late_worker_result_after_stop_is_ignored():
@@ -2538,7 +3039,7 @@ def _valid_trace() -> str:
 def _valid_trace_with_ids() -> str:
     return (
         _valid_trace()
-        + f'\nsession_id={VALID_TRAE_SESSION_ID} task_id={VALID_TRAE_TASK_ID} '
+        + f'\nsession_id={VALID_TRAE_CHAT_SESSION_ID} task_id={VALID_TRAE_TASK_ID} '
         + f'message_id={VALID_TRAE_USER_MESSAGE_ID} trace_id="{VALID_TRAE_TRACE_ID}"\n'
     )
 
@@ -2546,7 +3047,12 @@ def _valid_trace_with_ids() -> str:
 def _valid_trae_turn() -> dict:
     return {
         "status": "found",
-        "session_id": VALID_TRAE_SESSION_ID,
+        "session_id": VALID_TRAE_CHAT_SESSION_ID,
+        "chat_session_id": VALID_TRAE_CHAT_SESSION_ID,
+        "display_session_id": VALID_TRAE_SESSION_ID,
+        "trace_ids": [VALID_TRAE_TRACE_ID],
+        "task_ids": [VALID_TRAE_TASK_ID],
+        "end_time": "2026-06-08T10:03:01+08:00",
         "user_message_id": VALID_TRAE_USER_MESSAGE_ID,
         "task_id": VALID_TRAE_TASK_ID,
         "trace_id": VALID_TRAE_TRACE_ID,

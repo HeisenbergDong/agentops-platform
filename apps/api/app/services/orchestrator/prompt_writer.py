@@ -35,6 +35,10 @@ FORBIDDEN_PROMPT_PHRASES = (
     "AgentOps 自动作业",
     "AgentOps自动作业",
     "平台侧 LLM",
+    "工具调用",
+    "watcher",
+    "LLM",
+    "AI 判断",
 )
 REUSED_PROMPT_PATTERNS = (
     "先修上一轮验收里暴露的问题",
@@ -47,28 +51,38 @@ FORBIDDEN_PROMPT_REGEXES = (
     re.compile(r"你现在.{0,12}trae\s*cn", re.IGNORECASE),
     re.compile(r"\btrae\s*cn\b", re.IGNORECASE),
     re.compile(r"调度(角色|器|流程)|平台侧|自动作业流程"),
-    re.compile(r"关键证据|验收证据|不满意原因|产物不满意|过程不满意"),
+    re.compile(r"关键证据|验收证据|不满意原因|产物不满意|过程不满意|结果不满意"),
+    re.compile(r"(日志|轨迹|扫描|工具调用|watcher|trace|session)", re.IGNORECASE),
 )
 FIRST_ROUND_TEMPLATE_PREFIXES = (
     "按这个项目方向做一个能继续迭代的系统雏形",
     "基于这个项目方向做一个能继续迭代的系统雏形",
 )
+PROMPT_WRITER_RETRY_LIMIT = 1
 PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。你不能直接写飞书，不能决定作业完成，只负责给编码助手的本轮或下一轮用户提示词提案。
 要求：
-1. 必须基于输入的完整作业状态、当前项目、轮次、上一轮真实不满意原因、已用提示词来写。
-2. 不能复读上一轮提示词，不能套娃式重复“把 XX 里这条不好用的路径修顺”。
-3. 不能在提示词里出现“产物不满意”“过程不满意”“不满意原因”“证据：”。
-4. 提示词要像真实用户给开发助手的需求：明确现象、期望结果、复查路径。
-5. 如果上一轮问题是证据不足或日志缺失，不要让编码助手修“日志轨迹/飞书/GitHub”，而要回到当前业务系统的可验证交互或工程交付。
-只输出 JSON：{"prompt": "...", "prompt_kind": "bugfix|feature", "focus": "...", "acceptance_checks": ["..."], "difference_from_previous": "..."}"""
+1. 你是长期任务设计角色，不是简单改写器。调度会告诉你当前范围、轮次、模式和范围计划，你只为当前范围生成当前轮 Trae prompt。
+2. 用户给多个范围时，每个范围是独立项目；你只能写 current_direction/current_range，不能合并其他 queued directions，也不能提前写下一个范围。
+3. 任务粒度必须中等：一个明确业务模块、两到四个相关区域、三到六个可验证交互、本地模拟数据或简单接口、多文件结构，并能运行或构建。
+4. 任务不能太小：不能只是改标题、颜色、按钮文案、单字段、README，不能小到单文件静态页。
+5. 任务不能太大：不能一次要求完整商业平台、前后台移动端全套、过多模块，避免 Trae 迟迟做不完。
+6. 首轮要做可运行业务骨架：列表、详情、操作入口、统计状态、本地模拟数据，不能是说明页或单文件 demo。
+7. 后续轮要基于现有项目继续，不重搭，不重复修同一个 bug；同类问题连续修过两次后，应改做相关业务路径扩展或提示调度考虑切换范围。
+8. 上一轮满意时，不硬找问题，选择当前范围 module_map 里未覆盖或覆盖不足的下一个自然模块继续扩展。
+9. 上一轮不满意时，把用户可见问题转换成自然开发要求，不复述原文，不写内部工具问题。
+10. 不能在提示词里出现“产物不满意”“过程不满意”“结果不满意”“不满意原因”“证据：”“日志”“轨迹”“扫描”“工具调用”“watcher”“trace”“session”“LLM”“AI”。
+11. 提示词要像真实用户给开发助手的需求：明确现象、期望结果、复查路径。
+12. 如果上一轮问题是内部证据不足、轨迹缺失、GitHub/飞书链路失败，除非当前产品本身就是 AgentOps，否则不要让编码助手修这些内部链路，而要回到当前业务系统的可验证交互或工程交付。
+只输出 JSON：{"prompt": "...", "prompt_kind": "bugfix|feature|workflow|edge_case|engineering|closure", "focus": "...", "acceptance_checks": ["..."], "difference_from_previous": "...", "used_module": "...", "should_scheduler_consider_switch": false, "reason": "..."}"""
 
 PROMPT_WRITER_SYSTEM += """
 
-AgentOps SOP context:
-- The platform, not the Trae prompt, handles trace collection, GitHub commit, and Feishu write after Trae completes.
-- Prompts sent to Trae must read like normal user development requests, not internal scheduler instructions.
-- If this round resumes after Stop/Pause, ask Trae to continue from the interruption point, preserve existing files and structure, and avoid rebuilding from scratch.
-- Do not mention internal trace gates, Worker stop reports, scheduler states, or evidence commits unless the product being built is AgentOps itself and those are real product features.
+AgentOps 流程上下文：
+- 平台会在 Trae 完成后处理执行轨迹采集、GitHub 提交和飞书写入，这些不是发给 Trae 的需求内容。
+- 发给 Trae 的提示词必须像普通用户的开发需求，不要写成内部调度指令。
+- 如果本轮是暂停后的继续，请让 Trae 从中断点继续，保留已有文件和结构，避免从零重做。
+- 不要提到内部轨迹门禁、Worker 停止报告、调度状态或证据提交，除非正在开发的产品本身就是 AgentOps 且这些是真实产品功能。
+- 编码环境是 Windows PowerShell；如果提示词提到 Node.js 验证命令，请要求先把 npm 缓存设到当前项目的 .npm-cache，再使用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd 或 cmd /c，避免被 npm.ps1 执行策略拦截和全局缓存沙箱限制。
 """.strip()
 
 
@@ -112,6 +126,8 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
 
     previous_reason = _previous_dissatisfaction(db, job, round_)
     current_direction = _current_direction(job)
+    visible_directions = _visible_directions_for_prompt(job)
+    prompt_intent = _prompt_writer_intent(job, current_direction)
     state = _compact_prompt_state(db, job, round_, previous_reason)
     current = _current_task(job, round_, previous_reason)
     meta = _prompt_meta(job, round_)
@@ -136,26 +152,31 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
                         "formal_write_requires_real_trace": True,
                         "first_round_must_be_operable_system": True,
                         "must_not_leak_internal_evidence_terms": True,
+                        "must_use_only_current_direction": True,
+                        "must_not_merge_other_queued_directions": True,
+                        "must_generate_medium_sized_tasks": True,
+                        "must_not_repeat_same_bug_loop": True,
+                        "satisfied_round_should_expand_next_module": True,
                     },
                     "state": state,
                     "current": current,
                     "meta": meta,
-                    "orchestrator_intent": job.intent or {},
+                    "orchestrator_intent": prompt_intent,
                     "user_rules": rules,
-                    "current_direction": current_direction or _directions_text(job.directions),
-                    "directions": job.directions or [],
+                    "current_direction": current_direction,
+                    "directions": visible_directions,
+                    "direction_queue": _direction_queue_meta(job),
+                    "range_plan": _range_plan_meta(job),
                     "preferred_stack": _select_stack(job, round_),
                 },
                 ensure_ascii=False,
             ),
         },
     ]
+    llm_client = LLMClient()
+    llm_config = model_config_from_settings(load_user_settings(db, user.id), role_model_config_key)
     try:
-        result = LLMClient().complete(
-            model_config_from_settings(load_user_settings(db, user.id), role_model_config_key),
-            messages,
-            purpose="prompt_generation",
-        )
+        result = llm_client.complete(llm_config, messages, purpose="prompt_generation")
     except LLMError as exc:
         prompt = build_fallback_prompt(job, round_, rules, previous_reason or str(exc))
         add_log(
@@ -169,36 +190,99 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
         )
         return _store_prompt(db, job, round_, prompt, model="built-in-fallback", wire_api="local")
 
-    proposal = _parse_prompt_writer_result(result.text)
-    prompt = _naturalize_prompt(str(proposal.get("prompt") or result.text or ""))
-    prompt_kind = str(proposal.get("prompt_kind") or ("feature" if round_.round_index <= 1 else "bugfix")).strip().lower()
-    if prompt_kind not in {"bugfix", "feature"}:
-        prompt_kind = "feature"
-    if not prompt:
-        prompt = build_fallback_prompt(job, round_, rules, previous_reason or "Prompt writer returned empty prompt")
-        add_log(
-            db,
-            job_id=job.id,
-            round_id=round_.id,
-            stage="prompt_generation_fallback",
-            message="LLM prompt writer returned empty text; built-in prompt fallback will be sent to worker.",
-            level="warning",
-            extra={"prompt_chars": len(prompt)},
-        )
-        return _store_prompt(db, job, round_, prompt, model="built-in-fallback", wire_api="local")
-
-    prompt = _soften_prompt_repetition(db, job, round_, prompt, prompt_kind)
-    quality_error = prompt_quality_error(db, job, round_, prompt)
+    proposal, prompt, prompt_kind, quality_error = _prompt_candidate_from_result(db, job, round_, result)
     if quality_error:
-        prompt = build_fallback_prompt(job, round_, rules, previous_reason or "Prompt writer output failed quality gate")
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage="prompt_generation_retry",
+            message="Prompt writer output failed the quality gate; scheduler is asking the role to regenerate.",
+            level="warning",
+            extra={
+                "quality_error": quality_error,
+                "quality_reason": _quality_error_explanation(quality_error),
+                "attempt": 1,
+                "max_attempts": PROMPT_WRITER_RETRY_LIMIT,
+                "rejected_prompt_preview": prompt[:500],
+            },
+        )
+        retry_messages = [
+            *messages,
+            {
+                "role": "user",
+                "content": json.dumps(
+                    _prompt_quality_feedback_payload(job, round_, prompt, quality_error),
+                    ensure_ascii=False,
+                ),
+            },
+        ]
+        try:
+            retry_result = llm_client.complete(llm_config, retry_messages, purpose="prompt_generation_retry")
+        except LLMError as exc:
+            fallback = build_fallback_prompt(job, round_, rules, previous_reason or str(exc))
+            add_log(
+                db,
+                job_id=job.id,
+                round_id=round_.id,
+                stage="prompt_generation_fallback",
+                message="Prompt writer retry failed; built-in prompt fallback will be sent to worker.",
+                level="warning",
+                extra={
+                    "error": str(exc),
+                    "quality_error": quality_error,
+                    "original_quality_error": quality_error,
+                    "prompt_chars": len(fallback),
+                },
+            )
+            return _store_prompt(db, job, round_, fallback, model="built-in-fallback", wire_api="local")
+
+        retry_proposal, retry_prompt, retry_prompt_kind, retry_quality_error = _prompt_candidate_from_result(
+            db,
+            job,
+            round_,
+            retry_result,
+        )
+        if retry_prompt and not retry_quality_error:
+            return _store_prompt(
+                db,
+                job,
+                round_,
+                retry_prompt,
+                model=retry_result.model,
+                wire_api=retry_result.wire_api,
+                extra={
+                    "prompt_kind": retry_prompt_kind,
+                    "llm_prompt_writer": {
+                        "focus": retry_proposal.get("focus") or "",
+                        "acceptance_checks": retry_proposal.get("acceptance_checks") or [],
+                        "difference_from_previous": retry_proposal.get("difference_from_previous") or "",
+                    },
+                    "prompt_retry": {
+                        "attempts": 1,
+                        "original_quality_error": quality_error,
+                        "original_quality_reason": _quality_error_explanation(quality_error),
+                    },
+                },
+            )
+
+        fallback_reason = retry_quality_error or "Prompt writer retry returned empty prompt"
+        prompt = build_fallback_prompt(job, round_, rules, previous_reason or fallback_reason)
         add_log(
             db,
             job_id=job.id,
             round_id=round_.id,
             stage="prompt_generation_fallback",
-            message="LLM prompt writer output failed the quality gate; built-in prompt fallback will be sent to worker.",
+            message="Prompt writer retry did not pass the quality gate; built-in prompt fallback will be sent to worker.",
             level="warning",
-            extra={"quality_error": quality_error, "prompt_chars": len(prompt)},
+            extra={
+                "quality_error": retry_quality_error or quality_error,
+                "original_quality_error": quality_error,
+                "retry_quality_error": retry_quality_error,
+                "retry_prompt_empty": not bool(retry_prompt),
+                "prompt_chars": len(prompt),
+                "retry_prompt_preview": retry_prompt[:500] if retry_prompt else "",
+            },
         )
         return _store_prompt(db, job, round_, prompt, model="built-in-fallback", wire_api="local")
     return _store_prompt(
@@ -219,19 +303,83 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
     )
 
 
+def _prompt_candidate_from_result(
+    db: Session,
+    job: Job,
+    round_: TaskRound,
+    result,
+) -> tuple[dict, str, str, str]:
+    proposal = _parse_prompt_writer_result(result.text)
+    prompt = _naturalize_prompt(str(proposal.get("prompt") or result.text or ""))
+    prompt_kind = str(proposal.get("prompt_kind") or ("feature" if round_.round_index <= 1 else "bugfix")).strip().lower()
+    if prompt_kind not in {"bugfix", "feature", "workflow", "edge_case", "engineering", "closure"}:
+        prompt_kind = "feature"
+    if not prompt:
+        return proposal, "", prompt_kind, "prompt_empty"
+    prompt = _soften_prompt_repetition(db, job, round_, prompt, prompt_kind)
+    return proposal, prompt, prompt_kind, prompt_quality_error(db, job, round_, prompt)
+
+
+def _prompt_quality_feedback_payload(job: Job, round_: TaskRound, rejected_prompt: str, quality_error: str) -> dict:
+    return {
+        "type": "quality_gate_rejection",
+        "role": "prompt_writer",
+        "quality_error": quality_error,
+        "quality_reason": _quality_error_explanation(quality_error),
+        "rejected_prompt": rejected_prompt,
+        "required_action": (
+            "请根据 quality_reason 重新生成一个完全合格的 JSON。只输出 JSON，不要解释。"
+            "新 prompt 必须只围绕 current_direction，避开 queued directions、内部调度词、质量门禁止词，"
+            "保持中等任务粒度，并像普通用户给开发助手的需求。"
+        ),
+        "current_direction": _current_direction(job),
+        "direction_queue": _direction_queue_meta(job),
+        "round_index": round_.round_index,
+    }
+
+
+def _quality_error_explanation(quality_error: str) -> str:
+    if quality_error.startswith("prompt_mentions_other_direction:"):
+        target = quality_error.split(":", 1)[1]
+        return f"提示词提到了非当前范围的内容：{target}。只能围绕 current_direction，不要提前合并后续范围或扩展能力。"
+    if quality_error.startswith("prompt_contains_meta_phrase:"):
+        target = quality_error.split(":", 1)[1]
+        return f"提示词包含内部判定或质量反馈用语：{target}。要改成普通用户需求口吻。"
+    if quality_error.startswith("prompt_contains_internal_process:"):
+        return "提示词包含平台内部流程、日志、轨迹、扫描、工具调用等调度词。要只描述用户可见产品需求。"
+    if quality_error.startswith("prompt_reuses_template_phrase:"):
+        target = quality_error.split(":", 1)[1]
+        return f"提示词复用了不适合直接发给开发助手的模板句：{target}。需要换成自然业务需求。"
+    explanations = {
+        "first_round_template_prefix": "第一轮提示词不能套用过泛模板，要直接给出当前业务范围的可操作系统骨架。",
+        "first_round_too_small": "第一轮任务太小，不能只是单页、小 demo 或极简改动。",
+        "prompt_too_small": "提示词任务粒度太小，需要扩展到可验证的业务路径或模块。",
+        "prompt_too_short": "提示词过短，缺少可执行范围和验收方式。",
+        "prompt_reuses_last_dissatisfaction_phrase": "提示词直接复述了上一轮不满意原因，需要转换成自然开发要求。",
+        "prompt_duplicate_recent": "提示词和最近一轮重复，需要换一个自然模块或明确不同改动点。",
+        "prompt_too_similar_to_recent": "提示词和最近历史太相似，需要避免重复循环。",
+        "prompt_empty": "提示词角色没有返回可用 prompt。",
+    }
+    for key, explanation in explanations.items():
+        if quality_error.startswith(key):
+            return explanation
+    return "提示词没有通过质量门，需要按当前范围重新生成。"
+
+
 def build_fallback_prompt(
     job: Job,
     round_: TaskRound,
     rules: dict[str, str] | None = None,
     fallback_reason: str = "",
 ) -> str:
-    directions = [_current_direction(job)] if _current_direction(job) else []
+    directions = _visible_directions_for_prompt(job)
     if round_.round_index > 1:
         return build_followup_fallback_prompt(job, round_, fallback_reason)
     intent = job.intent if isinstance(job.intent, dict) else {}
     prompt_brief = str(intent.get("prompt_brief") or "").strip()
-    direction = prompt_brief or (directions[0] if directions else "做一个方便后续继续迭代的业务系统。")
-    smoke_prompt = _test_smoke_prompt(direction, intent)
+    direction = directions[0] if directions else (prompt_brief or "做一个方便后续继续迭代的业务系统。")
+    smoke_source = prompt_brief if intent.get("run_mode") == "test" and prompt_brief else direction
+    smoke_prompt = _test_smoke_prompt(smoke_source, intent)
     if smoke_prompt:
         return smoke_prompt
     task = _build_direction_task(direction, _select_stack(job, round_))
@@ -244,18 +392,19 @@ def build_fallback_prompt(
         direction_text = "1. 做一个方便后续继续迭代的业务系统。"
     stack = _select_stack(job, round_)
     project_hint = _project_hint(directions, stack)
-    return (
-        f"我想做一个中等规模的{project_hint}，主技术栈用 {stack}。\n\n"
-        "需求范围：\n"
-        f"{direction_text}\n\n"
-        "请按真实项目的标准来实现，不要只做一个很小的 demo，也不要只放一个静态页面。"
-        "功能要有清楚的数据结构、核心业务流程、错误处理和基础页面/接口组织，代码结构要方便后续继续迭代。\n\n"
-        "实现要求：\n"
-        "1. 在当前工作目录里完成项目实现；如果目录里已经有工程，先理解现有结构再改。\n"
-        "2. 按所选技术栈建立合理的目录、模块和启动方式，必要时补 README 或运行说明。\n"
-        "3. 至少完成一个可运行的主流程，并补上必要的校验、空状态、错误提示和示例数据。\n"
-        "4. 完成后运行合适的检查或启动命令；如果因为环境缺依赖导致不能运行，请把原因和下一步写清楚。\n"
-        "5. 最终回复用自然中文说明：完成了哪些功能、改了哪些关键文件、运行了哪些验证、还有没有阻塞。"
+    return _structured_prompt(
+        topic=project_hint,
+        stack=stack,
+        objective=f"围绕下面这个范围先做一个能继续迭代的业务项目：{direction_text}",
+        module="核心工作台和第一条业务主流程",
+        interactions=[
+            "列表和详情能联动，选择不同记录后右侧或详情区状态同步变化",
+            "新增或编辑入口能完成本地保存，并刷新列表、统计或状态标签",
+            "至少处理一个空状态、一个字段校验失败状态和一个操作成功反馈",
+            "统计区或概览区要跟当前数据变化联动，不要只是写死装饰数字",
+        ],
+        data="先用本地模拟数据或轻量接口组织业务对象，字段要能支撑列表、详情、状态、负责人、时间和操作记录。",
+        verification="完成后运行构建或本地检查；如果依赖安装受限，请说明使用的命令、失败原因和还能人工复查的页面路径。",
     )
 
 
@@ -270,9 +419,45 @@ def _test_smoke_prompt(direction: str, intent: dict) -> str:
     base = text or "AgentOps E2E smoke: create a tiny README or static page that says AgentOps E2E smoke OK."
     return _naturalize_prompt(
         f"{base}\n\n"
-        "Test constraint: make the smallest reviewable change, skip slow tests/builds/browser "
-        "acceptance, and finish with one or two short sentences listing changed files."
+        "测试约束：只做最小可复查改动，不要运行耗时测试、构建或浏览器验收；"
+        "完成后用一两句中文列出改动文件。"
+        f"{_windows_node_command_note()}"
     )
+
+
+def _windows_node_command_note() -> str:
+    return (
+        "Windows 命令提示：如果在 PowerShell 里运行 Node.js 工具，先执行 "
+        "`$env:npm_config_cache = \"$PWD\\.npm-cache\"`，再使用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd "
+        "或 cmd /c 命令；不要直接使用 npm/npx/pnpm/yarn，也不要使用全局或用户级 npm 缓存。"
+    )
+
+
+def _append_windows_command_note(prompt: str) -> str:
+    text = _strip_foreign_windows_command_note(str(prompt or "").strip())
+    note = _windows_node_command_note()
+    has_cmd_guard = any(token in text for token in ("npm.cmd", "npx.cmd", "pnpm.cmd", "yarn.cmd", "cmd /c"))
+    has_cache_guard = "npm_config_cache" in text or ".npm-cache" in text
+    if has_cmd_guard and has_cache_guard:
+        return text
+    if "Windows 命令提示：" in text and not has_cache_guard:
+        return _naturalize_prompt(f"{text} 另外，安装依赖前必须把 npm 缓存设到当前项目的 .npm-cache，例如 `$env:npm_config_cache = \"$PWD\\.npm-cache\"`。")
+    return _naturalize_prompt(f"{text}\n\n{note}")
+
+
+def append_windows_command_note(prompt: str) -> str:
+    return _append_windows_command_note(prompt)
+
+
+def _strip_foreign_windows_command_note(prompt: str) -> str:
+    text = str(prompt or "")
+    patterns = (
+        r"Windows\s+command\s+note\s*:\s*if\s+you\s+run\s+Node\.?js\s+tooling.*?(?=(?:\n\s*\n|$))",
+        r"Windows\s+command\s+note\s*:\s*.*?(?=(?:\n\s*\n|$))",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
+    return text.replace("Windows command note:", "").strip()
 
 
 def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason: str = "") -> str:
@@ -282,33 +467,111 @@ def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason:
     topic = _direction_topic(direction_text)
     if reason and _has_fixable_previous_issue(reason):
         action = _issue_action_from_reason(reason, topic, direction_text)
-        candidates = [
-            f"这次先帮我修 {topic} 里不好用的操作，不重搭页面：{action}。修完后用实际点击路径说明入口、操作后状态和失败提示。",
-            f"基于 {topic} 现在的页面按线上验收会点到的路径修一下：{action}。不要只改文案，相关按钮、弹窗、列表刷新和统计联动都要能实际跑。",
-            f"接下来集中处理 {topic} 的操作链路问题：{action}。保留现有结构，修完跑构建或本地检查，并把可复查路径交代清楚。",
-        ]
-        return _naturalize_prompt(candidates[_stable_index(job.id, round_.id, "bugfix", modulo=len(candidates))])
+        return _structured_prompt(
+            topic=topic,
+            stack=_select_stack(job, round_),
+            objective=f"继续在现有项目上处理一个会影响验收的业务问题：{action}",
+            module="当前问题所在的页面、状态流转和关联数据",
+            interactions=[
+                "不要重搭项目，先沿着现有入口复现并修正对应操作路径",
+                "修正按钮、表单、列表刷新、详情状态或统计联动里真正不一致的部分",
+                "同类数据状态要一起处理，避免只改一个样例或只改展示文案",
+                "补上失败提示、空数据反馈或边界状态，保证用户能看懂当前结果",
+            ],
+            data="沿用当前项目已有的数据结构；如果字段不足，可以补少量必要字段，但不要把业务重做成另一个系统。",
+            verification="完成后跑构建或本地检查，并说明从哪个页面入口复查、怎么操作、操作后应该看到什么变化。",
+        )
+    module_prompt = _module_map_followup_prompt(job, round_, topic)
+    if module_prompt:
+        return _naturalize_prompt(module_prompt)
     followups = _direction_followup_prompts(direction_text, topic)
     if followups:
         return _naturalize_prompt(followups[(round_.round_index - 2) % len(followups)])
     reason_summary = _prompt_problem_summary(reason) or "上一轮复查时发现核心业务入口、运行验证和异常反馈还没有收口清楚"
-    return _naturalize_prompt(
-        f"继续完善这个项目，方向还是：{direction_text}。上一轮复查时暴露的问题是：{reason_summary[:500]}。"
-        "这一轮不要重做一个新项目，也不要只改文档或补一个很小的示例。请直接在现有代码上把真实功能、状态变化、异常提示和可复查的运行路径补好。"
+    return _structured_prompt(
+        topic=topic,
+        stack=_select_stack(job, round_),
+        objective=f"继续完善现有项目，方向仍然是：{direction_text}。需要避开上一轮暴露出的薄弱点：{reason_summary[:420]}",
+        module="下一段自然业务流程",
+        interactions=[
+            "补一个和现有列表、详情或统计有关的业务模块，不要只改文案或 README",
+            "让新增模块和已有数据发生联动，例如状态流转、负责人变化、筛选结果或统计数字变化",
+            "至少补三处可实际复查的交互，包括成功反馈和异常反馈",
+            "保留已有结构和页面风格，避免从零重建",
+        ],
+        data="继续使用当前项目的数据模型，必要时补模拟数据、状态枚举和操作记录。",
+        verification="完成后跑构建或本地检查，并在最终回复里写清楚复查路径。",
     )
+
+
+def _module_map_followup_prompt(job: Job, round_: TaskRound, topic: str) -> str:
+    range_meta = _range_plan_meta(job).get("current_range") or {}
+    module_map = range_meta.get("module_map") if isinstance(range_meta, dict) else []
+    modules = [str(item).strip() for item in module_map or [] if str(item).strip()]
+    if not modules:
+        return ""
+    index = max(0, int(round_.round_index or 1) - 1) % len(modules)
+    module = modules[index]
+    if module in {"系统骨架"} and round_.round_index > 1:
+        index = (index + 1) % len(modules)
+        module = modules[index]
+    return _structured_prompt(
+        topic=topic,
+        stack=_select_stack(job, round_),
+        objective=f"基于当前项目继续扩展 {module}，不要重搭项目，也不要重复修同一个小问题。",
+        module=module,
+        interactions=[
+            "给这个模块补清楚的入口，并接到已有列表、详情、工作台或统计区域",
+            "完成一个新增、编辑、状态切换、筛选或批量处理中的中等业务动作",
+            "操作后要同步更新相关列表、详情、统计或提示，不要只做静态展示",
+            "补空状态、校验失败和成功反馈，保证复查时能看出真实流程",
+        ],
+        data="沿用当前项目已有模拟数据或接口组织方式，补足这个模块需要的字段、状态和关联记录。",
+        verification="完成后跑构建或本地检查，并说明复查入口和关键操作路径。",
+    )
+
+
+def _structured_prompt(
+    *,
+    topic: str,
+    stack: str,
+    objective: str,
+    module: str,
+    interactions: list[str],
+    data: str,
+    verification: str,
+) -> str:
+    items = "\n".join(f"{index}. {item}" for index, item in enumerate(interactions, start=1))
+    prompt = (
+        f"请继续做一个中等规模的{topic}，技术栈优先用 {stack}。\n\n"
+        f"目标：{objective}\n\n"
+        f"本次范围：集中在“{module}”，但要和现有页面、数据和状态联动起来。不要做成单文件静态页，也不要一次扩成完整商业平台。\n\n"
+        f"交互要求：\n{items}\n\n"
+        f"数据和结构：{data} 代码要拆成合理的组件、页面、数据或接口文件，方便后续继续迭代。\n\n"
+        f"验收方式：{verification}\n\n"
+        "完成后用中文简要说明改了哪些关键文件、怎么运行、从哪个页面复查。"
+    )
+    return _naturalize_prompt(prompt)
 
 
 def prompt_quality_error(db: Session | None, job: Job, round_: TaskRound, prompt: str) -> str:
     text = " ".join(str(prompt or "").split())
+    agentops_context = _is_agentops_context(_current_direction(job) or _directions_text(job.directions))
     for phrase in FORBIDDEN_PROMPT_PHRASES:
+        if agentops_context and phrase in {"LLM", "工具调用"}:
+            continue
         if phrase in text:
             return f"prompt_contains_meta_phrase:{phrase}"
     for phrase in REUSED_PROMPT_PATTERNS:
         if phrase in text:
             return f"prompt_reuses_template_phrase:{phrase}"
     for pattern in FORBIDDEN_PROMPT_REGEXES:
+        if agentops_context and "(日志|轨迹|扫描|工具调用|watcher|trace|session)" in pattern.pattern:
+            continue
         if pattern.search(text):
             return f"prompt_contains_internal_process:{pattern.pattern}"
+    if other_direction := _queued_other_direction_mention(job, text):
+        return f"prompt_mentions_other_direction:{other_direction}"
     if round_.round_index == 1:
         stripped = text.lstrip()
         for prefix in FIRST_ROUND_TEMPLATE_PREFIXES:
@@ -330,6 +593,14 @@ def prompt_quality_error(db: Session | None, job: Job, round_: TaskRound, prompt
         )
         if any(re.search(pattern, positive_scope_text, re.IGNORECASE) for pattern in too_small_patterns):
             return "first_round_too_small"
+    small_followup_patterns = (
+        r"只(改|调整|修改).{0,10}(标题|颜色|文案|按钮|字段|README)",
+        r"(改|调整|修改).{0,8}(标题|颜色|文案)$",
+        r"补一?个字段",
+        r"只补\s*README",
+    )
+    if any(re.search(pattern, text, re.IGNORECASE) for pattern in small_followup_patterns):
+        return "prompt_too_small"
     if len(text) < 12:
         return "prompt_too_short"
     previous_reason = _previous_dissatisfaction(db, job, round_) if db else ""
@@ -380,6 +651,7 @@ def _store_prompt(
     wire_api: str,
     extra: dict | None = None,
 ) -> str:
+    prompt = _append_windows_command_note(prompt)
     round_.prompt = prompt
     round_.status = JobState.PROMPT_READY
     job.status = JobState.PROMPT_READY
@@ -439,6 +711,64 @@ def _directions_text(directions: object) -> str:
     return "；".join(str(item).strip() for item in directions if str(item).strip())
 
 
+def _direction_items(job: Job) -> list[str]:
+    if not isinstance(job.directions, list):
+        return []
+    return [str(item).strip() for item in job.directions if str(item).strip()]
+
+
+def _visible_directions_for_prompt(job: Job) -> list[str]:
+    current = _current_direction(job)
+    return [current] if current else []
+
+
+def _direction_queue_meta(job: Job) -> dict:
+    items = _direction_items(job)
+    return {
+        "policy": "queue_first_only",
+        "total": len(items),
+        "current_index": 1 if items else 0,
+        "remaining_count": max(0, len(items) - 1),
+    }
+
+
+def _range_plan_meta(job: Job) -> dict:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    plan = intent.get("range_plan") if isinstance(intent.get("range_plan"), dict) else {}
+    ranges = plan.get("ranges") if isinstance(plan.get("ranges"), list) else []
+    current = _current_direction(job)
+    current_range = {}
+    for item in ranges:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_text") or "").strip() == current:
+            current_range = item
+            break
+    if not current_range and ranges and isinstance(ranges[0], dict):
+        current_range = ranges[0]
+    return {
+        "total_target_rounds": plan.get("total_target_rounds") or job.daily_target or 100,
+        "current_range": current_range,
+        "ranges": ranges,
+        "synthetic_range_policy": plan.get("synthetic_range_policy") if isinstance(plan.get("synthetic_range_policy"), dict) else {},
+        "scheduler_policy": {
+            "role": "global_orchestrator",
+            "prompt_writer_does_not_switch_ranges": True,
+            "prompt_writer_may_suggest_switch": True,
+            "satisfied_round_should_expand_next_module_or_switch_by_scheduler": True,
+        },
+    }
+
+
+def _prompt_writer_intent(job: Job, current_direction: str) -> dict:
+    intent = dict(job.intent) if isinstance(job.intent, dict) else {}
+    if current_direction:
+        intent["prompt_brief"] = current_direction
+        intent["current_direction"] = current_direction
+    intent["direction_queue_policy"] = "only_current_direction"
+    return intent
+
+
 def _current_direction(job: Job) -> str:
     if not isinstance(job.directions, list):
         return ""
@@ -447,6 +777,63 @@ def _current_direction(job: Job) -> str:
         if text:
             return text
     return ""
+
+
+def _queued_other_direction_mention(job: Job, prompt: str) -> str:
+    directions = _direction_items(job)
+    if len(directions) <= 1:
+        return ""
+    current = _current_direction(job)
+    current_text = _normalized_phrase_text(current)
+    prompt_text = _normalized_phrase_text(prompt)
+    for direction in directions[1:]:
+        if _normalized_phrase_text(direction) == current_text:
+            continue
+        for label in _direction_match_labels(direction):
+            normalized_label = _normalized_phrase_text(label)
+            if not normalized_label or normalized_label in current_text:
+                continue
+            if normalized_label in prompt_text:
+                return _direction_public_label(direction)
+    return ""
+
+
+def _direction_match_labels(direction: str) -> list[str]:
+    text = str(direction or "").strip()
+    head = re.split(r"[：:，,。；;\s]", text, maxsplit=1)[0].strip()
+    topic = _direction_topic(text)
+    labels: list[str] = []
+    for candidate in (head, topic):
+        candidate = str(candidate or "").strip("：:，,。；; ")
+        if candidate:
+            labels.append(candidate)
+            labels.extend(_domain_label_variants(candidate))
+    generic = {"平台", "系统", "服务", "项目", "业务", "应用", "前端", "后端", "web", "Web"}
+    result: list[str] = []
+    seen: set[str] = set()
+    for label in labels:
+        clean = re.sub(r"\s+", "", label)
+        if len(clean) < 2 or clean in generic:
+            continue
+        if clean in seen:
+            continue
+        seen.add(clean)
+        result.append(clean)
+    return result
+
+
+def _direction_public_label(direction: str) -> str:
+    text = str(direction or "").strip()
+    head = re.split(r"[：:，,。；;\s]", text, maxsplit=1)[0].strip()
+    return head or _direction_topic(text)
+
+
+def _domain_label_variants(label: str) -> list[str]:
+    variants: list[str] = []
+    for suffix in ("服务平台", "管理平台", "业务平台", "平台", "管理系统", "系统", "服务"):
+        if label.endswith(suffix) and len(label) > len(suffix) + 1:
+            variants.append(label[: -len(suffix)])
+    return variants
 
 
 def _prompt_preview(prompt: str, limit: int = 220) -> str:
@@ -561,7 +948,8 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
         "now": datetime.now().isoformat(),
         "round_index": round_.round_index,
         "current_task": _current_task(job, round_, previous_reason),
-        "orchestrator_intent": job.intent or {},
+        "orchestrator_intent": _prompt_writer_intent(job, _current_direction(job)),
+        "direction_queue": _direction_queue_meta(job),
         "daily_counts": {"submitted": job.submitted_count or 0, "satisfied": job.satisfied_count or 0},
         "recent_history": [
             {
@@ -583,10 +971,6 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
 
 def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
     direction = _current_direction(job) or _directions_text(job.directions)
-    intent = job.intent if isinstance(job.intent, dict) else {}
-    prompt_brief = str(intent.get("prompt_brief") or "").strip()
-    if prompt_brief:
-        direction = prompt_brief
     previous_prompts = []
     if round_.job_id:
         # The caller's DB session is not available here, so generate_round_prompt passes detailed state separately.

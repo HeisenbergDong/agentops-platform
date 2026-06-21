@@ -3,6 +3,7 @@ from pathlib import Path
 import pytest
 
 from worker.project import browser_acceptance
+from worker.project import dev_env
 from worker.project.browser_acceptance import run_browser_acceptance
 from worker.project.diagnostics import summarize_command_result
 from worker.project.git_submit import _classify_push_failure, _push_args
@@ -96,7 +97,41 @@ def test_browser_acceptance_starts_nested_vite_dev_server(monkeypatch: pytest.Mo
 
     assert result["status"] == "passed"
     assert result["auto_start"]["cwd"] == str(app)
-    assert launched["command"] == ["npm", "run", "dev", "--", "--host", "127.0.0.1", "--port", "5173"]
+    assert launched["command"][0].lower().endswith(("npm", "npm.cmd"))
+    assert launched["command"][1:] == ["run", "dev", "--", "--host", "127.0.0.1", "--port", "5173"]
+
+
+def test_browser_acceptance_prefers_project_log_url_over_stale_config(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "workspace"
+    agentops = workspace / ".agentops"
+    agentops.mkdir(parents=True)
+    (agentops / "browser-acceptance-server.log").write_text(
+        "Local: http://localhost:5174/jobs\n",
+        encoding="utf-8",
+    )
+    calls = []
+
+    def fake_fetch(project_path: str, normalized_url: str, timeout_seconds: float, cancellation_check=None):
+        calls.append(normalized_url)
+        if normalized_url == "http://localhost:5174/jobs":
+            return {"status": "passed", "project_path": project_path, "url": normalized_url, "http_status": 200}
+        return {"status": "failed", "project_path": project_path, "url": normalized_url, "http_status": 200}
+
+    monkeypatch.setattr(browser_acceptance, "_fetch_url", fake_fetch)
+
+    result = run_browser_acceptance(str(workspace), "http://localhost:5173", timeout_seconds=0.1)
+
+    assert result["status"] == "passed"
+    assert result["url"] == "http://localhost:5174/jobs"
+    assert calls[0] == "http://localhost:5174/jobs"
+    assert "http://localhost:5173" not in calls[:1]
+
+
+def test_resolve_tool_prefers_cmd_shim_on_windows(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    monkeypatch.setattr(dev_env.os, "name", "nt")
+    monkeypatch.setattr(dev_env.shutil, "which", lambda name: f"C:/node/{name}" if name == "npm.cmd" else None)
+
+    assert dev_env.resolve_tool(tmp_path, "npm") == "C:/node/npm.cmd"
 
 
 def test_browser_acceptance_html_inspection_rejects_blank_page():

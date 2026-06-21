@@ -2,12 +2,13 @@ from __future__ import annotations
 
 import ctypes
 from datetime import datetime
+from pathlib import Path
 from typing import Any, Callable
 
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae.supervisor import has_ui_completion_text
-from worker.trae.ui_locator import locate_visible_action_targets, target_for_action, validate_target
+from worker.trae.ui_locator import normalize_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
 
 ACTION_BUTTON_MARKERS = {
@@ -61,6 +62,56 @@ TERMINAL_PROMPT_MARKERS = (
 )
 TERMINAL_DEFAULT_INPUT = "y"
 SERVICE_RECOVERY_REASONS = {"awaiting_continuation", "service_interrupted"}
+DELETE_CONFIRMATION_MARKERS = (
+    "\u786e\u8ba4\u5220\u9664",
+    "\u5220\u9664\u540e\u6587\u4ef6\u65e0\u6cd5\u6062\u590d",
+    "\u662f\u5426\u4ecd\u8981\u5220\u9664",
+    "\u662f\u5426\u8981\u5220\u9664",
+)
+DESTRUCTIVE_CHOICE_MARKERS = (
+    "\u5220\u9664",
+    "\u79fb\u9664",
+    "\u6e05\u7a7a",
+    "\u91cd\u7f6e",
+    "\u653e\u5f03",
+    "\u4e22\u5f03",
+    "delete",
+    "remove",
+    "reset",
+    "discard",
+)
+WAITING_ACTION_MARKERS = (
+    "\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c",
+    "\u6b63\u5728\u7b49\u5f85\u60a8\u7684\u64cd\u4f5c",
+    "\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c",
+    "\u7b49\u5f85\u60a8\u7684\u64cd\u4f5c",
+    "\u7b49\u5f85\u64cd\u4f5c",
+    "waiting for your operation",
+    "waiting for your action",
+)
+CLICK_RECOMMENDATIONS = {
+    "click_run_button",
+    "click_confirm_button",
+    "click_keep_button",
+    "click_save_button",
+    "click_continue_button",
+    "click_delete_button",
+    "click_discard_button",
+    "click_cancel_button",
+}
+SCROLL_RECOMMENDATIONS = {
+    "scroll_inner_panel",
+}
+RECOMMENDATION_ACTIONS = {
+    "click_run_button": "run_button",
+    "click_confirm_button": "confirm_button",
+    "click_keep_button": "keep_button",
+    "click_save_button": "save_button",
+    "click_continue_button": "continue_button",
+    "click_delete_button": "delete_button",
+    "click_discard_button": "discard_button",
+    "click_cancel_button": "cancel_button",
+}
 
 
 def diagnose_ui(
@@ -68,9 +119,22 @@ def diagnose_ui(
     scroll_bottom: bool = True,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     task: str = "find_reply_action_button",
+    workspace_path: str | Path | None = None,
 ) -> dict:
-    focus_trae(timeout_seconds=timeout_seconds)
-    window = find_trae_window(timeout_seconds=timeout_seconds)
+    if workspace_path:
+        focus_trae(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+        window = find_trae_window(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+    else:
+        focus_trae(timeout_seconds=timeout_seconds)
+        window = find_trae_window(timeout_seconds=timeout_seconds)
     scroll_result = scroll_assistant_to_bottom(window) if scroll_bottom else {}
     text = window_text_snapshot(window, limit=500)
     buttons = _button_summaries(window)
@@ -92,8 +156,15 @@ def diagnose_ui(
             {"button_count": len(buttons), "match_count": len(matches), "scroll": extra_scroll},
         )
     visual = {}
-    if not matches and _should_try_local_visual(text, buttons):
-        visual = _diagnose_local_visual(window_rect, ui_analyst=ui_analyst, task=task, window_title=window.window_text())
+    if window_rect and ui_analyst:
+        visual = _diagnose_ai_visual(
+            window_rect,
+            ui_analyst=ui_analyst,
+            task=task,
+            window_title=window.window_text(),
+            text_sample=text[-1600:],
+            buttons=buttons[:40],
+        )
     output_probe = probe_trace(text)
     terminal_prompt = detect_terminal_prompt(text)
 
@@ -101,16 +172,49 @@ def diagnose_ui(
     suggested = {}
     confidence = 0.0
     reason = ""
-    if has_ui_completion_text(text) or _visual_completion_detected(visual):
+    visual_suggested = _visual_suggested_intervention(visual, window_rect)
+    delete_confirmation = _delete_confirmation_intervention(text, matches)
+    destructive_waiting = _destructive_waiting_intervention(text, buttons)
+    if delete_confirmation:
+        state = "awaiting_delete_confirmation"
+        confidence = float(delete_confirmation.get("confidence") or 0.86)
+        suggested = delete_confirmation["suggested_intervention"]
+        reason = str(delete_confirmation.get("reason") or "local_delete_confirmation")
+    elif destructive_waiting:
+        state = str(destructive_waiting.get("state") or "awaiting_destructive_confirmation")
+        confidence = float(destructive_waiting.get("confidence") or 0.9)
+        suggested = destructive_waiting["suggested_intervention"]
+        reason = str(destructive_waiting.get("reason") or "local_waiting_destructive_confirmation")
+    elif _visual_completion_detected(visual):
         state = "completed"
         confidence = _completion_confidence(text, visual)
-        reason = "ui_completion_detected" if has_ui_completion_text(text) else "visual_completion_detected"
+        reason = "visual_completion_detected"
+    elif visual_suggested:
+        state = str(visual_suggested.get("state") or "awaiting_visual_action")
+        confidence = float(visual_suggested.get("confidence") or 0.0)
+        suggested = visual_suggested["suggested_intervention"]
+        reason = str(visual_suggested.get("reason") or "ai_visual_action_target")
+    elif _needs_inner_panel_scroll(text, matches, terminal_prompt):
+        state = "needs_scroll_inner_panel"
+        confidence = 0.84
+        suggested = {
+            "mode": "scroll-inner-panel",
+            "action": "scroll_inner_panel",
+            "risk": "safe",
+            "wheel_steps": 8,
+            "recommended_action": "scroll_inner_panel",
+        }
+        reason = "waiting_action_inner_panel_hidden"
+    elif has_ui_completion_text(text):
+        state = "completed"
+        confidence = _completion_confidence(text, visual)
+        reason = "ui_completion_detected"
     elif output_probe.get("reason") == "service_interrupted":
         state = "service_interrupted"
         confidence = 0.9
         suggested = {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
         reason = str(output_probe.get("reason") or "")
-    elif matches:
+    elif matches and not ui_analyst:
         best = matches[0]
         state = f"awaiting_{best['action']}"
         confidence = best["confidence"]
@@ -121,12 +225,6 @@ def diagnose_ui(
             "y": best["button"].get("center_y"),
             "button": best["button"].get("name") or "",
         }
-    elif visual.get("suggested_intervention"):
-        target = visual["suggested_intervention"]
-        state = "awaiting_run"
-        confidence = float(target.get("confidence") or 0.0)
-        suggested = target
-        reason = str(visual.get("reason") or "local_visual_action_target")
     elif terminal_prompt:
         state = "awaiting_terminal_input"
         confidence = terminal_prompt["confidence"]
@@ -148,6 +246,7 @@ def diagnose_ui(
         "confidence": confidence,
         "time": datetime.now().isoformat(),
         "window_title": window.window_text(),
+        "workspace_path": str(workspace_path or ""),
         "window_rect": window_rect,
         "text_chars": len(text),
         "text_sample": text[-1600:],
@@ -187,6 +286,23 @@ def detect_terminal_prompt(text: str) -> dict:
         "input": input_text,
         "markers": matched[:8],
     }
+
+
+def _needs_inner_panel_scroll(text: str, matches: list[dict], terminal_prompt: dict) -> bool:
+    if matches or terminal_prompt:
+        return False
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in WAITING_ACTION_MARKERS)
+
+
+def _has_waiting_action_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return any(marker.lower() in lowered for marker in WAITING_ACTION_MARKERS)
+
+
+def _has_destructive_choice_text(text: str) -> bool:
+    normalized = _normalize(text)
+    return any(_normalize(marker) in normalized for marker in DESTRUCTIVE_CHOICE_MARKERS)
 
 
 def _button_summaries(window) -> list[dict[str, Any]]:
@@ -256,16 +372,75 @@ def _action_matches(buttons: list[dict[str, Any]], window_rect: dict | None) -> 
     return matches
 
 
-def _should_try_local_visual(text: str, buttons: list[dict[str, Any]]) -> bool:
-    return len(str(text or "").strip()) < 120
+def _delete_confirmation_intervention(text: str, matches: list[dict]) -> dict[str, Any]:
+    normalized_text = _normalize(text)
+    if not normalized_text or not any(marker in normalized_text for marker in DELETE_CONFIRMATION_MARKERS):
+        return {}
+    confirm = next((item for item in matches if item.get("action") == "confirm"), None)
+    if not confirm:
+        return {}
+    button = confirm.get("button") if isinstance(confirm.get("button"), dict) else {}
+    return {
+        "confidence": min(0.92, max(0.86, float(confirm.get("confidence") or 0.86))),
+        "reason": "local_delete_confirmation",
+        "suggested_intervention": {
+            "mode": "manual-required",
+            "action": "delete_button",
+            "x": button.get("center_x"),
+            "y": button.get("center_y"),
+            "button": button.get("name") or "\u786e\u8ba4",
+            "confidence": confirm.get("confidence") or 0.86,
+            "source": "local_uia",
+            "risk": "blocked",
+            "recommended_action": "do_not_click",
+            "manual_message": "Trae 正在等待删除确认，涉及文件删除，已暂停等待人工确认。",
+        },
+    }
 
 
-def _diagnose_local_visual(
+def _destructive_waiting_intervention(text: str, buttons: list[dict[str, Any]]) -> dict[str, Any]:
+    if not _has_waiting_action_text(text) or not _has_destructive_choice_text(text):
+        return {}
+    button = _first_button_with_markers(buttons, DESTRUCTIVE_CHOICE_MARKERS)
+    return {
+        "state": "awaiting_destructive_confirmation",
+        "confidence": 0.92,
+        "reason": "local_waiting_destructive_confirmation",
+        "suggested_intervention": {
+            "mode": "manual-required",
+            "action": "manual_required",
+            "x": button.get("center_x") if button else None,
+            "y": button.get("center_y") if button else None,
+            "button": button.get("name") if button else "",
+            "confidence": 0.92,
+            "source": "local_uia",
+            "risk": "blocked",
+            "recommended_action": "do_not_click",
+            "manual_message": (
+                "Trae is waiting for a user decision on a destructive action "
+                "(delete/remove/discard/reset). Do not mark the task complete or click it automatically."
+            ),
+        },
+    }
+
+
+def _first_button_with_markers(buttons: list[dict[str, Any]], markers: tuple[str, ...]) -> dict[str, Any] | None:
+    normalized_markers = [_normalize(marker) for marker in markers]
+    for button in buttons:
+        name = _normalize(str(button.get("name") or ""))
+        if name and any(marker in name for marker in normalized_markers):
+            return button
+    return None
+
+
+def _diagnose_ai_visual(
     window_rect: dict | None,
     *,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     task: str = "find_reply_action_button",
     window_title: str = "",
+    text_sample: str = "",
+    buttons: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     if not window_rect:
         return {"status": "not_found", "reason": "missing_window_rect"}
@@ -285,7 +460,13 @@ def _diagnose_local_visual(
         try:
             response = ui_analyst(
                 str(screenshot["path"]),
-                _visual_diagnosis_context(tuple_rect, window_title=window_title, task=task),
+                _visual_diagnosis_context(
+                    tuple_rect,
+                    window_title=window_title,
+                    task=task,
+                    text_sample=text_sample,
+                    buttons=buttons or [],
+                ),
             )
             ai_analysis = response.get("analysis") if isinstance(response, dict) else response
             if not isinstance(ai_analysis, dict):
@@ -300,37 +481,37 @@ def _diagnose_local_visual(
             "ai_analysis": ai_analysis,
             "ai_error": ai_error,
         }
-    analysis = locate_visible_action_targets(str(screenshot.get("path") or ""), tuple_rect)
-    target = target_for_action(analysis, "run_button", min_confidence=0.72)
-    if not target:
-        return {
-            "status": "not_found",
-            "reason": analysis.get("reason") or ai_error or "no_local_visual_target",
-            "screenshot": screenshot,
-            "analysis": analysis,
-            "ai_analysis": ai_analysis,
-            "ai_error": ai_error,
-        }
-    ok, reason = validate_target(target, "run_button", tuple_rect, min_confidence=0.72)
-    if not ok:
-        return {"status": "not_found", "reason": reason, "screenshot": screenshot, "analysis": analysis}
-    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    if task == "find_prompt_input_and_send_button" and ai_analysis:
+        screen_state = str(ai_analysis.get("screen_state") or "")
+        recommended = str(ai_analysis.get("recommended_action") or "")
+        if screen_state in {"prompt_submitted", "generating", "still_generating"} or recommended in {
+            "wait",
+            "collect_trace_candidate",
+        }:
+            return {
+                "status": "prompt_submitted",
+                "reason": "ai_visual_prompt_submitted",
+                "screenshot": screenshot,
+                "ai_analysis": ai_analysis,
+                "ai_error": ai_error,
+            }
+        if screen_state in {"prompt_still_in_composer", "prompt_not_submitted"} or str(ai_analysis.get("status") or "") in {
+            "found",
+            "partial",
+        }:
+            return {
+                "status": "prompt_ready",
+                "reason": "ai_visual_prompt_controls_or_unsent_prompt",
+                "screenshot": screenshot,
+                "ai_analysis": ai_analysis,
+                "ai_error": ai_error,
+            }
     return {
-        "status": "found",
-        "reason": str(target.get("reason") or "local_visual_run_button"),
+        "status": str(ai_analysis.get("status") or "not_found") if ai_analysis else "not_found",
+        "reason": str(ai_analysis.get("reason") or ai_error or "ai_visual_no_action") if isinstance(ai_analysis, dict) else ai_error,
         "screenshot": screenshot,
-        "analysis": analysis,
         "ai_analysis": ai_analysis,
         "ai_error": ai_error,
-        "suggested_intervention": {
-            "mode": "click-point",
-            "action": "run",
-            "x": center.get("x"),
-            "y": center.get("y"),
-            "confidence": target.get("confidence"),
-            "source": "local_vision",
-            "label": target.get("label") or "",
-        },
     }
 
 
@@ -339,6 +520,8 @@ def _visual_diagnosis_context(
     *,
     window_title: str,
     task: str,
+    text_sample: str = "",
+    buttons: list[dict[str, Any]] | None = None,
 ) -> dict[str, Any]:
     left, top, right, bottom = rect
     return {
@@ -359,8 +542,161 @@ def _visual_diagnosis_context(
             "assistant reply footer indicates the current turn is done",
             "code changes tab shows a finished task with no generating indicator",
         ],
-        "instructions": "Decide whether the current Trae task is completed, still generating, or waiting for a safe action. Return JSON only.",
+        "completion_blockers": [
+            "Chinese text like \u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c or \u7b49\u5f85\u60a8\u7684\u64cd\u4f5c",
+            "English text like waiting for your operation/action",
+            "a confirmation card with \u4fdd\u7559/\u5220\u9664, keep/delete, delete/remove/discard/cancel/reset",
+            "terminal or UI confirmation asking whether to run, delete, discard, overwrite, or proceed",
+        ],
+        "manual_required_rules": [
+            "Never return screen_state=completed or recommended_action=collect_trace_candidate when a waiting-for-user-action card is visible.",
+            "If a destructive choice is visible (\u5220\u9664/delete/remove/discard/cancel/reset), return recommended_action=do_not_click, risk=blocked, screen_state=manual_required, and explain blocked_reason.",
+            "If only part of the action card is visible, return recommended_action=scroll_inner_panel instead of completed.",
+            "Safe click actions are only for explicit run/continue/keep/save buttons with risk=safe; destructive buttons are not safe.",
+        ],
+        "required_json_shape": {
+            "status": "found|partial|not_found",
+            "screen_state": "completed|still_generating|prompt_submitted|prompt_still_in_composer|prompt_not_submitted|manual_required|awaiting_action|needs_scroll_inner_panel",
+            "recommended_action": "wait|collect_trace_candidate|click_run_button|click_continue_button|click_keep_button|click_save_button|scroll_inner_panel|do_not_click|type_continue|answer_terminal_prompt",
+            "risk": "safe|blocked",
+            "blocked_reason": "required when risk is blocked",
+        },
+        "visible_text_sample": text_sample,
+        "uia_buttons": buttons or [],
+        "instructions": _visual_task_instructions(task),
     }
+
+
+def _visual_task_instructions(task: str) -> str:
+    if task == "find_prompt_input_and_send_button":
+        return (
+            "Decide whether the latest prompt has actually left the Trae composer. "
+            "If the prompt text is still in the composer or the active send/up-arrow button is visible beside a filled composer, "
+            "return prompt_still_in_composer or prompt_not_submitted with do_not_click. "
+            "If the prompt has been submitted and Trae is generating or responding, return prompt_submitted/still_generating with wait. "
+            "If the composer and safe send button are visible for retry, identify that state without choosing microphone, voice, attachment, model selector, or toolbar icons as send. "
+            "Return JSON only."
+        )
+    return (
+        "Decide whether the current Trae task is completed, still generating, or waiting for a user action. "
+        "Treat waiting-for-user-action cards as blockers, not completion evidence. "
+        "If a visible confirmation card asks to delete/remove/discard/cancel/reset, return do_not_click with risk=blocked. "
+        "If a safe confirmation card asks to execute, continue, or keep/save changes, return the exact visible button target. "
+        "Return JSON only."
+    )
+
+
+def _visual_suggested_intervention(visual: dict[str, Any], window_rect: dict | None) -> dict[str, Any]:
+    if not isinstance(visual, dict):
+        return {}
+    analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    if not analysis:
+        return {}
+    recommended = str(analysis.get("recommended_action") or "")
+    if recommended == "type_continue":
+        return {
+            "state": str(analysis.get("screen_state") or "awaiting_continue"),
+            "confidence": analysis.get("confidence") or 0.82,
+            "reason": str(analysis.get("reason") or "ai_visual_type_continue"),
+            "suggested_intervention": {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"},
+        }
+    if recommended == "answer_terminal_prompt":
+        return {
+            "state": "awaiting_terminal_input",
+            "confidence": analysis.get("confidence") or 0.82,
+            "reason": str(analysis.get("reason") or "ai_visual_terminal_prompt"),
+            "suggested_intervention": {"mode": "terminal-input", "action": "terminal_input", "text": "y"},
+        }
+    if recommended in SCROLL_RECOMMENDATIONS:
+        return {
+            "state": str(analysis.get("screen_state") or "needs_scroll_inner_panel"),
+            "confidence": analysis.get("confidence") or 0.82,
+            "reason": str(analysis.get("reason") or "ai_visual_scroll_inner_panel"),
+            "suggested_intervention": {
+                "mode": "scroll-inner-panel",
+                "action": "scroll_inner_panel",
+                "risk": "safe",
+                "wheel_steps": 8,
+                "recommended_action": recommended,
+            },
+        }
+    if recommended == "do_not_click" and str(analysis.get("risk") or "") == "blocked":
+        return {
+            "state": str(analysis.get("screen_state") or "manual_required"),
+            "confidence": analysis.get("confidence") or 0.82,
+            "reason": str(analysis.get("blocked_reason") or analysis.get("reason") or "ai_visual_manual_required"),
+            "suggested_intervention": {
+                "mode": "manual-required",
+                "action": "manual_required",
+                "risk": "blocked",
+                "recommended_action": "do_not_click",
+                "manual_message": str(analysis.get("blocked_reason") or analysis.get("reason") or "Trae 正在等待人工确认。"),
+            },
+        }
+    if recommended in {"click_delete_button", "click_discard_button", "click_cancel_button"}:
+        return {
+            "state": str(analysis.get("screen_state") or "manual_required"),
+            "confidence": analysis.get("confidence") or 0.82,
+            "reason": str(analysis.get("reason") or "ai_visual_destructive_confirmation"),
+            "suggested_intervention": {
+                "mode": "manual-required",
+                "action": "manual_required",
+                "risk": "blocked",
+                "recommended_action": "do_not_click",
+                "manual_message": "Trae 正在等待删除、丢弃或取消类确认，已暂停等待人工确认。",
+            },
+        }
+    if recommended not in CLICK_RECOMMENDATIONS:
+        return {}
+    if str(analysis.get("risk") or "") != "safe":
+        return {}
+    target = analysis.get("target") if isinstance(analysis.get("target"), dict) else {}
+    if not target:
+        targets = analysis.get("targets") if isinstance(analysis.get("targets"), list) else []
+        target = next((item for item in targets if isinstance(item, dict) and str(item.get("risk") or "") == "safe"), {})
+    if not target:
+        return {}
+    action = normalize_action(str(target.get("action") or RECOMMENDATION_ACTIONS.get(recommended) or ""))
+    expected = normalize_action(RECOMMENDATION_ACTIONS.get(recommended, action))
+    if action != expected:
+        action = expected
+    tuple_rect = _tuple_window_rect(window_rect)
+    ok, reason = validate_target(target, action, tuple_rect, min_confidence=0.6)
+    if not ok:
+        return {
+            "state": str(analysis.get("screen_state") or "awaiting_visual_action"),
+            "confidence": analysis.get("confidence") or 0.0,
+            "reason": f"ai_visual_target_rejected:{reason}",
+            "suggested_intervention": {},
+        }
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    return {
+        "state": str(analysis.get("screen_state") or f"awaiting_{action}"),
+        "confidence": analysis.get("confidence") or target.get("confidence") or 0.0,
+        "reason": str(analysis.get("reason") or target.get("reason") or "ai_visual_action_target"),
+        "suggested_intervention": {
+            "mode": "click-point",
+            "action": action,
+            "x": center.get("x"),
+            "y": center.get("y"),
+            "button": target.get("label") or target.get("action") or "",
+            "confidence": target.get("confidence") or analysis.get("confidence"),
+            "source": "ai_vision",
+            "risk": target.get("risk") or analysis.get("risk"),
+            "recommended_action": recommended,
+        },
+    }
+
+
+def _tuple_window_rect(window_rect: dict | None) -> tuple[int, int, int, int] | None:
+    if not window_rect:
+        return None
+    return (
+        int(window_rect.get("left") or 0),
+        int(window_rect.get("top") or 0),
+        int(window_rect.get("right") or 0),
+        int(window_rect.get("bottom") or 0),
+    )
 
 
 def _analysis_is_completed(analysis: dict[str, Any]) -> bool:

@@ -24,6 +24,23 @@ PROMPT_INPUT_MIN_HEIGHT = 12
 PROMPT_INPUT_CANDIDATE_LIMIT = 2
 SUBMISSION_PROBE_INTERVAL_SECONDS = 0.75
 NEW_TASK_SETTLE_SECONDS = 0.8
+COMPOSER_READY_TIMEOUT_SECONDS = 15.0
+COMPOSER_READY_INTERVAL_SECONDS = 0.8
+PROMPT_PROGRESS_INTERVAL_SECONDS = 5.0
+VISUAL_SUBMISSION_SETTLE_SECONDS = 1.2
+VISUAL_SUBMISSION_PASS_STATES = {
+    "prompt_submitted",
+    "generating",
+    "awaiting_run_confirmation",
+    "awaiting_confirm",
+    "awaiting_keep_changes",
+    "awaiting_save",
+    "awaiting_continue",
+    "service_interrupted",
+    "model_error_3003",
+    "terminal_prompt",
+}
+VISUAL_SUBMISSION_FAILURE_STATES = {"prompt_still_in_composer", "prompt_not_submitted"}
 PROMPT_INPUT_NAME_MARKERS = (
     "ask",
     "chat",
@@ -55,12 +72,20 @@ def send_prompt(
     submission_timeout_seconds: float = 15.0,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     open_new_task: bool = False,
+    verify_visual_submission: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict:
     prompt = prompt.strip()
     if not prompt:
         raise PromptSendError("Prompt is empty")
 
     try:
+        _emit_prompt_progress(
+            progress_callback,
+            "focus_trae",
+            "Worker is focusing Trae before sending the prompt.",
+            workspace_path=str(workspace_path or ""),
+        )
         focus_result = _focus_trae_for_prompt(workspace_path)
         window = wait_for_workspace_window_or_any(
             timeout_seconds=3.0,
@@ -82,13 +107,30 @@ def send_prompt(
         raise PromptSendError(str(exc)) from exc
 
     new_task_result = _open_new_task_composer() if open_new_task else {"status": "skipped"}
+    composer_ready: dict[str, Any] = {"status": "skipped"}
     if new_task_result.get("status") == "sent":
+        _emit_prompt_progress(
+            progress_callback,
+            "open_new_task",
+            "Worker opened a new Trae task and is waiting for the composer.",
+            method=str(new_task_result.get("method") or ""),
+        )
         window = wait_for_workspace_window_or_any(
             timeout_seconds=3.0,
             workspace_path=workspace_path,
             prefer_workspace_match=bool(workspace_path),
         )
     window_rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
+    if new_task_result.get("status") == "sent" and window_rect:
+        composer_ready = _wait_for_composer_ready(
+            window=window,
+            window_rect=window_rect,
+            workspace_path=workspace_path,
+            submit=submit,
+            ui_analyst=ui_analyst,
+            window_title=str(focus_result.get("window_title") or ""),
+            progress_callback=progress_callback,
+        )
     if not window_rect:
         input_result = _focus_prompt_input(window)
         _send_keys("^a")
@@ -135,7 +177,17 @@ def send_prompt(
         window_title=str(focus_result.get("window_title") or ""),
         ui_analyst=ui_analyst,
         new_task_result=new_task_result,
+        ready_target_set=composer_ready.get("target_set") if isinstance(composer_ready, dict) else None,
+        verify_visual_submission=verify_visual_submission,
+        progress_callback=progress_callback,
     )
+    attempt_result.setdefault("automation", {})["composer_ready"] = composer_ready
+    if attempt_result.get("status") == "failed":
+        details = {
+            "stage": str(attempt_result.get("reason") or "trae_prompt_send_failed"),
+            "attempt": attempt_result,
+        }
+        raise PromptSendError(str(attempt_result.get("error") or attempt_result.get("reason") or "Trae prompt send failed"), details)
     return {
         "status": "sent",
         "chars": len(prompt),
@@ -233,6 +285,156 @@ def _compact_submission_probe(probe: dict[str, Any]) -> dict:
     return result
 
 
+def _verify_prompt_submission_visually(
+    *,
+    prompt: str,
+    workspace_path: str | Path | None,
+    window_rect: tuple[int, int, int, int],
+    window_title: str,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    probe_error: PromptSendError | None = None,
+) -> dict[str, Any]:
+    time.sleep(VISUAL_SUBMISSION_SETTLE_SECONDS)
+    screenshot_info = _capture_ui_analysis_screenshot(workspace_path=workspace_path)
+    analysis_rect = _screenshot_window_rect(screenshot_info) or window_rect
+    local_analysis: dict[str, Any] = {}
+    if screenshot_info.get("path"):
+        local_analysis = locate_prompt_targets(screenshot_info["path"], analysis_rect)
+    local_state = _local_visual_submission_state(local_analysis)
+    if local_state["status"] == "failed":
+        raise PromptSendError(
+            "Prompt still appears to be in the Trae composer after clicking send.",
+            {
+                "stage": "visual_submission_failed",
+                "reason": local_state["reason"],
+                "submission_probe": _compact_submission_probe(probe_error.details.get("submission_probe", {}))
+                if probe_error
+                else {},
+                "screenshot": screenshot_info,
+                "local_analysis": local_analysis,
+            },
+        )
+
+    ai_analysis: dict[str, Any] = {}
+    ai_error = ""
+    if ui_analyst and screenshot_info.get("path"):
+        try:
+            response = ui_analyst(
+                str(screenshot_info["path"]),
+                _submission_analysis_context(
+                    prompt=prompt,
+                    window_rect=analysis_rect,
+                    window_title=window_title,
+                    workspace_path=workspace_path,
+                    local_analysis=local_analysis,
+                    probe_error=probe_error,
+                ),
+            )
+            ai_analysis = response.get("analysis") if isinstance(response, dict) else {}
+            if not isinstance(ai_analysis, dict):
+                ai_analysis = {}
+        except Exception as exc:
+            ai_error = str(exc)
+        ai_state = _ai_visual_submission_state(ai_analysis)
+        if ai_state["status"] == "confirmed":
+            return {
+                "status": "visually_confirmed",
+                "source": "ai_vision",
+                "screen_state": ai_state["screen_state"],
+                "reason": ai_state["reason"],
+                "screenshot": screenshot_info,
+                "local_analysis": local_analysis,
+                "ai_analysis": ai_analysis,
+                "probe": _probe_error_summary(probe_error),
+            }
+        if ai_state["status"] == "failed":
+            raise PromptSendError(
+                "Visual analysis indicates the prompt was not submitted to Trae.",
+                {
+                    "stage": "visual_submission_failed",
+                    "reason": ai_state["reason"],
+                    "screen_state": ai_state["screen_state"],
+                    "submission_probe": _probe_error_summary(probe_error),
+                    "screenshot": screenshot_info,
+                    "local_analysis": local_analysis,
+                    "ai_analysis": ai_analysis,
+                },
+            )
+
+    if local_state["status"] == "confirmed":
+        return {
+            "status": "visually_confirmed",
+            "source": "local_vision",
+            "reason": local_state["reason"],
+            "screenshot": screenshot_info,
+            "local_analysis": local_analysis,
+            "ai_analysis": ai_analysis,
+            "ai_error": ai_error,
+            "probe": _probe_error_summary(probe_error),
+        }
+
+    if probe_error:
+        raise PromptSendError(
+            "Prompt was clicked in Trae, but neither Trae logs nor visual analysis confirmed submission.",
+            {
+                "stage": "visual_submission_unconfirmed",
+                "submission_probe": _probe_error_summary(probe_error),
+                "screenshot": screenshot_info,
+                "local_analysis": local_analysis,
+                "ai_analysis": ai_analysis,
+                "ai_error": ai_error,
+            },
+        )
+
+    return {
+        "status": "visually_unconfirmed",
+        "source": "visual_fallback",
+        "reason": "no_failure_detected",
+        "screenshot": screenshot_info,
+        "local_analysis": local_analysis,
+        "ai_analysis": ai_analysis,
+        "ai_error": ai_error,
+    }
+
+
+def _local_visual_submission_state(local_analysis: dict[str, Any]) -> dict[str, str]:
+    targets = local_analysis.get("targets") if isinstance(local_analysis.get("targets"), list) else []
+    if not targets:
+        return {"status": "unknown", "reason": "no_local_prompt_targets_detected"}
+    send_target = target_for_action(local_analysis, "send_button", min_confidence=0.55)
+    input_target = target_for_action(local_analysis, "prompt_input", min_confidence=0.55)
+    if send_target and input_target:
+        return {"status": "failed", "reason": "composer_still_has_active_send_button"}
+    if not send_target:
+        return {"status": "confirmed", "reason": "active_send_button_disappeared"}
+    return {"status": "unknown", "reason": "send_button_visible_without_confirmed_input"}
+
+
+def _ai_visual_submission_state(ai_analysis: dict[str, Any]) -> dict[str, str]:
+    if not isinstance(ai_analysis, dict) or not ai_analysis:
+        return {"status": "unknown", "screen_state": "", "reason": "missing_ai_analysis"}
+    screen_state = str(ai_analysis.get("screen_state") or "")
+    recommended_action = str(ai_analysis.get("recommended_action") or "")
+    reason = str(ai_analysis.get("reason") or ai_analysis.get("blocked_reason") or "")
+    if screen_state in VISUAL_SUBMISSION_PASS_STATES or recommended_action in {"wait", "click_run_button", "click_confirm_button"}:
+        return {"status": "confirmed", "screen_state": screen_state, "reason": reason or "ai_visual_confirmed"}
+    if screen_state in VISUAL_SUBMISSION_FAILURE_STATES:
+        return {"status": "failed", "screen_state": screen_state, "reason": reason or screen_state}
+    targets = ai_analysis.get("targets") if isinstance(ai_analysis.get("targets"), list) else []
+    actions = {str(item.get("action") or "") for item in targets if isinstance(item, dict)}
+    if {"prompt_input", "send_button"}.issubset(actions):
+        return {"status": "failed", "screen_state": screen_state, "reason": "ai_detected_prompt_input_and_send_button"}
+    return {"status": "unknown", "screen_state": screen_state, "reason": reason or "ai_visual_unknown"}
+
+
+def _probe_error_summary(error: PromptSendError | None) -> dict[str, Any]:
+    if not error:
+        return {}
+    details = error.details if isinstance(error.details, dict) else {}
+    probe = details.get("submission_probe") if isinstance(details.get("submission_probe"), dict) else {}
+    return _compact_submission_probe(probe) if probe else {"error": str(error)}
+
+
 def _send_prompt_with_adaptive_targets(
     *,
     prompt: str,
@@ -246,9 +448,40 @@ def _send_prompt_with_adaptive_targets(
     window_title: str,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
     new_task_result: dict[str, Any],
+    ready_target_set: dict[str, Any] | None = None,
+    verify_visual_submission: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     attempts: list[dict[str, Any]] = []
     workspace_marker = _workspace_marker(workspace_path)
+    if ready_target_set:
+        ready_result = _try_candidate_set(
+            ready_target_set,
+            prompt=prompt,
+            submit=submit,
+            verify_submission=verify_submission,
+            workspace_path=workspace_path,
+            sent_at_epoch=sent_at_epoch,
+            submission_timeout_seconds=submission_timeout_seconds,
+            strict_submission_verification=strict_submission_verification,
+            window_rect=window_rect,
+            workspace_marker=workspace_marker,
+            ui_analyst=ui_analyst,
+            window_title=window_title,
+            verify_visual_submission=verify_visual_submission,
+            progress_callback=progress_callback,
+        )
+        attempts.append(_compact_attempt(ready_result))
+        if ready_result.get("status") == "sent":
+            ready_result.setdefault("automation", {})["attempts"] = attempts
+            ready_result["automation"]["new_task"] = new_task_result
+            return ready_result
+        if _attempt_clicked_send_then_failed_verification(ready_result):
+            ready_result.setdefault("automation", {})["attempts"] = attempts
+            ready_result["automation"]["new_task"] = new_task_result
+            ready_result["reason"] = "send_clicked_but_unverified_no_retry"
+            return ready_result
+
     for candidate_set in _candidate_target_sets(window_rect, workspace_marker):
         result = _try_candidate_set(
             candidate_set,
@@ -261,11 +494,20 @@ def _send_prompt_with_adaptive_targets(
             strict_submission_verification=strict_submission_verification,
             window_rect=window_rect,
             workspace_marker=workspace_marker,
+            ui_analyst=ui_analyst,
+            window_title=window_title,
+            verify_visual_submission=verify_visual_submission,
+            progress_callback=progress_callback,
         )
         attempts.append(_compact_attempt(result))
         if result.get("status") == "sent":
             result.setdefault("automation", {})["attempts"] = attempts
             result["automation"]["new_task"] = new_task_result
+            return result
+        if _attempt_clicked_send_then_failed_verification(result):
+            result.setdefault("automation", {})["attempts"] = attempts
+            result["automation"]["new_task"] = new_task_result
+            result["reason"] = "send_clicked_but_unverified_no_retry"
             return result
 
     screenshot_info = _capture_ui_analysis_screenshot(workspace_path=workspace_path)
@@ -285,6 +527,10 @@ def _send_prompt_with_adaptive_targets(
             window_rect=analysis_window_rect,
             workspace_marker=workspace_marker,
             source="local_vision",
+            ui_analyst=ui_analyst,
+            window_title=window_title,
+            verify_visual_submission=verify_visual_submission,
+            progress_callback=progress_callback,
         )
         attempts.append(_compact_attempt(local_result))
         if local_result.get("status") == "sent":
@@ -292,6 +538,13 @@ def _send_prompt_with_adaptive_targets(
             local_result["automation"]["screenshot"] = screenshot_info
             local_result["automation"]["local_analysis"] = local_analysis
             local_result["automation"]["new_task"] = new_task_result
+            return local_result
+        if _attempt_clicked_send_then_failed_verification(local_result):
+            local_result.setdefault("automation", {})["attempts"] = attempts
+            local_result["automation"]["screenshot"] = screenshot_info
+            local_result["automation"]["local_analysis"] = local_analysis
+            local_result["automation"]["new_task"] = new_task_result
+            local_result["reason"] = "send_clicked_but_unverified_no_retry"
             return local_result
 
     ai_analysis: dict[str, Any] = {}
@@ -323,6 +576,10 @@ def _send_prompt_with_adaptive_targets(
                 window_rect=analysis_window_rect,
                 workspace_marker=workspace_marker,
                 source="ai_vision",
+                ui_analyst=ui_analyst,
+                window_title=window_title,
+                verify_visual_submission=verify_visual_submission,
+                progress_callback=progress_callback,
             )
             attempts.append(_compact_attempt(ai_result))
             if ai_result.get("status") == "sent":
@@ -331,6 +588,14 @@ def _send_prompt_with_adaptive_targets(
                 ai_result["automation"]["local_analysis"] = local_analysis
                 ai_result["automation"]["ai_analysis"] = ai_analysis
                 ai_result["automation"]["new_task"] = new_task_result
+                return ai_result
+            if _attempt_clicked_send_then_failed_verification(ai_result):
+                ai_result.setdefault("automation", {})["attempts"] = attempts
+                ai_result["automation"]["screenshot"] = screenshot_info
+                ai_result["automation"]["local_analysis"] = local_analysis
+                ai_result["automation"]["ai_analysis"] = ai_analysis
+                ai_result["automation"]["new_task"] = new_task_result
+                ai_result["reason"] = "send_clicked_but_unverified_no_retry"
                 return ai_result
 
     details = {
@@ -391,6 +656,10 @@ def _try_analysis_targets(
     window_rect: tuple[int, int, int, int],
     workspace_marker: str,
     source: str,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    window_title: str = "",
+    verify_visual_submission: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     input_target = target_for_action(analysis, "prompt_input", min_confidence=0.55 if source == "local_vision" else 0.75)
     send_target = target_for_action(analysis, "send_button", min_confidence=0.55 if source == "local_vision" else 0.75)
@@ -405,6 +674,10 @@ def _try_analysis_targets(
         strict_submission_verification=strict_submission_verification,
         window_rect=window_rect,
         workspace_marker=workspace_marker,
+        ui_analyst=ui_analyst,
+        window_title=window_title,
+        verify_visual_submission=verify_visual_submission,
+        progress_callback=progress_callback,
     )
 
 
@@ -420,6 +693,10 @@ def _try_candidate_set(
     strict_submission_verification: bool,
     window_rect: tuple[int, int, int, int],
     workspace_marker: str,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    window_title: str = "",
+    verify_visual_submission: bool = False,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
 ) -> dict[str, Any]:
     source = str(candidate_set.get("source") or "unknown")
     input_target = candidate_set.get("input") if isinstance(candidate_set.get("input"), dict) else {}
@@ -431,27 +708,81 @@ def _try_candidate_set(
         ok, reason = validate_target(send_target, "send_button", window_rect, min_confidence=0.5 if source != "ai_vision" else 0.75)
         if not ok:
             return {"status": "failed", "source": source, "reason": reason, "input": input_target, "send": send_target}
+    _emit_prompt_progress(
+        progress_callback,
+        "prompt_input_target_selected",
+        "Worker selected the Trae prompt input target.",
+        source=source,
+        input=_compact_target_or_click(input_target),
+        submit=submit,
+    )
     input_result = _click_target(input_target, method=_operation_method(source, "prompt_input"))
     _send_keys("^a")
     _send_keys("{BACKSPACE}")
     _send_keys("^v")
+    _emit_prompt_progress(
+        progress_callback,
+        "prompt_pasted",
+        "Worker pasted the prompt into Trae.",
+        source=source,
+        input=_compact_target_or_click(input_result),
+    )
     time.sleep(0.7)
     submit_result = {}
     if submit:
+        send_guard = _verify_send_button_visual(send_target, window_rect, workspace_path)
+        if send_guard.get("status") == "failed":
+            ui_cache.record_failure("send_button", send_target, reason=str(send_guard.get("reason") or "send_visual_guard_failed"))
+            return {
+                "status": "failed",
+                "source": source,
+                "reason": str(send_guard.get("reason") or "send_visual_guard_failed"),
+                "input": input_result,
+                "send": send_target,
+                "send_guard": send_guard,
+            }
         submit_result = _click_target(send_target, method=_operation_method(source, "send_button"))
+        _emit_prompt_progress(
+            progress_callback,
+            "prompt_send_clicked",
+            "Worker clicked the Trae send button.",
+            source=source,
+            submit=_compact_target_or_click(submit_result),
+        )
     verified = not (submit and verify_submission)
     try:
         submission = {}
         if submit and verify_submission:
-            submission = _verify_prompt_submission(
+            try:
+                submission = _verify_prompt_submission(
+                    prompt=prompt,
+                    workspace_path=workspace_path,
+                    sent_at_epoch=sent_at_epoch,
+                    timeout_seconds=submission_timeout_seconds,
+                )
+            except PromptSendError as probe_error:
+                if not verify_visual_submission:
+                    raise
+                submission = _verify_prompt_submission_visually(
+                    prompt=prompt,
+                    workspace_path=workspace_path,
+                    window_rect=window_rect,
+                    window_title=window_title,
+                    ui_analyst=ui_analyst,
+                    probe_error=probe_error,
+                )
+            verified = True
+        elif submit and verify_visual_submission:
+            submission = _verify_prompt_submission_visually(
                 prompt=prompt,
                 workspace_path=workspace_path,
-                sent_at_epoch=sent_at_epoch,
-                timeout_seconds=submission_timeout_seconds,
+                window_rect=window_rect,
+                window_title=window_title,
+                ui_analyst=ui_analyst,
             )
             verified = True
     except PromptSendError as exc:
-        if strict_submission_verification and source.startswith("cache"):
+        if strict_submission_verification:
             ui_cache.record_failure("prompt_input", input_target, reason=str(exc))
             if send_target:
                 ui_cache.record_failure("send_button", send_target, reason=str(exc))
@@ -507,6 +838,241 @@ def _open_new_task_composer() -> dict[str, Any]:
         return {"status": "sent", "method": "ctrl_alt_n"}
     except PromptSendError as exc:
         return {"status": "failed", "method": "ctrl_alt_n", "error": str(exc)}
+
+
+def _wait_for_composer_ready(
+    *,
+    window: Any,
+    window_rect: tuple[int, int, int, int],
+    workspace_path: str | Path | None,
+    submit: bool,
+    ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None,
+    window_title: str,
+    progress_callback: Callable[[dict[str, Any]], None] | None = None,
+) -> dict[str, Any]:
+    deadline = time.monotonic() + COMPOSER_READY_TIMEOUT_SECONDS
+    observations: list[dict[str, Any]] = []
+    last_screenshot: dict[str, Any] = {}
+    last_local_analysis: dict[str, Any] = {}
+    last_ai_analysis: dict[str, Any] = {}
+    last_ai_error = ""
+
+    while time.monotonic() < deadline:
+        uia_candidates = _prompt_input_candidates(window, window_rect)
+        screenshot_info = _capture_ui_analysis_screenshot(workspace_path=workspace_path)
+        last_screenshot = screenshot_info
+        analysis_rect = _screenshot_window_rect(screenshot_info) or window_rect
+        local_analysis = {}
+        if screenshot_info.get("path"):
+            local_analysis = locate_prompt_targets(screenshot_info["path"], analysis_rect)
+        last_local_analysis = local_analysis
+
+        target_set = _ready_target_set(
+            local_analysis,
+            uia_candidates,
+            window_rect=analysis_rect,
+            submit=submit,
+            source="composer_ready",
+        )
+        observation = _composer_ready_observation(local_analysis, uia_candidates, target_set)
+        observations.append(observation)
+        _emit_prompt_progress(
+            progress_callback,
+            "composer_ready_check",
+            "Worker is waiting for the Trae prompt composer to become ready.",
+            observation=observation,
+            attempts=len(observations),
+        )
+        if target_set:
+            return {
+                "status": "ready",
+                "source": "local_vision" if target_set.get("send") else "uia_candidate",
+                "target_set": target_set,
+                "attempts": len(observations),
+                "observations": observations[-5:],
+                "screenshot": screenshot_info,
+                "local_analysis": local_analysis,
+            }
+
+        if ui_analyst and screenshot_info.get("path") and len(observations) >= 2:
+            try:
+                response = ui_analyst(
+                    str(screenshot_info["path"]),
+                    _analysis_context(
+                        window_rect=analysis_rect,
+                        window_title=window_title,
+                        workspace_path=workspace_path,
+                        failed_attempts=observations[-5:],
+                    ),
+                )
+                ai_analysis = response.get("analysis") if isinstance(response, dict) else {}
+                if not isinstance(ai_analysis, dict):
+                    ai_analysis = {}
+                last_ai_analysis = ai_analysis
+                ai_target_set = _ready_target_set(
+                    ai_analysis,
+                    uia_candidates,
+                    window_rect=analysis_rect,
+                    submit=submit,
+                    source="composer_ready_ai",
+                )
+                observations.append(_composer_ready_observation(ai_analysis, uia_candidates, ai_target_set))
+                if ai_target_set:
+                    return {
+                        "status": "ready",
+                        "source": "ai_vision",
+                        "target_set": ai_target_set,
+                        "attempts": len(observations),
+                        "observations": observations[-5:],
+                        "screenshot": screenshot_info,
+                        "local_analysis": local_analysis,
+                        "ai_analysis": ai_analysis,
+                    }
+            except Exception as exc:
+                last_ai_error = str(exc)
+
+        time.sleep(COMPOSER_READY_INTERVAL_SECONDS)
+
+    raise PromptSendError(
+        "Trae composer was not ready after opening a new task.",
+        {
+            "stage": "composer_not_ready",
+            "timeout_seconds": COMPOSER_READY_TIMEOUT_SECONDS,
+            "window_rect": _rect_dict(window_rect),
+            "workspace_path": str(workspace_path or ""),
+            "observations": observations[-8:],
+            "screenshot": last_screenshot,
+            "local_analysis": last_local_analysis,
+            "ai_analysis": last_ai_analysis,
+            "ai_error": last_ai_error,
+        },
+    )
+
+
+def _ready_target_set(
+    analysis: dict[str, Any],
+    uia_candidates: list[dict[str, Any]],
+    *,
+    window_rect: tuple[int, int, int, int],
+    submit: bool,
+    source: str,
+) -> dict[str, Any] | None:
+    input_target = target_for_action(analysis, "prompt_input", min_confidence=0.55)
+    send_target = target_for_action(analysis, "send_button", min_confidence=0.55)
+    if submit:
+        if not (input_target and send_target):
+            return None
+    elif not input_target and not uia_candidates:
+        return None
+    if not input_target and uia_candidates:
+        input_target = _target_from_uia_candidate(uia_candidates[0], window_rect)
+    result = {"source": source, "input": input_target or {}}
+    if submit:
+        result["send"] = send_target or {}
+    return result
+
+
+def _target_from_uia_candidate(candidate: dict[str, Any], window_rect: tuple[int, int, int, int]) -> dict[str, Any]:
+    left, top, right, bottom = window_rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    x = int(candidate.get("center_x") or 0)
+    y = int(candidate.get("center_y") or 0)
+    return {
+        "action": "prompt_input",
+        "center": {"x": x, "y": y},
+        "ratio": {"x": round((x - left) / width, 4), "y": round((y - top) / height, 4)},
+        "confidence": 0.82,
+        "risk": "safe",
+        "method": "uia_candidate",
+        "reason": "composer ready UIA candidate",
+    }
+
+
+def _composer_ready_observation(
+    analysis: dict[str, Any],
+    uia_candidates: list[dict[str, Any]],
+    target_set: dict[str, Any] | None,
+) -> dict[str, Any]:
+    targets = analysis.get("targets") if isinstance(analysis.get("targets"), list) else []
+    actions = [str(item.get("action") or "") for item in targets if isinstance(item, dict)]
+    return {
+        "status": "ready" if target_set else "waiting",
+        "analysis_status": str(analysis.get("status") or ""),
+        "analysis_reason": str(analysis.get("reason") or ""),
+        "actions": actions,
+        "uia_candidate_count": len(uia_candidates),
+    }
+
+
+def _verify_send_button_visual(
+    target: dict[str, Any],
+    window_rect: tuple[int, int, int, int],
+    workspace_path: str | Path | None,
+) -> dict[str, Any]:
+    """Reject obvious microphone/toolbar mis-targets before clicking send."""
+    try:
+        screenshot = capture_screenshot(
+            target="trae_window",
+            timeout_seconds=3.0,
+            quality_required=False,
+            workspace_path=workspace_path,
+        )
+    except Exception as exc:
+        return {"status": "unknown", "reason": f"screenshot_failed:{exc}"}
+    path = screenshot.get("path")
+    if not path:
+        return {"status": "unknown", "reason": "missing_screenshot_path"}
+    capture = screenshot.get("capture") if isinstance(screenshot.get("capture"), dict) else {}
+    bounds = capture.get("bounds") if isinstance(capture.get("bounds"), dict) else {}
+    try:
+        image_left = int(bounds.get("left"))
+        image_top = int(bounds.get("top"))
+    except (TypeError, ValueError):
+        image_left, image_top = window_rect[0], window_rect[1]
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    try:
+        cx = int(float(center.get("x"))) - image_left
+        cy = int(float(center.get("y"))) - image_top
+    except (TypeError, ValueError):
+        return {"status": "failed", "reason": "send_visual_guard_missing_center"}
+    try:
+        from PIL import Image
+
+        image = Image.open(path).convert("RGB")
+    except Exception as exc:
+        return {"status": "unknown", "reason": f"screenshot_unreadable:{exc}"}
+    if not (0 <= cx < image.width and 0 <= cy < image.height):
+        return {"status": "failed", "reason": "send_visual_guard_center_outside_screenshot"}
+    radius = 18
+    green_pixels = 0
+    bright_pixels = 0
+    total = 0
+    for y in range(max(0, cy - radius), min(image.height, cy + radius + 1), 2):
+        for x in range(max(0, cx - radius), min(image.width, cx + radius + 1), 2):
+            red, green, blue = image.getpixel((x, y))
+            total += 1
+            if green >= 45 and green > red * 1.15 and green > blue * 1.05:
+                green_pixels += 1
+            if red >= 170 and green >= 170 and blue >= 170:
+                bright_pixels += 1
+    green_ratio = green_pixels / max(1, total)
+    # The valid Trae send control has a green square background. A microphone
+    # button is mostly grey/white and should fail this guard.
+    if green_pixels >= 10 and green_ratio >= 0.06:
+        return {
+            "status": "passed",
+            "reason": "green_send_button_near_target",
+            "green_pixels": green_pixels,
+            "green_ratio": round(green_ratio, 4),
+        }
+    return {
+        "status": "failed",
+        "reason": "send_target_not_green_send_button",
+        "green_pixels": green_pixels,
+        "green_ratio": round(green_ratio, 4),
+        "bright_pixels": bright_pixels,
+    }
 
 
 def _unconfirmed_submission(error: PromptSendError) -> dict[str, Any]:
@@ -807,6 +1373,26 @@ def _capture_ui_analysis_screenshot(workspace_path: str | Path | None = None) ->
         return {"status": "failed", "error": str(exc)}
 
 
+def _emit_prompt_progress(
+    callback: Callable[[dict[str, Any]], None] | None,
+    event: str,
+    display_message: str,
+    **extra: Any,
+) -> None:
+    if not callback:
+        return
+    try:
+        callback(
+            {
+                "event": event,
+                "display_message": display_message,
+                **extra,
+            }
+        )
+    except Exception:
+        return
+
+
 def _screenshot_window_rect(screenshot_info: dict[str, Any]) -> tuple[int, int, int, int] | None:
     capture = screenshot_info.get("capture") if isinstance(screenshot_info.get("capture"), dict) else {}
     bounds = capture.get("bounds") if isinstance(capture.get("bounds"), dict) else {}
@@ -845,9 +1431,67 @@ def _analysis_context(
         },
         "workspace_path": str(workspace_path or ""),
         "allowed_actions": ["prompt_input", "send_button"],
-        "blocked_actions": ["delete", "discard", "remove", "reset", "cancel"],
+        "desired_action": "send_button",
+        "blocked_actions": [
+            "delete",
+            "discard",
+            "remove",
+            "reset",
+            "cancel",
+            "voice",
+            "microphone",
+            "audio",
+            "语音",
+            "麦克风",
+        ],
         "failed_attempts": failed_attempts[-8:],
-        "instructions": "Locate the Trae chat composer input and green send button. Return JSON only.",
+        "instructions": (
+            "Locate the Trae chat composer input and the active green send/up-arrow/paper-plane button. "
+            "Do not choose microphone, voice input, audio, lightning, attachment, model selector, seed selector, "
+            "or any other composer toolbar icon as send_button. If the candidate looks like microphone/voice, "
+            "return not_found/do_not_click and explain it. Return JSON only."
+        ),
+    }
+
+
+def _submission_analysis_context(
+    *,
+    prompt: str,
+    window_rect: tuple[int, int, int, int],
+    window_title: str,
+    workspace_path: str | Path | None,
+    local_analysis: dict[str, Any],
+    probe_error: PromptSendError | None,
+) -> dict[str, Any]:
+    left, top, right, bottom = window_rect
+    return {
+        "task": "verify_prompt_submission",
+        "window": {
+            "title": window_title,
+            "bounds": {
+                "left": left,
+                "top": top,
+                "right": right,
+                "bottom": bottom,
+                "width": max(1, right - left),
+                "height": max(1, bottom - top),
+            },
+        },
+        "workspace_path": str(workspace_path or ""),
+        "desired_action": "verify_prompt_submission",
+        "prompt_sample": prompt[:600],
+        "local_analysis": local_analysis,
+        "submission_probe_error": _probe_error_summary(probe_error),
+        "instructions": (
+            "Determine whether the prompt was actually submitted after the worker clicked send. "
+            "Return screen_state=prompt_submitted, generating, awaiting_run_confirmation, awaiting_confirm, "
+            "awaiting_continue, service_interrupted, model_error_3003, or terminal_prompt when the submitted prompt "
+            "has left the composer and Trae is processing or waiting for a safe next step. "
+            "Return screen_state=prompt_still_in_composer if the prompt text is still visible in the composer or "
+            "the active green send button is still present next to a filled prompt input. "
+            "Return screen_state=prompt_not_submitted if no submitted user prompt or generation is visible. "
+            "Do not choose any click target for this task; classify only."
+        ),
     }
 
 
@@ -860,6 +1504,15 @@ def _compact_attempt(result: dict[str, Any]) -> dict[str, Any]:
         "input": _compact_target_or_click(result.get("input")),
         "submit": _compact_target_or_click(result.get("submit")),
     }
+
+
+def _attempt_clicked_send_then_failed_verification(result: dict[str, Any]) -> bool:
+    if str(result.get("status") or "") != "failed":
+        return False
+    if str(result.get("reason") or "") != "verification_failed":
+        return False
+    submit = result.get("submit") if isinstance(result.get("submit"), dict) else {}
+    return submit.get("click_x") is not None and submit.get("click_y") is not None
 
 
 def _last_attempt_error(attempts: list[dict[str, Any]]) -> str:

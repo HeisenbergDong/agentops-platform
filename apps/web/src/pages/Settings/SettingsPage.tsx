@@ -52,6 +52,23 @@ export function SettingsPage() {
     }, 0);
   }, [location.hash]);
 
+  useEffect(() => {
+    function handleFeishuOAuthMessage(event: MessageEvent) {
+      if (event.origin !== window.location.origin) return;
+      const data = event.data || {};
+      if (data.source !== "agentops-feishu-oauth") return;
+      setDiscovering(false);
+      if (data.status === "success") {
+        message.success(data.message || "飞书授权已完成");
+        void settings.refetch();
+      } else {
+        message.error(data.message || "飞书授权失败");
+      }
+    }
+    window.addEventListener("message", handleFeishuOAuthMessage);
+    return () => window.removeEventListener("message", handleFeishuOAuthMessage);
+  }, [settings]);
+
   const readinessText = useMemo(() => {
     if (settings.data?.preflight?.summary) {
       return settings.data.preflight.summary;
@@ -79,17 +96,49 @@ export function SettingsPage() {
     setDiscovering(true);
     try {
       await save(form.getFieldsValue(true), false);
-      const response = await api.post("/settings/feishu/discover");
-      message.success(response.data?.resources?.message || "飞书授权已验证");
-      await settings.refetch();
+      const redirectUri = `${window.location.origin}/api/settings/feishu/oauth/callback`;
+      const response = await api.post("/settings/feishu/oauth/begin", { redirect_uri: redirectUri });
+      const authorizeUrl = response.data?.authorize_url;
+      if (!authorizeUrl) {
+        throw new Error("后端没有返回飞书授权地址");
+      }
+      const popup = window.open(authorizeUrl, "agentops-feishu-oauth", "width=920,height=720");
+      if (!popup) {
+        message.warning("浏览器拦截了飞书授权窗口，请允许弹窗后重试。");
+        setDiscovering(false);
+        return;
+      }
+      message.info("请在弹出的飞书窗口完成授权。");
     } catch (error: any) {
-      message.error(error?.response?.data?.detail || "飞书资源获取失败");
-    } finally {
+      message.error(error?.response?.data?.detail || error?.message || "飞书授权启动失败");
       setDiscovering(false);
     }
   }
 
   const feishuResources = settings.data?.sections?.feishu?.discovered_resources;
+  const configuredWorkerId = String(Form.useWatch(["worker", "worker_id"], form) || "").trim();
+  const selectedWorker = useMemo(
+    () => (workers.data || []).find((worker: any) => worker.worker_id === configuredWorkerId),
+    [configuredWorkerId, workers.data]
+  );
+  const workerRuntime = selectedWorker?.runtime_status || {};
+  const workerOptions = useMemo(() => {
+    const options = (workers.data || []).map((worker: any) => ({
+      label: `${worker.worker_id} / ${worker.machine_name}`,
+      value: worker.worker_id
+    }));
+    if (configuredWorkerId && !options.some((option: any) => option.value === configuredWorkerId)) {
+      return [
+        {
+          label: `${configuredWorkerId} / unavailable for current user`,
+          value: configuredWorkerId,
+          disabled: true
+        },
+        ...options
+      ];
+    }
+    return options;
+  }, [configuredWorkerId, workers.data]);
 
   return (
     <Space direction="vertical" size={16} className="page">
@@ -204,6 +253,11 @@ export function SettingsPage() {
                 />
               </Form.Item>
             </Col>
+            <Col span={24}>
+              <Form.Item name={["feishu", "write_url"]} label="写入飞书地址">
+                <Input placeholder="https://bcnrsnl3m9wk.feishu.cn/base/...?table=...&view=..." />
+              </Form.Item>
+            </Col>
             <Col span={8}>
               <Form.Item name={["feishu", "app_token"]} label="Base / App Token">
                 <Input placeholder="bascn..." />
@@ -223,7 +277,7 @@ export function SettingsPage() {
               <Alert
                 showIcon
                 type={feishuResources ? "success" : "warning"}
-                message={feishuResources?.message || "填写 App ID / Secret 后点击获取，系统会验证授权并缓存可自动刷新的访问 token。"}
+                message={feishuResources?.message || "填写 App ID / Secret 和写入地址后点击获取，系统会打开飞书授权页，授权成功后缓存可自动刷新的用户访问 token。"}
               />
             </Col>
           </Row>
@@ -243,13 +297,17 @@ export function SettingsPage() {
                   {...selectPopupProps}
                   allowClear
                   placeholder="选择已注册 Worker"
-                  options={(workers.data || []).map((worker: any) => ({
-                    label: `${worker.worker_id} / ${worker.machine_name}`,
-                    value: worker.worker_id
-                  }))}
+                  options={workerOptions}
                   notFoundContent="暂无可关联 Worker"
                 />
               </Form.Item>
+              {configuredWorkerId && workerOptions[0]?.value === configuredWorkerId && workerOptions[0]?.disabled ? (
+                <Alert
+                  showIcon
+                  type="warning"
+                  message="当前配置关联的 Worker 不属于当前用户或已不可用，请重新注册并选择当前用户自己的 Worker。"
+                />
+              ) : null}
             </Col>
             <Col span={12}>
               <Form.Item name={["worker", "trae_workspace_path"]} label="Trae 工作目录">
@@ -257,13 +315,34 @@ export function SettingsPage() {
               </Form.Item>
             </Col>
             <Col span={12}>
+              <Form.Item name={["worker", "trae_exe_path"]} label="Trae 安装路径">
+                <Input placeholder="D:\\app\\Trae CN\\Trae CN.exe" />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
               <Form.Item name={["worker", "browser_url"]} label="浏览器验收 URL">
                 <Input placeholder="http://localhost:5173" />
               </Form.Item>
             </Col>
+            {selectedWorker ? (
+              <Col span={24}>
+                <Alert
+                  showIcon
+                  type={workerRuntime.trae_exe_exists ? "success" : "warning"}
+                  message={
+                    workerRuntime.trae_exe_exists
+                      ? `Worker 已应用 Trae 路径：${workerRuntime.trae_exe_resolved_path || workerRuntime.trae_exe_path}`
+                      : `Worker 当前找不到 Trae：${workerRuntime.trae_exe_path || "未上报 Trae 路径"}`
+                  }
+                  description={`工作目录：${workerRuntime.workspace_root || "-"} ${
+                    workerRuntime.workspace_root_exists === false ? "（Worker 本机不存在）" : ""
+                  }`}
+                />
+              </Col>
+            ) : null}
             <Col span={24}>
               <Typography.Paragraph type="secondary">
-                服务端只保存这份关联配置，不直接访问本机路径；后续由 Worker 拉取或接收该配置。浏览器验收 URL 仅支持本地 HTTP 地址。
+                服务端只保存这份关联配置，不直接访问本机路径；Worker 在线心跳后会拉取 Trae 安装路径、工作目录和浏览器验收 URL，并回报本机校验结果。
               </Typography.Paragraph>
             </Col>
           </Row>

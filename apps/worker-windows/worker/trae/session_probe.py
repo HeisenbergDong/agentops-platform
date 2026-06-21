@@ -62,9 +62,13 @@ class TraeTurn:
     match_score: float = 0.0
 
     def as_dict(self) -> dict[str, Any]:
+        display_id = build_session_display_id(self)
         return {
             "status": "found",
             "session_id": self.session_id,
+            "chat_session_id": self.session_id,
+            "display_session_id": display_id,
+            "trae_session_display_id": display_id,
             "user_message_id": self.user_message_id,
             "trace_id": self.trace_ids[-1] if self.trace_ids else "",
             "trace_ids": self.trace_ids,
@@ -83,6 +87,50 @@ class TraeTurn:
             "match_score": self.match_score,
             "confidence": "latest_completed_trae_log_turn" if self.status == "completed" else "latest_trae_log_turn",
         }
+
+
+def build_session_display_id(turn: TraeTurn | dict[str, Any]) -> str:
+    trace_ids = _turn_list_value(turn, "trace_ids")
+    task_ids = _turn_list_value(turn, "task_ids")
+    trace_id = _turn_text_value(turn, "trace_id") or (trace_ids[0] if trace_ids else "")
+    session_id = _turn_text_value(turn, "session_id") or _turn_text_value(turn, "chat_session_id")
+    task_id = _turn_text_value(turn, "task_id") or (task_ids[0] if task_ids else "")
+    message_id = _turn_text_value(turn, "user_message_id")
+    end_time = format_session_time(_turn_text_value(turn, "end_time") or _turn_text_value(turn, "start_time"))
+    if not all([trace_id, session_id, task_id, message_id, end_time]):
+        return ""
+    return f".696467687743947:{trace_id}_{session_id}.{task_id}.{message_id}:Trae CN.T({end_time})"
+
+
+def format_session_time(value: str) -> str:
+    if not value:
+        return ""
+    text = str(value).strip()
+    if text.endswith("Z"):
+        text = text[:-1] + "+00:00"
+    try:
+        parsed = datetime.fromisoformat(text)
+    except ValueError:
+        return text
+    return f"{parsed.year}/{parsed.month}/{parsed.day} {parsed.hour:02d}:{parsed.minute:02d}:{parsed.second:02d}"
+
+
+def _turn_text_value(turn: TraeTurn | dict[str, Any], key: str) -> str:
+    if isinstance(turn, TraeTurn):
+        value = getattr(turn, key, "")
+    else:
+        value = turn.get(key)
+    return str(value or "").strip()
+
+
+def _turn_list_value(turn: TraeTurn | dict[str, Any], key: str) -> list[str]:
+    if isinstance(turn, TraeTurn):
+        value = getattr(turn, key, [])
+    else:
+        value = turn.get(key) or []
+    if not isinstance(value, list):
+        return []
+    return [str(item).strip() for item in value if str(item).strip()]
 
 
 def probe_latest_trae_turn(

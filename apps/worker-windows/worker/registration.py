@@ -10,6 +10,8 @@ from worker.capabilities import CAPABILITIES, SUPPORTED_APPS
 from worker.config import WorkerSettings, load_worker_settings, save_worker_settings
 from worker.connection.client import WorkerClient
 
+DEFAULT_WORKER_ID = "local-windows-worker"
+
 
 @dataclass(frozen=True)
 class RegistrationOptions:
@@ -34,9 +36,12 @@ def register_worker(options: RegistrationOptions) -> tuple[WorkerSettings, Path,
     current = load_worker_settings(options.config_path)
     machine_name = socket.gethostname()
     display_name = options.display_name.strip() or current.display_name or machine_name
+    requested_worker_id = options.worker_id.strip()
+    if not requested_worker_id and current.worker_id and current.worker_id != DEFAULT_WORKER_ID:
+        requested_worker_id = current.worker_id
     payload = {
         "registration_code": registration_code,
-        "worker_id": options.worker_id.strip() or current.worker_id or "",
+        "worker_id": requested_worker_id,
         "display_name": display_name,
         "worker_type": current.worker_type,
         "machine_name": machine_name,

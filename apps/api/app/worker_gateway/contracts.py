@@ -52,6 +52,7 @@ class WorkerHeartbeat(BaseModel):
     capabilities: list[str] = Field(default_factory=list)
     current_stage: str = "idle"
     current_window_title: str = ""
+    runtime_status: dict[str, Any] = Field(default_factory=dict)
     busy: bool = False
 
 

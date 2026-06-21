@@ -58,6 +58,7 @@ class CommandRunner:
             self.state.stage = command_type or "unknown_command"
             if command_type != "stop_current_task":
                 self.state.stop_requested = False
+                self.state.stop_cleanup_result = None
                 cancellation.raise_if_cancelled()
             if command_type == "capture_screenshot":
                 data = self._capture_screenshot(payload)
@@ -72,11 +73,11 @@ class CommandRunner:
                 data = self._wait_completion(payload, cancellation, command_id)
                 self.state.stage = "trae_completed"
             elif command_type == "diagnose_ui":
-                data = diagnose_ui()
+                data = self._diagnose_ui(payload)
             elif command_type == "click_continue":
                 data = self._click_continue(payload)
             elif command_type == "click_confirm":
-                data = click_confirm()
+                data = click_confirm(ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None)
             elif command_type == "copy_latest_reply":
                 data = self._copy_latest_reply(payload, cancellation)
             elif command_type == "scan_project":
@@ -94,7 +95,12 @@ class CommandRunner:
                 return self._failed(command_id, f"Unsupported command type: {command_type}", lease_id=lease_id)
             return self._success(command_id, data, lease_id=lease_id)
         except CommandCancelled as exc:
-            return self._cancelled(command_id, str(exc), lease_id=lease_id)
+            return self._cancelled(
+                command_id,
+                str(exc),
+                lease_id=lease_id,
+                data=self._cancelled_stop_data(payload),
+            )
         except (TraeAutomationError, PromptSendError) as exc:
             return self._manual_required(command_id, exc, lease_id=lease_id)
         except Exception as exc:
@@ -125,6 +131,15 @@ class CommandRunner:
         self.state.current_window_title = str(result.get("window_title") or "")
         return result
 
+    def _ensure_trae_ready_for_payload(self, payload: dict[str, Any], workspace_path: Path | None) -> dict:
+        if not (payload.get("trae_workspace_path") or payload.get("workspace_path")):
+            return {"status": "skipped", "reason": "no_workspace_path"}
+        return self.ensure_trae_ready(
+            workspace_path,
+            launch_timeout_seconds=float(payload.get("launch_timeout_seconds", payload.get("timeout_seconds", 30))),
+            force_open_workspace=bool(payload.get("force_open_workspace", False)),
+        )
+
     def _focus_trae(self, payload: dict[str, Any]) -> dict:
         launch_if_missing = bool(payload.get("launch_if_missing", True))
         if not launch_if_missing:
@@ -137,11 +152,16 @@ class CommandRunner:
         )
 
     def _capture_screenshot(self, payload: dict[str, Any]) -> dict:
-        return capture_screenshot(
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        open_result = self._ensure_trae_ready_for_payload(payload, workspace_path)
+        result = capture_screenshot(
             target=str(payload.get("target") or "trae_window"),
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
             quality_required=bool(payload.get("quality_required", True)),
+            workspace_path=self._launch_workspace_path(workspace_path),
         )
+        result["open_trae"] = open_result
+        return result
 
     def _send_prompt(self, payload: dict[str, Any]) -> dict:
         prompt = str(payload.get("prompt") or "")
@@ -167,7 +187,9 @@ class CommandRunner:
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 30)),
                 ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
-                open_new_task=bool(payload.get("open_new_task", True)),
+                open_new_task=bool(payload.get("open_new_task", False)),
+                verify_visual_submission=bool(payload.get("verify_visual_submission", True)),
+                progress_callback=lambda event: self._post_send_prompt_progress(command_id, payload, event),
             )
         except PromptSendError as exc:
             details = dict(exc.details or {})
@@ -192,6 +214,54 @@ class CommandRunner:
         self.state.current_window_title = str(send_result.get("window_title") or self.state.current_window_title)
         return send_result
 
+    def _post_send_prompt_progress(self, command_id: str, payload: dict[str, Any], event: dict[str, Any]) -> None:
+        if not self.worker_client:
+            return
+        display_message = str(event.get("display_message") or "").strip()
+        extra = {key: value for key, value in event.items() if key != "display_message"}
+        try:
+            self.worker_client.get_command(
+                self.worker_id,
+                command_id,
+                lease_id=str(self.state.current_lease_id or ""),
+            )
+        except Exception:
+            pass
+        if not display_message:
+            return
+        try:
+            self.worker_client.post_log(
+                self.worker_id,
+                {
+                    "command_id": command_id,
+                    "job_id": payload.get("job_id"),
+                    "round_id": payload.get("round_id"),
+                    "stage": "sending_prompt",
+                    "level": "info",
+                    "message": str(event.get("event") or "send_prompt progress"),
+                    "display_message": display_message,
+                    "extra": extra,
+                },
+            )
+        except Exception:
+            return
+
+    def _diagnose_ui(self, payload: dict[str, Any]) -> dict:
+        task = str(payload.get("task") or "find_reply_action_button")
+        scroll_bottom_value = payload.get("scroll_bottom")
+        scroll_bottom = task != "find_prompt_input_and_send_button" if scroll_bottom_value is None else bool(scroll_bottom_value)
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        open_result = self._ensure_trae_ready_for_payload(payload, workspace_path)
+        result = diagnose_ui(
+            timeout_seconds=float(payload.get("timeout_seconds") or 10),
+            scroll_bottom=scroll_bottom,
+            task=task,
+            workspace_path=self._launch_workspace_path(workspace_path),
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+        )
+        result["open_trae"] = open_result
+        return result
+
     def _stop_current_task(self, payload: dict[str, Any]) -> dict:
         workspace_path = None
         workspace_error = ""
@@ -208,6 +278,7 @@ class CommandRunner:
         cleanup = cleanup_local_activity(
             workspace_path=workspace_path,
             project_name=str(payload.get("project_name") or payload.get("project_slug") or ""),
+            browser_url=str(payload.get("url") or payload.get("browser_url") or payload.get("acceptance_url") or ""),
             kill_trae=bool(payload.get("kill_trae", False)),
         )
         time.sleep(float(payload.get("stop_verify_delay_seconds") or 3.0))
@@ -248,6 +319,7 @@ class CommandRunner:
 
     def _wait_completion(self, payload: dict[str, Any], cancellation: CancellationToken, command_id: str = "") -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        self._ensure_trae_ready_for_payload(payload, workspace_path)
         return wait_completion(
             timeout_seconds=float(payload.get("timeout_seconds", 900)),
             stable_seconds=float(payload.get("stable_seconds", 15)),
@@ -258,7 +330,7 @@ class CommandRunner:
             progress_callback=lambda event: self._post_wait_progress(command_id, payload, event),
             progress_interval_seconds=float(payload.get("progress_interval_seconds", 10)),
             prompt=str(payload.get("prompt") or ""),
-            workspace_path=str(workspace_path or self.settings.workspace_root),
+            workspace_path=str(workspace_path or ""),
             sent_at_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
@@ -290,9 +362,10 @@ class CommandRunner:
 
     def _copy_latest_reply(self, payload: dict[str, Any], cancellation: CancellationToken | None = None) -> dict:
         workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        open_result = self._ensure_trae_ready_for_payload(payload, workspace_path)
         trae_turn = probe_latest_trae_turn(
             prompt=str(payload.get("prompt") or ""),
-            workspace_path=str(workspace_path or self.settings.workspace_root),
+            workspace_path=str(workspace_path or ""),
             sent_after_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_after=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
         )
@@ -301,20 +374,27 @@ class CommandRunner:
             cancellation_check=cancellation.raise_if_cancelled if cancellation else None,
             trae_turn=trae_turn,
             prompt=str(payload.get("prompt") or ""),
-            workspace_path=str(workspace_path or self.settings.workspace_root),
-            allow_local_fallback=bool(payload.get("allow_local_trace_fallback", True)),
+            workspace_path=str(workspace_path or ""),
+            allow_local_fallback=bool(payload.get("allow_local_trace_fallback", False)),
+            ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
         )
         result["trae_turn"] = trae_turn
+        result["open_trae"] = open_result
         result["current_turn_gate"] = _current_turn_gate(result.get("trae_turn"), result.get("trace_probe"))
         result["supervisor_decision"] = _copy_supervisor_decision(result.get("current_turn_gate"), result.get("trace_probe"))
         return result
 
     def _click_continue(self, payload: dict[str, Any]) -> dict:
-        return click_continue(
+        workspace_path = self._workspace_path(payload.get("trae_workspace_path") or payload.get("workspace_path"))
+        open_result = self._ensure_trae_ready_for_payload(payload, workspace_path)
+        result = click_continue(
             timeout_seconds=float(payload.get("timeout_seconds", 10)),
             recovery_reason=str(payload.get("recovery_reason") or ""),
+            workspace_path=self._launch_workspace_path(workspace_path),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
         )
+        result["open_trae"] = open_result
+        return result
 
     def _analyze_trae_ui(self, screenshot_path: str, context: dict[str, Any]) -> dict:
         if not self.worker_client:
@@ -390,8 +470,7 @@ class CommandRunner:
         return workspace_path
 
     def _launch_workspace_path(self, workspace_path: Path | None) -> Path | None:
-        candidate = workspace_path or self.settings.workspace_root
-        return candidate if candidate and candidate.exists() else workspace_path
+        return workspace_path if workspace_path and workspace_path.exists() else workspace_path
 
     def _restore_trae_foreground(self, data: dict) -> dict:
         if not self.settings.keep_trae_foreground:
@@ -427,14 +506,44 @@ class CommandRunner:
             "error": str(error),
         }
 
-    def _cancelled(self, command_id: str, message: str, lease_id: str = "") -> dict:
+    def _cancelled_stop_data(self, payload: dict[str, Any]) -> dict:
+        stop_payload = {
+            **(payload or {}),
+            "reason": "server_cancelled_current_command",
+            "use_ai_ui_analyst": True,
+        }
+        try:
+            cached = self.state.stop_cleanup_result if isinstance(self.state.stop_cleanup_result, dict) else None
+            if cached:
+                return {**cached, "stop_report": {**cached.get("stop_report", {}), "cleanup_source": "async_cancel"}}
+            data = self._stop_current_task(stop_payload)
+            data["stop_reason"] = "server_cancelled_current_command"
+            return data
+        except Exception as exc:
+            return {
+                "stopped": False,
+                "message": "Worker stop cleanup failed after command cancellation.",
+                "stop_reason": "server_cancelled_current_command",
+                "stop_report": {
+                    "worker_command_cancelled": True,
+                    "stop_confirmed": False,
+                    "cleanup_status": "failed",
+                    "cleanup_error": str(exc),
+                    "trae_stop_clicked": False,
+                    "local_processes_matched": 0,
+                    "local_processes_killed": 0,
+                    "local_process_kill_errors": 1,
+                },
+            }
+
+    def _cancelled(self, command_id: str, message: str, lease_id: str = "", data: dict | None = None) -> dict:
         return {
             "command_id": command_id,
             "worker_id": self.worker_id,
             "lease_id": lease_id,
             "status": "cancelled",
             "message": message or "Command cancelled",
-            "data": {},
+            "data": data or {},
             "error": "",
         }
 

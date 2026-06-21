@@ -57,6 +57,111 @@ def test_diagnose_ui_classifies_safe_action_button(monkeypatch: pytest.MonkeyPat
     assert result["suggested_intervention"]["mode"] == "click-point"
 
 
+def test_diagnose_ui_marks_local_delete_confirmation_manual_required(monkeypatch: pytest.MonkeyPatch):
+    class Rect:
+        left = 325
+        top = 555
+        right = 683
+        bottom = 590
+
+    class FakeButton:
+        def window_text(self):
+            return "\u786e\u8ba4"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeButton()] if control_type == "Button" else []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        "worker.trae.diagnose.window_text_snapshot",
+        lambda window, limit=500: "\u786e\u8ba4\u5220\u9664 4 \u4e2a\u6587\u4ef6\uff1f\u5220\u9664\u540e\u6587\u4ef6\u65e0\u6cd5\u6062\u590d",
+    )
+
+    result = diagnose_ui()
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_delete_confirmation"
+    assert result["suggested_intervention"]["action"] == "delete_button"
+    assert result["suggested_intervention"]["mode"] == "manual-required"
+    assert result["suggested_intervention"]["risk"] == "blocked"
+
+
+def test_diagnose_ui_blocks_waiting_delete_card_even_if_vision_says_completed(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    screenshot = tmp_path / "trae-waiting-delete-card.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+    seen_context = {}
+
+    class DeleteRect:
+        left = 378
+        top = 655
+        right = 435
+        bottom = 686
+
+    class FakeButton:
+        def window_text(self):
+            return "\u5220\u9664"
+
+        def rectangle(self):
+            return DeleteRect()
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeButton()] if control_type == "Button" else []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        "worker.trae.diagnose.window_text_snapshot",
+        lambda window, limit=500: "\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c\n\u5220\u9664 startup.log\n\u4fdd\u7559\n\u5220\u9664",
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+
+    def fake_analyst(path, context):
+        seen_context.update(context)
+        return {
+            "analysis": {
+                "status": "found",
+                "screen_state": "completed",
+                "recommended_action": "collect_trace_candidate",
+                "confidence": 0.93,
+                "risk": "safe",
+            }
+        }
+
+    result = diagnose_ui(ui_analyst=fake_analyst)
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_destructive_confirmation"
+    assert result["reason"] == "local_waiting_destructive_confirmation"
+    assert result["suggested_intervention"]["mode"] == "manual-required"
+    assert result["suggested_intervention"]["recommended_action"] == "do_not_click"
+    assert result["suggested_intervention"]["risk"] == "blocked"
+    assert any("waiting-for-user-action" in item for item in seen_context["manual_required_rules"])
+    assert "\u5220\u9664/delete/remove/discard/cancel/reset" in seen_context["manual_required_rules"][1]
+
+
 def test_diagnose_ui_scrolls_again_when_action_card_is_below_view(monkeypatch: pytest.MonkeyPatch):
     class Rect:
         left = 100
@@ -181,7 +286,7 @@ def test_local_vision_finds_high_risk_run_button(tmp_path):
     assert 490 <= target["center"]["y"] <= 540
 
 
-def test_diagnose_ui_uses_local_visual_when_webview_buttons_are_hidden(monkeypatch: pytest.MonkeyPatch, tmp_path):
+def test_diagnose_ui_uses_llm_visual_when_webview_buttons_are_hidden(monkeypatch: pytest.MonkeyPatch, tmp_path):
     screenshot = tmp_path / "trae-risk-card.png"
     Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
 
@@ -206,29 +311,157 @@ def test_diagnose_ui_uses_local_visual_when_webview_buttons_are_hidden(monkeypat
         "worker.trae.diagnose.capture_screenshot",
         lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
     )
-    monkeypatch.setattr(
-        "worker.trae.diagnose.locate_visible_action_targets",
-        lambda path, rect: {
-            "status": "found",
-            "targets": [
-                {
+    def fake_analyst(path, context):
+        assert path == str(screenshot)
+        assert context["task"] == "find_reply_action_button"
+        return {
+            "analysis": {
+                "status": "found",
+                "screen_state": "awaiting_run_confirmation",
+                "recommended_action": "click_run_button",
+                "confidence": 0.91,
+                "risk": "safe",
+                "target": {
                     "action": "run_button",
+                    "label": "\u6267\u884c",
                     "center": {"x": 685, "y": 512},
                     "ratio": {"x": 0.3568, "y": 0.4961},
-                    "confidence": 0.86,
+                    "confidence": 0.91,
                     "risk": "safe",
-                    "reason": "high-risk command confirmation card",
-                }
-            ],
-        },
-    )
+                    "reason": "visible execute button",
+                },
+            }
+        }
 
-    result = diagnose_ui()
+    result = diagnose_ui(ui_analyst=fake_analyst)
 
     assert result["ok"] is True
-    assert result["state"] == "awaiting_run"
+    assert result["state"] == "awaiting_run_confirmation"
     assert result["suggested_intervention"]["mode"] == "click-point"
-    assert result["suggested_intervention"]["action"] == "run"
+    assert result["suggested_intervention"]["action"] == "run_button"
+    assert result["suggested_intervention"]["source"] == "ai_vision"
+
+
+def test_diagnose_ui_blocks_llm_delete_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    screenshot = tmp_path / "trae-delete-card.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "\u6700\u5c0f\u5316\n\u5173\u95ed")
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+
+    result = diagnose_ui(
+        ui_analyst=lambda path, context: {
+            "analysis": {
+                "status": "found",
+                "screen_state": "awaiting_delete_confirmation",
+                "recommended_action": "click_delete_button",
+                "confidence": 0.88,
+                "risk": "safe",
+                "target": {
+                    "action": "delete_button",
+                    "label": "\u5220\u9664",
+                    "center": {"x": 600, "y": 620},
+                    "confidence": 0.88,
+                    "risk": "safe",
+                },
+            }
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_delete_confirmation"
+    assert result["suggested_intervention"]["mode"] == "manual-required"
+    assert result["suggested_intervention"]["risk"] == "blocked"
+
+
+def test_diagnose_ui_uses_llm_inner_panel_scroll(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    screenshot = tmp_path / "trae-inner-card.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c")
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+
+    result = diagnose_ui(
+        ui_analyst=lambda path, context: {
+            "analysis": {
+                "status": "partial",
+                "screen_state": "needs_scroll_inner_panel",
+                "recommended_action": "scroll_inner_panel",
+                "confidence": 0.89,
+                "risk": "safe",
+                "evidence": ["\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c", "\u5185\u5c42\u5361\u7247\u672a\u5b8c\u5168\u663e\u793a"],
+            }
+        }
+    )
+
+    assert result["ok"] is True
+    assert result["state"] == "needs_scroll_inner_panel"
+    assert result["suggested_intervention"]["mode"] == "scroll-inner-panel"
+
+
+def test_diagnose_ui_scrolls_inner_panel_from_waiting_action_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "正在等待您的操作")
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+
+    result = diagnose_ui(ui_analyst=None)
+
+    assert result["ok"] is True
+    assert result["state"] == "needs_scroll_inner_panel"
+    assert result["reason"] == "waiting_action_inner_panel_hidden"
+    assert result["suggested_intervention"]["mode"] == "scroll-inner-panel"
 
 
 def test_apply_intervention_rejects_unknown_mode():
@@ -346,8 +579,8 @@ def test_wait_completion_runs_idle_intervention(monkeypatch: pytest.MonkeyPatch)
     now = {"value": 100.0}
     interventions = []
 
-    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds, **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds, **_kwargs: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "Trae waiting for confirmation")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
     monkeypatch.setattr(
@@ -401,8 +634,8 @@ def test_wait_completion_intervenes_on_pending_ui_before_local_turn_completes(mo
     interventions = []
     diagnosis_calls = {"count": 0}
 
-    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds, **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds, **_kwargs: FakeWindow())
     monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u786e\u8ba4\u6267\u884c\nTrae waiting for run confirmation")
     monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
     monkeypatch.setattr(
@@ -457,8 +690,8 @@ def test_wait_completion_accepts_completed_turn_with_pending_keep_text(monkeypat
     now = {"value": 100.0}
     diagnosis_calls = {"count": 0}
 
-    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds, **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds, **_kwargs: FakeWindow())
     monkeypatch.setattr(
         wait_module,
         "window_text_snapshot",
@@ -717,8 +950,8 @@ def test_wait_completion_keeps_waiting_when_current_turn_is_pending(monkeypatch:
 
     now = {"value": 100.0}
 
-    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds, **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds, **_kwargs: FakeWindow())
     monkeypatch.setattr(
         wait_module,
         "window_text_snapshot",

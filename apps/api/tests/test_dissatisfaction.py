@@ -18,8 +18,8 @@ def test_dissatisfaction_reason_humanizes_feishu_403():
     )
 
     reason = result["reason"]
-    assert "产物不满意：" in reason
-    assert "过程不满意：" in reason
+    assert reason.startswith("产物不满意：")
+    assert "\n过程不满意：" in reason
     assert "飞书接口返回 403" in reason
     assert "developer.mozilla.org" not in reason
     assert "关键证据" not in reason
@@ -42,6 +42,33 @@ def test_dissatisfaction_reason_uses_domain_hint_without_inventing_clicks():
     assert "可能" not in reason
 
 
+def test_dissatisfaction_reason_states_specific_browser_failure_not_uncertainty():
+    result = generate_dissatisfaction_reason(
+        DissatisfactionEvidence(
+            failure_stage="browser_accepting",
+            failure_message="Browser acceptance did not pass with usable local page evidence.",
+            prompt="招聘方工作台首页要直达工作台，并支持职位、候选人、面试和统计四个入口",
+            data={
+                "status": "failed",
+                "url": "http://localhost:5174/",
+                "http_status": 500,
+                "inspection": {
+                    "issues": ["页面包含运行错误或构建错误信号：Internal Server Error"],
+                    "interaction": {"total": 0, "button_labels": []},
+                },
+            },
+        )
+    )
+
+    reason = result["reason"]
+    assert "http://localhost:5174/ 浏览器验收失败" in reason
+    assert "HTTP 状态为 500" in reason
+    assert "页面没有检测到可操作入口" in reason
+    assert "未确认" not in reason
+    assert "不能确认" not in reason
+    assert "无法确认" not in reason
+
+
 def test_dissatisfaction_reason_agentops_uses_agentops_acceptance_without_monitor_leak():
     result = generate_dissatisfaction_reason(
         DissatisfactionEvidence(
@@ -53,8 +80,13 @@ def test_dissatisfaction_reason_agentops_uses_agentops_acceptance_without_monito
     )
 
     reason = result["reason"]
+    assert reason.startswith("产物不满意：")
+    assert "\n过程不满意：" in reason
     assert "提示发送" in reason
-    assert "底部日志复制" in reason
+    assert "底部过程记录复制" in reason
+    body = reason.replace("产物不满意：", "").replace("过程不满意：", "")
+    assert "日志" not in body
+    assert "轨迹" not in body
     assert "全过程链路看板" not in reason
     assert "告警规则" not in reason
     assert result["task_done"] == "未完成任务"
@@ -93,5 +125,7 @@ def test_dissatisfaction_reason_can_force_labeled_test_unsatisfied():
     )
 
     assert result["test_mode"] is True
+    assert result["reason"].startswith("产物不满意：")
+    assert "\n过程不满意：" in result["reason"]
     assert "链路验证测试" in result["reason"]
     assert "正式业务验收" in result["reason"]

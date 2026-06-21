@@ -38,8 +38,13 @@ def build_display_message(
         if workspace:
             return f"已为本次作业准备项目目录 {project or ''}：{workspace}"
         return "已为本次作业准备独立项目目录。"
+    if stage_key == "prompt_generation_retry":
+        reason = str(data.get("quality_reason") or data.get("quality_error") or "").strip()
+        if reason:
+            return f"提示词未通过质量检查，调度已将原因反馈给提示词角色重生成：{reason}"
+        return "提示词未通过质量检查，调度已要求提示词角色重生成。"
     if stage_key == "prompt_generation_fallback":
-        return "提示词角色暂时不可用，系统正在使用内置规则生成可执行提示词。"
+        return "提示词角色未能生成合格结果，系统正在使用内置规则生成可执行提示词。"
     if stage_key == "prompt_ready":
         preview = str(data.get("prompt_preview") or "").strip()
         if preview:
@@ -125,7 +130,16 @@ def build_display_message(
     if stage_key == "worker_command_retry":
         return "已重新下发当前 Worker 命令。"
     if stage_key == "worker_stop_command":
-        return "已通知绑定的 Worker 停止当前动作。"
+        return "停止命令已下发给绑定的 Worker，等待 Worker 回传停止确认。"
+    if stage_key == "worker_commands_cancelled":
+        count = data.get("cancelled_commands")
+        try:
+            value = int(count)
+        except (TypeError, ValueError):
+            value = 0
+        if value > 0:
+            return f"已取消 {value} 个正在排队或执行的 Worker 命令，等待 Worker 停止本机动作。"
+        return "已取消正在排队或执行的 Worker 命令，等待 Worker 停止本机动作。"
     if stage_key == "dissatisfaction_reason":
         reason = str(data.get("reason") or message or "").strip()
         return f"本轮不满意原因已生成：{_clean_reason(reason)}"
@@ -183,12 +197,21 @@ def _worker_command_finished_message(command_type: str, status: str, data: dict[
         return "GitHub 提交流程已完成。"
     if command_type == "click_continue" and ok:
         return _click_continue_finished_message(data)
+    if command_type == "stop_current_task" and ok:
+        report = data.get("stop_report") if isinstance(data.get("stop_report"), dict) else {}
+        if report.get("trae_ui_stopped_verified"):
+            return "Worker 已确认暂停成功，Trae 生成和本地动作都已停止。"
+        if report.get("stop_confirmed") or report.get("worker_command_cancelled"):
+            return "Worker 已回传暂停确认，本地清理已执行完成。"
+        return "Worker 已执行暂停命令，但没有拿到明确停止确认。"
     if command_type == "wait_completion" and not ok:
         return "Worker 暂时还不能确认 Trae CN 当前回复已完成，调度器会按恢复流程继续观察。"
     if command_type == "copy_latest_reply" and not ok:
         return "Worker 还没有拿到可用的完整 Trae CN 回复轨迹，调度器会继续恢复和重试采集。"
     if command_type == "click_continue" and not ok:
         return "Worker 没能安全完成续写恢复动作，调度器会根据结果判断是否需要人工处理。"
+    if command_type == "stop_current_task" and not ok:
+        return "Worker 暂停命令没有确认成功，请检查 Trae 或本地进程是否仍在运行。"
     if ok:
         return "Worker 命令已执行完成。"
     return "Worker 命令执行失败或需要人工处理。"

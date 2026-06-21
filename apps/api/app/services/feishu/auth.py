@@ -7,6 +7,7 @@ from app.core.secrets import seal_secret
 from app.services.user_settings import safe_open_secret
 
 FEISHU_BASE_URL = "https://open.feishu.cn/open-apis"
+FEISHU_AUTHORIZE_URL = "https://accounts.feishu.cn/open-apis/authen/v1/authorize"
 TOKEN_REFRESH_SKEW_SECONDS = 300
 
 
@@ -14,7 +15,11 @@ class FeishuAuthError(RuntimeError):
     pass
 
 
-def get_feishu_access_token(feishu_config: dict[str, Any]) -> tuple[str, dict[str, Any] | None, str]:
+def get_feishu_access_token(
+    feishu_config: dict[str, Any],
+    *,
+    require_user_oauth: bool = False,
+) -> tuple[str, dict[str, Any] | None, str]:
     token_cache = feishu_config.get("token_cache") if isinstance(feishu_config.get("token_cache"), dict) else {}
 
     cached_user_token = _cached_secret(token_cache, "user_access_token", "access_token")
@@ -27,10 +32,13 @@ def get_feishu_access_token(feishu_config: dict[str, Any]) -> tuple[str, dict[st
     if refresh_token and (not refresh_expires_at or refresh_expires_at > int(time.time()) + TOKEN_REFRESH_SKEW_SECONDS):
         try:
             refreshed = refresh_user_token(feishu_config, refresh_token)
-            refreshed_cache = _cache_user_token(token_cache, refreshed, refresh_token)
+            refreshed_cache = cache_user_token(token_cache, refreshed, refresh_token)
             return _oauth_data_token(refreshed), refreshed_cache, "user_oauth"
         except (FeishuAuthError, httpx.HTTPError):
             pass
+
+    if require_user_oauth:
+        raise FeishuAuthError("Feishu user OAuth is required. Please authorize this user first.")
 
     cached_tenant_token = _cached_secret(token_cache, "tenant_access_token")
     tenant_expires_at = _cached_expires_at(token_cache, "tenant_expires_at", "expires_at")
@@ -49,6 +57,35 @@ def get_feishu_access_token(feishu_config: dict[str, Any]) -> tuple[str, dict[st
     refreshed_cache["tenant_access_token"] = seal_secret(tenant_token)
     refreshed_cache["tenant_expires_at"] = int(time.time()) + max(expire - TOKEN_REFRESH_SKEW_SECONDS, 60)
     return tenant_token, refreshed_cache, "tenant"
+
+
+def exchange_authorization_code(feishu_config: dict[str, Any], code: str, redirect_uri: str) -> dict[str, Any]:
+    app_id = str(feishu_config.get("app_id") or "").strip()
+    app_secret = safe_open_secret(feishu_config.get("app_secret"))
+    if not app_id or not app_secret:
+        raise FeishuAuthError("Feishu App ID and App Secret are required.")
+    if not code:
+        raise FeishuAuthError("Feishu authorization code is required.")
+
+    response = httpx.post(
+        f"{FEISHU_BASE_URL}/authen/v2/oauth/token",
+        json={
+            "grant_type": "authorization_code",
+            "client_id": app_id,
+            "client_secret": app_secret,
+            "code": code,
+            "redirect_uri": redirect_uri,
+        },
+        timeout=15,
+    )
+    response.raise_for_status()
+    payload = response.json()
+    if payload.get("code", 0) not in (0, None):
+        raise FeishuAuthError(str(payload.get("msg") or "Failed to exchange Feishu authorization code."))
+    data = payload.get("data") or payload
+    if not _oauth_data_token(data):
+        raise FeishuAuthError("Feishu authorization response did not include access_token.")
+    return data
 
 
 def refresh_user_token(feishu_config: dict[str, Any], refresh_token: str) -> dict[str, Any]:
@@ -92,10 +129,10 @@ def tenant_access_token(app_id: str, app_secret: str) -> dict[str, Any]:
     return data
 
 
-def _cache_user_token(
+def cache_user_token(
     existing_cache: dict[str, Any],
     oauth_data: dict[str, Any],
-    fallback_refresh_token: str,
+    fallback_refresh_token: str = "",
 ) -> dict[str, Any]:
     access_token = _oauth_data_token(oauth_data)
     refresh_token = str(oauth_data.get("refresh_token") or fallback_refresh_token)

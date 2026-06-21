@@ -378,22 +378,46 @@ def _find_duplicate_record_for_search(
     mapped: dict[str, Any],
 ) -> dict[str, Any]:
     session = str(mapped.get(SESSION_FIELD) or "").strip()
-    if not session:
+    if session:
+        duplicate = _first_matching_record(
+            _search_records(
+                access_token,
+                app_token,
+                table_id,
+                field_names=["UID", SESSION_FIELD],
+                conditions=[
+                    {"field_name": SESSION_FIELD, "operator": "is", "value": [session]},
+                ],
+                page_size=20,
+            ),
+            target_record_id,
+            lambda fields: str(fields.get(SESSION_FIELD) or "").strip() == session,
+        )
+        if duplicate:
+            return duplicate
+
+    prompt = _normalized_duplicate_text(mapped.get("User Prompt"))
+    round_label = _normalized_duplicate_text(mapped.get("轮次"))
+    if not prompt or not round_label:
         return {}
 
+    task_type = _normalized_duplicate_text(mapped.get("任务类型"))
+    domain = _normalized_duplicate_text(mapped.get("业务领域"))
+    field_names = ["UID", SESSION_FIELD, "User Prompt", "轮次", "任务类型", "业务领域"]
     return _first_matching_record(
         _search_records(
             access_token,
             app_token,
             table_id,
-            field_names=["UID", SESSION_FIELD],
+            field_names=field_names,
             conditions=[
-                {"field_name": SESSION_FIELD, "operator": "is", "value": [session]},
+                {"field_name": "User Prompt", "operator": "is", "value": [str(mapped.get("User Prompt") or "")]},
+                {"field_name": "轮次", "operator": "is", "value": [str(mapped.get("轮次") or "")]},
             ],
             page_size=20,
         ),
         target_record_id,
-        lambda fields: str(fields.get(SESSION_FIELD) or "").strip() == session,
+        lambda fields: _record_matches_prompt_round(fields, prompt, round_label, task_type, domain),
     )
 
 
@@ -446,6 +470,24 @@ def _find_duplicate_record(
             if task_matches and domain_matches:
                 return record
     return {}
+
+
+def _record_matches_prompt_round(
+    fields: dict[str, Any],
+    prompt: str,
+    round_label: str,
+    task_type: str,
+    domain: str,
+) -> bool:
+    if _normalized_duplicate_text(fields.get("User Prompt")) != prompt:
+        return False
+    if _normalized_duplicate_text(fields.get("轮次")) != round_label:
+        return False
+    existing_task = _normalized_duplicate_text(fields.get("任务类型"))
+    existing_domain = _normalized_duplicate_text(fields.get("业务领域"))
+    task_matches = not task_type or not existing_task or task_type == existing_task
+    domain_matches = not domain or not existing_domain or domain == existing_domain
+    return task_matches and domain_matches
 
 
 def _first_config_value(feishu_config: dict[str, Any], keys: tuple[str, ...]) -> str:

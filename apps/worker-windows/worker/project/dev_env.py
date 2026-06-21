@@ -1,6 +1,7 @@
 import json
 import os
 import re
+import shutil
 from pathlib import Path
 
 
@@ -29,6 +30,9 @@ def resolve_tool(root: Path, name: str) -> str:
         path = str(tool.get("path") or "").strip()
         if path and Path(path).exists():
             return path
+    if os.name == "nt" and name.lower() in {"npm", "npx", "pnpm", "yarn"}:
+        cmd_name = f"{name}.cmd"
+        return shutil.which(cmd_name) or cmd_name
     return name
 
 

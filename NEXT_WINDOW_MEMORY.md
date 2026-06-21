@@ -2377,3 +2377,270 @@ Implemented fix:
 Verification:
 - `apps/api`: `python -m pytest tests/test_worker_results.py -q` -> `61 passed`.
 - Local process check after pausing/closing Worker: no `agentops-worker.exe`, `Trae CN.exe`, or `trae-sandbox.exe`.
+
+## 2026-06-18 Stop confirmation and Chinese prompt notes deployed
+
+User feedback:
+- Generated Trae prompt still contained English fixed text: `Windows command note: ...`.
+- Clicking pause did not clearly report whether Worker had actually stopped.
+- In the real run, the Worker did not stop the active Trae/job work, which felt like a previously fixed regression.
+
+Root cause:
+- `prompt_writer.py` appended an English Windows/Node command note to every prompt.
+- `jobs.py` logged command cancellation with an English raw message and only said the stop command was queued, which looked like a completed pause.
+- The Worker is single-command-at-a-time. A queued `stop_current_task` can sit behind the currently running command, and some command paths, especially prompt send, may finish before checking cancellation. That meant API could mark active commands cancelled while the local Worker had not yet run stop cleanup or clicked Trae stop.
+
+Implemented:
+- Prompt writer fixed text is now Chinese:
+  - test mode uses `测试约束：...`
+  - Windows Node note uses `Windows 命令提示：...`
+  - prompt writer system context was also changed to Chinese to reduce model copying.
+- Pause API now returns a clear Chinese message:
+  - scheduler paused and stop command queued,
+  - waiting for Worker stop confirmation.
+- Pause logs now distinguish:
+  - command cancellation / stop command queued,
+  - Worker-confirmed stop after `stop_report` returns.
+- Stop command payload now sets `use_ai_ui_analyst=true` so Worker can use visual detection for Trae stop buttons.
+- Worker cancellation now runs local stop cleanup immediately:
+  - `CommandRunner` attaches `stop_report` to cancelled command results.
+  - Worker main loop rechecks server command status after command execution; if the server cancelled it during the run, it converts a success result into cancelled + stop cleanup.
+  - API accepts cancelled command results containing `stop_report`, even if the server-side command row is already `cancelled`, and logs structured stop confirmation.
+- Worker runtime version bumped to `0.1.11-stop-confirmation`.
+- Added Worker capability `cancelled_command_stop_cleanup`.
+
+Verification:
+- API targeted: `python -m pytest apps\api\tests\test_preflight.py apps\api\tests\test_worker_results.py apps\api\tests\test_worker_command_leases.py` -> `108 passed`.
+- Worker targeted: `python -m pytest apps\worker-windows\tests\test_worker_main.py apps\worker-windows\tests\test_command_runner.py` -> `59 passed`.
+- API full: `python -m pytest apps\api\tests` -> `145 passed, 3 warnings`.
+- Worker full: `python -m pytest apps\worker-windows\tests` -> `143 passed, 2 warnings`.
+- Web build: `npm.cmd run build` passed with existing Vite large chunk warning.
+- `git diff --check` passed.
+- Worker build:
+  - EXE size: `27810942`
+  - EXE SHA256: `E02C54264E5A5443CEC05256D1FD82E1DE4FB4762E994E440AC4AD7BFFCB687D`
+  - ZIP size: `27407577`
+  - ZIP SHA256: `179094CE581F41872D2400A8518EEC324785CDF16E88E99792E05673E9C49711`
+  - ZIP header: `PK`
+
+Deployment:
+- Uploaded bundle to production: `/tmp/agentops-deploy-20260618-222656-stop-confirmation-cn`.
+- Production backup dir: `/opt/agentops-deploy-backups/20260618-222656-stop-confirmation-cn`.
+- Synced source to `/opt/agentops-platform`, preserving production `.env`, API `.venv`, API storage, Web node_modules, Worker venv/build/dist, and storage.
+- Web dist copied to `/opt/agentops-platform/apps/web/dist`.
+- Worker ZIP copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Production `.deploy-revision`: `20260618-222656-stop-confirmation-cn`.
+- Restarted `agentops-api`; service is `active`.
+- Health verification:
+  - local `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+  - public `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+  - homepage: `200`
+  - production Worker ZIP size/SHA/header match local build: `27407577`, `179094ce581f41872d2400a8518eec324785cdf16e88e99792e05673e9c49711`, `504b`.
+
+Local process state:
+- After deployment check, no local `agentops-worker.exe` process was running.
+- Local Trae CN processes were still running and were not touched.
+
+Next real-test expectation:
+- The first prompt should no longer contain English fixed text such as `Windows command note:` or `Test constraint:`.
+- Pause should first show that the stop request was queued/waiting, then show Worker-confirmed stop only after a `stop_report` returns.
+- The actual stop cleanup requires a Worker running the new package/version `0.1.11-stop-confirmation`; old local Worker processes will not have the cancellation-to-stop-cleanup behavior.
+
+## 2026-06-19 Worker registered-vs-online status fix deployed
+
+User feedback:
+- Worker management still showed a green state even when the local Worker window was not actually running/usable.
+- This made a registered Worker look like an active online Worker.
+
+Root cause:
+- The API registration flow marked a Worker as `online` immediately after registration, before a real runtime heartbeat.
+- `serialize_worker()` returned `busy=false` for offline records, so the Web Worker page rendered a green `空闲` tag even for offline/registered-only Workers.
+- A local worker process had been started in a visible window but no `%APPDATA%\AgentOps\worker.json` or Worker log existed, so it was not a usable heartbeating runtime; it was likely waiting for interactive registration.
+
+Implemented:
+- API registration now stores newly registered Workers as `offline`.
+- API `serialize_worker()` now returns explicit `online` and `registered` booleans, and only reports `busy=true/false` as activity when the effective Worker status is online/busy.
+- Web Worker page now separates:
+  - `在线` / `离线` status;
+  - online-only `空闲` / `忙碌` activity;
+  - `已注册` registration state.
+- Web Worker page disables the manual test command for offline Workers.
+- Added regression coverage: registered Worker is not reported online until heartbeat.
+
+Verification:
+- API targeted: `python -m pytest apps\api\tests\test_worker_command_leases.py` -> `9 passed`.
+- API full: `python -m pytest apps\api\tests` -> `149 passed, 3 warnings`.
+- Web build: `npm.cmd run build` passed with the existing Vite large chunk warning.
+
+Deployment:
+- Deployed revision: `20260619-1529-worker-status-registered-offline`.
+- Uploaded source and Web dist to production `/opt/agentops-platform`.
+- Restarted `agentops-api`; service is `active`.
+- Health verification:
+  - production local `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+  - public `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+  - homepage `http://115.190.113.8/`: `200`
+  - Web dist contains new assets `index-B3206oKy.js` and `index-UTf109PN.css`.
+
+Current state after fix:
+- Production worker serialization currently reports `local-windows-worker offline False True False`, meaning `status=offline`, `online=false`, `registered=true`, `busy=false`.
+- Local Windows check after cleanup: no `agentops-worker.exe` process remains.
+- Local default Worker config/logs are missing:
+  - `C:\Users\PC\AppData\Roaming\AgentOps\worker.json`
+  - `C:\Users\PC\AppData\Local\AgentOps\Worker\logs\agentops-worker.log`
+- To make the Worker truly online, register/start the Worker so it writes `worker.json` and sends heartbeat; only then should the UI show `在线`.
+
+## 2026-06-19 Role prompts, range scheduler, inner-card scroll deployed
+
+User feedback:
+- Trae prompt still leaked English fixed text such as `Windows command note: if you run Node.js tooling...`.
+- Pausing said the scheduler stopped, but the Worker did not clearly confirm whether local Trae/project activity was actually stopped.
+- Trae reply sometimes showed a nested confirmation/card with its own inner scroll area; AgentOps did not scroll that inner panel, missed “正在等待你的操作/确认执行/删除/保留” style states, and got stuck.
+- User wanted the D-drive-style multi-role design implemented more explicitly:
+  - scheduler understands the whole 100-round objective, range queue, switching policy, and when to synthesize new ranges;
+  - prompt writer generates medium-sized current-range tasks, not tiny single-file prompts or repeated bug fixes;
+  - dissatisfaction writer uses natural user-facing reasons, can return `满意`, and avoids AI/tool/log/trace style wording.
+
+Implemented:
+- Prompt writer:
+  - strips any English `Windows command note...` text before appending the platform-owned Chinese Windows/Node command note;
+  - only sees current queue head/current range;
+  - receives `range_plan` metadata and module maps;
+  - generates medium-sized followups from module maps instead of repeating the same small bug;
+  - quality gate rejects too-small prompts and future-range leakage.
+- Range/scheduler:
+  - `directions.py` now builds a range plan with target-round allocation across user-provided ranges, module maps, and synthetic-range policy;
+  - default per-direction target is 50, and total target remains 100;
+  - satisfied rounds can continue into the next module instead of forcing completion after one good round;
+  - scheduler can advance to another range when the current one is satisfied enough or reaches target.
+- Dissatisfaction writer:
+  - system prompt now allows `满意` when evidence does not support a real problem;
+  - user-visible `reason` no longer emits `产物不满意：/过程不满意：`;
+  - visible reasons replace or remove obvious tool/AI terms such as `日志/轨迹/扫描/工具调用/LLM/AI`, while internal `product_reason/process_reason` fields remain for compatibility.
+- Trae visual/Worker:
+  - UI analyst knows `needs_scroll_inner_panel` and `scroll_inner_panel`;
+  - waiting-action markers such as `正在等待你的操作`, `确认执行`, `保留`, `删除` are treated as user action states, not generation;
+  - destructive delete/discard/cancel confirmations default to manual-required unless explicitly allowed;
+  - Worker can scroll nested reply panels with `scroll_inner_reply_panel`;
+  - `diagnose_ui` maps inner-scroll analysis to `scroll-inner-panel` interventions.
+- Worker registered/online state hardening:
+  - `workers.last_seen_at` is nullable;
+  - registration no longer fakes a heartbeat;
+  - new migration `0012_worker_last_seen_nullable` and bootstrap fallback alter existing production tables.
+
+Verification before deploy:
+- API full: `python -m pytest apps\api\tests -q` -> `150 passed, 3 warnings`.
+- Worker full: `python -m pytest apps\worker-windows\tests -q` -> `149 passed, 2 warnings`.
+- Web build: `npm.cmd run build` passed; existing Vite large chunk warning remains.
+- Worker package built with `powershell.exe -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`.
+- Local Worker ZIP:
+  - path: `D:\code-space\auto-tool\agentops-platform-stop-trace-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - size: `27409923`
+  - SHA256: `E964E433BFD0B1E15ABA954D75BCD0CC4411FBD44E8835E231DC903033393883`
+
+Deployment:
+- Deployed revision: `20260619-1908-role-prompts-inner-scroll`.
+- Uploaded bundle to production: `/tmp/agentops-deploy-20260619-1908-role-prompts-inner-scroll`.
+- Production backup dir: `/opt/agentops-deploy-backups/20260619-1908-role-prompts-inner-scroll`.
+- Synced source to `/opt/agentops-platform`, preserving production `.env`, API `.venv`, storage, Web node_modules, Worker venv/build/dist.
+- Web dist copied to `/opt/agentops-platform/apps/web/dist`.
+- Worker ZIP copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`; production is now at `0012_worker_last_seen_nullable (head)`.
+- Restarted `agentops-api`; service is `active`.
+- Note: the remote deploy script returned `1` because it curled local health immediately after restart before Uvicorn opened port 8000. Follow-up checks confirmed the service started normally and health is OK.
+
+Production verification:
+- local `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+- public `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`
+- homepage `http://115.190.113.8/`: `200 OK`
+- `.deploy-revision`: `20260619-1908-role-prompts-inner-scroll`
+- production Worker ZIP size/SHA matches local: `27409923`, `e964e433bfd0b1e15aba954d75bcd0cc4411fbd44e8835e231dc903033393883`.
+- production source checks:
+  - `prompt_writer.py` contains `_strip_foreign_windows_command_note`;
+  - `prompt_writer.py` contains `range_plan`;
+  - Worker `trace_copy.py` contains `scroll_inner_reply_panel`;
+  - Worker registration stores `worker.last_seen_at = None`.
+
+Current local process state:
+- No local `agentops-worker.exe` process is running.
+- The new Worker package is available through the Worker download page after login; to test the actual stop/inner-scroll behavior, download/start the updated Worker so it heartbeats with the new package.
+
+## 2026-06-19 Session ID, dissatisfaction format, trace copy, stop confirmation deployed
+
+User feedback:
+- Feishu `Trae Session ID` was still short/wrong; user said copying the Trae reply avatar gives a D-drive style long display ID and D盘 had file-based reading logic.
+- `不满意原因` should actually be labeled `产物不满意：` plus `过程不满意：` in Feishu. The prompt sent to Trae must not contain those labels.
+- `产物不满意` should analyze generated code quality, run/build/browser result, and concrete interactions; `过程不满意` should come from Trae thinking/reply/process, not AgentOps runtime logs/trace/tool wording.
+- `日志轨迹` was still sometimes a tiny fragment such as `toolName: view_folder`; if needed, use visual trace-copy button and reject partial fragments.
+- Pause still did not clearly show whether the Worker actually stopped local Trae/project activity.
+- Trae nested reply cards can show `正在等待您的操作` while the needed action is hidden inside a smaller scroll panel.
+
+Implemented:
+- Session ID:
+  - Worker `session_probe.py` now builds D盘 style display IDs:
+    `.696467687743947:{trace_id}_{chat_session_id}.{task_id}.{user_message_id}:Trae CN.T({time})`
+  - Worker still preserves short `chat_session_id` internally, but returns `display_session_id` / `trae_session_display_id` to the API.
+  - API stores only the trusted long display format in `task_rounds.trae_session_id`; short chat/session IDs are rejected for Feishu business write.
+  - Added migration `0013_expand_trae_session_id` to expand `task_rounds.trae_session_id` from 128 to 512 chars.
+- Dissatisfaction role:
+  - Visible reason format is now exactly:
+    - `产物不满意：...`
+    - `过程不满意：...`
+  - Product text is based on code/run/browser evidence; process text is based on Trae thinking/reply/process.
+  - Visible text is cleaned of obvious tool/AI/meta words such as `日志/轨迹/扫描/工具调用/LLM/AI/证据`.
+  - Prompt writer strips `产物不满意/过程不满意/结果不满意/不满意原因` before generating the next Trae prompt, so labels are not copied into user-facing development prompts.
+- Trace/log collection:
+  - API and Worker trace validators reject single-tool fragments as `partial_tool_trace`.
+  - Worker still tries normal toolbar copy first, then AI visual trace-copy button, then local trace fallback only when the trace passes the full-trace shape gate.
+- Prompt/scheduler:
+  - Follow-up fallback prompts are structured medium-sized tasks instead of tiny single-file edits.
+  - Scheduler only creates synthetic new ranges when `range_plan.synthetic_range_policy.allowed == true`, so ordinary max-round completion does not unexpectedly continue.
+  - Synthetic range JSON persistence now copies the list/dict cleanly to trigger SQLAlchemy JSON change tracking.
+- Stop/pause:
+  - A cancelled command that returns `stop_report` is accepted and marked completed, so the UI can display actual pause confirmation instead of leaving a stale cancelled state.
+  - Runtime event messages now distinguish verified stop, cleanup-only stop, and unconfirmed stop.
+- Trae nested card scroll:
+  - `diagnose_ui` now locally recognizes `正在等待你的操作/正在等待您的操作/等待操作` even without visual-model scroll output.
+  - It returns a safe `scroll-inner-panel` intervention, which uses the existing nested reply panel scroll implementation.
+
+Verification before deploy:
+- API full: `python -m pytest apps\api\tests` -> `152 passed, 3 warnings`.
+- Worker full: `python -m pytest apps\worker-windows\tests` -> `151 passed, 2 warnings`.
+- Worker package built with:
+  - `powershell -NoProfile -ExecutionPolicy Bypass -File .\scripts\build_worker.ps1 -Clean`
+- Local Worker ZIP:
+  - path: `D:\code-space\auto-tool\agentops-platform-stop-trace-fix\apps\worker-windows\dist\agentops-worker-windows.zip`
+  - size: `27411858`
+  - SHA256: `4BE02D8B1D91B93079CCEF3FC563A1E55666729B45AD8ABFD6A33A84C40BFEEB`
+
+Deployment:
+- Deployed revision: `20260619-2230-session-reason-stop-trace`.
+- Uploaded bundle to production: `/tmp/agentops-deploy-20260619-2230-session-reason-stop-trace`.
+- Production backup dir: `/opt/agentops-deploy-backups/20260619-2230-session-reason-stop-trace`.
+- Synced source to `/opt/agentops-platform`, preserving production `.env`, API `.venv`, storage, Web node_modules/dist, Worker `.venv/build/dist`, and runtime caches.
+- Worker ZIP copied to `/opt/agentops-platform/storage/worker-packages/agentops-worker-windows.zip`.
+- Ran `alembic upgrade head`; production is now at `0013_expand_trae_session_id (head)`.
+- Restarted `agentops-api`; service is `active`.
+- Remote deploy shell returned exit code `1` only after successful deploy because the temporary script had BOM/CRLF and the final `tail -n 1` got a Windows `\r`. Follow-up verification commands were clean and confirmed deployment health.
+
+Production verification:
+- `systemctl is-active agentops-api`: `active`.
+- local `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`.
+- public `/api/health`: `{"status":"ok","service":"agentops-api","database":true}`.
+- homepage `http://115.190.113.8/`: `200`.
+- `.deploy-revision`: `20260619-2230-session-reason-stop-trace`.
+- Alembic current: `0013_expand_trae_session_id (head)`.
+- Production Worker ZIP size/SHA matches local:
+  - size `27411858`
+  - SHA256 `4be02d8b1d91b93079ccef3fc563a1e55666729b45ad8abfd6a33a84c40bfeeb`
+- Production source checks:
+  - `session_probe.py` contains `trae_session_display_id`.
+  - `worker_results.py` contains `TRAE_SESSION_DISPLAY_RE`.
+  - `dissatisfaction.py` contains `PRODUCT_LABEL = "产物不满意："`.
+  - `prompt_writer.py` contains `_structured_prompt`.
+  - `diagnose.py` contains `WAITING_ACTION_MARKERS`.
+  - `validator.py` contains `partial_tool_trace`.
+
+Current local process state:
+- No local `agentops-worker.exe` process is running.
+- To test the deployed Worker behavior locally, start/download the updated Worker package so the running Worker binary includes this ZIP's changes.

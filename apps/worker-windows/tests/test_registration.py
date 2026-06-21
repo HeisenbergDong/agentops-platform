@@ -50,6 +50,55 @@ def test_register_worker_persists_server_token_and_worker_id(monkeypatch, tmp_pa
     assert data["token"] == "token-registered"
 
 
+def test_register_worker_omits_default_worker_id(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, server_url: str, token: str) -> None:
+            pass
+
+        def register_worker(self, payload: dict) -> dict:
+            captured["payload"] = payload
+            return {"worker_id": "worker-generated", "worker_token": "token-generated"}
+
+    monkeypatch.setattr(registration, "WorkerClient", FakeClient)
+
+    register_worker(
+        RegistrationOptions(
+            server_url="http://server",
+            registration_code="reg-code",
+            config_path=tmp_path / "worker.json",
+        )
+    )
+
+    assert captured["payload"]["worker_id"] == ""
+
+
+def test_register_worker_reuses_explicit_worker_id(monkeypatch, tmp_path):
+    captured = {}
+
+    class FakeClient:
+        def __init__(self, server_url: str, token: str) -> None:
+            pass
+
+        def register_worker(self, payload: dict) -> dict:
+            captured["payload"] = payload
+            return {"worker_id": "mrs-l-worker", "worker_token": "token-generated"}
+
+    monkeypatch.setattr(registration, "WorkerClient", FakeClient)
+
+    register_worker(
+        RegistrationOptions(
+            server_url="http://server",
+            registration_code="reg-code",
+            worker_id="mrs-l-worker",
+            config_path=tmp_path / "worker.json",
+        )
+    )
+
+    assert captured["payload"]["worker_id"] == "mrs-l-worker"
+
+
 def test_is_registered_rejects_default_token():
     assert not is_registered(WorkerSettings())
     assert is_registered(

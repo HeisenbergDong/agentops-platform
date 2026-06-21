@@ -3,7 +3,7 @@
 
 a = Analysis(
     ['worker\\main.py'],
-    pathex=['D:\\code-space\\auto-tool\\agentops-platform\\apps\\worker-windows'],
+    pathex=['D:\\code-space\\auto-tool\\agentops-platform-stop-trace-fix\\apps\\worker-windows'],
     binaries=[],
     datas=[],
     hiddenimports=['comtypes', 'comtypes.client', 'comtypes.gen.UIAutomationClient', 'mss', 'PIL.Image'],

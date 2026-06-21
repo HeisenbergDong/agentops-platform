@@ -58,7 +58,7 @@ def test_stop_current_task_cleans_workspace_processes(monkeypatch: pytest.Monkey
     assert result["data"]["stop_report"]["requires_resume_prompt"] is True
     assert result["data"]["stop_report"]["sandbox_killed"] == 1
     assert result["data"]["stop_report"]["trae_ui_stopped_verified"] is True
-    assert cleaned == {"workspace_path": workspace, "project_name": "demo-project", "kill_trae": False}
+    assert cleaned == {"workspace_path": workspace, "project_name": "demo-project", "browser_url": "", "kill_trae": False}
 
 
 def test_stop_cleanup_matches_workspace_and_sandbox(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -95,6 +95,122 @@ def test_stop_cleanup_matches_workspace_and_sandbox(monkeypatch: pytest.MonkeyPa
     assert result["killed_count"] == 2
     assert killed == [101, 103]
     assert [item["pid"] for item in result["killed"]] == [101, 103]
+
+
+def test_stop_cleanup_kills_children_of_matched_workspace_process(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "roles-dashboard"
+    workspace.mkdir()
+    killed = []
+    monkeypatch.setattr(
+        stop_cleanup,
+        "_query_processes",
+        lambda: [
+            {
+                "pid": 101,
+                "parent_pid": 1,
+                "name": "cmd.exe",
+                "command_line": f"cmd /c cd /d {workspace} && npm.cmd run dev",
+            },
+            {
+                "pid": 102,
+                "parent_pid": 101,
+                "name": "node.exe",
+                "command_line": "node npm-cli.js run dev",
+            },
+            {
+                "pid": 103,
+                "parent_pid": 102,
+                "name": "python.exe",
+                "command_line": "python -m http.server 5173",
+            },
+        ],
+    )
+    monkeypatch.setattr(stop_cleanup, "_kill_process_tree", lambda pid: killed.append(pid) or {"ok": True})
+
+    result = stop_cleanup.cleanup_local_activity(workspace_path=workspace, project_name="roles-dashboard")
+
+    assert result["status"] == "completed"
+    assert result["matched_count"] == 3
+    assert killed == [101, 102, 103]
+    assert result["killed"][1]["matched_marker"].startswith("child_of:")
+
+
+def test_stop_cleanup_kills_metadata_started_dev_server(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "roles-dashboard"
+    agentops = workspace / ".agentops"
+    agentops.mkdir(parents=True)
+    (agentops / "browser-acceptance-server.json").write_text('{"pid": 201}', encoding="utf-8")
+    killed = []
+    monkeypatch.setattr(
+        stop_cleanup,
+        "_query_processes",
+        lambda: [
+            {
+                "pid": 201,
+                "parent_pid": 1,
+                "name": "node.exe",
+                "command_line": "node npm-cli.js run dev",
+            },
+            {
+                "pid": 202,
+                "parent_pid": 201,
+                "name": "python.exe",
+                "command_line": "python -m http.server 5173",
+            },
+        ],
+    )
+    monkeypatch.setattr(stop_cleanup, "_kill_process_tree", lambda pid: killed.append(pid) or {"ok": True})
+
+    result = stop_cleanup.cleanup_local_activity(workspace_path=workspace, project_name="")
+
+    assert result["status"] == "completed"
+    assert killed == [201, 202]
+    assert result["killed"][0]["matched_marker"] == "agentops-started-dev-server"
+
+
+def test_stop_cleanup_kills_browser_url_port_listener(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "roles-dashboard"
+    workspace.mkdir()
+    killed = []
+    monkeypatch.setattr(stop_cleanup, "_port_listener_pids", lambda _browser_url: {301})
+    monkeypatch.setattr(
+        stop_cleanup,
+        "_query_processes",
+        lambda: [
+            {
+                "pid": 301,
+                "parent_pid": 1,
+                "name": "python.exe",
+                "command_line": "python -m http.server 5173",
+            },
+            {
+                "pid": 302,
+                "parent_pid": 301,
+                "name": "node.exe",
+                "command_line": "node child.js",
+            },
+        ],
+    )
+    monkeypatch.setattr(stop_cleanup, "_kill_process_tree", lambda pid: killed.append(pid) or {"ok": True})
+
+    result = stop_cleanup.cleanup_local_activity(
+        workspace_path=workspace,
+        project_name="roles-dashboard",
+        browser_url="http://localhost:5173",
+    )
+
+    assert result["status"] == "completed"
+    assert killed == [301, 302]
+    assert result["killed"][0]["matched_marker"] == "browser-url-listener"
+
+
+def test_stop_cleanup_ignores_port_listener_timeout(monkeypatch: pytest.MonkeyPatch):
+    def timeout_run(*_args, **kwargs):
+        raise subprocess.TimeoutExpired(cmd="powershell.exe", timeout=kwargs.get("timeout"))
+
+    monkeypatch.setattr(stop_cleanup.subprocess, "run", timeout_run)
+
+    assert stop_cleanup._port_listener_pids("http://localhost:5173") == set()
 
 
 def test_stop_cleanup_reports_no_matching_processes(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -209,10 +325,38 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["data"]["submit_hotkey"] == "^{ENTER}"
     assert result["data"]["verify_submission"] is True
     assert result["data"]["strict_submission_verification"] is True
-    assert result["data"]["open_new_task"] is True
+    assert result["data"]["open_new_task"] is False
     assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
     assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
+
+
+def test_send_prompt_opens_new_task_only_when_payload_requests_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+    )
+    monkeypatch.setattr(
+        command_runner,
+        "send_prompt",
+        lambda prompt, submit, submit_hotkey, **kwargs: {"status": "sent", "open_new_task": kwargs.get("open_new_task")},
+    )
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {
+            "command_id": "cmd-open-new",
+            "type": "send_prompt",
+            "payload": {"prompt": "Build the feature", "trae_workspace_path": "project", "open_new_task": True},
+        }
+    )
+
+    assert result["status"] == "success"
+    assert result["data"]["open_new_task"] is True
 
 
 def test_send_prompt_auto_starts_trae_without_workspace_payload(
@@ -254,8 +398,8 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
     assert result["data"]["open_trae"]["status"] == "already_running"
     assert result["data"]["verify_submission"] is True
     assert result["data"]["strict_submission_verification"] is True
-    assert result["data"]["workspace_path"] == str(tmp_path)
-    assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
+    assert result["data"]["workspace_path"] == ""
+    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False)]
 
 
 def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytest.MonkeyPatch):
@@ -322,7 +466,7 @@ def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyP
 
     assert result["status"] == "success"
     assert result["data"]["status"] == "launched"
-    assert ensured == [(Path("C:/Trae/Trae.exe"), tmp_path, 30.0, False)]
+    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False)]
 
 
 def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.MonkeyPatch):
@@ -452,27 +596,28 @@ def test_ensure_trae_running_reuses_existing_window_for_target_workspace(monkeyp
     assert result["workspace_match"] is True
 
 
-def test_ensure_trae_running_falls_back_for_existing_window_title_missing(
+def test_ensure_trae_running_opens_workspace_when_existing_window_title_missing(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):
     workspace = tmp_path / "target-project"
-    fallback_window = trae_window.TraeWindow(202)
-    wait_calls = []
+    calls = []
 
-    monkeypatch.setattr(trae_window, "_try_find_trae_window", lambda **_kwargs: fallback_window)
+    monkeypatch.setattr(trae_window, "resolve_trae_executable", lambda path: Path("C:/Trae/Trae.exe"))
     monkeypatch.setattr(
         trae_window,
-        "wait_for_workspace_window_or_any",
-        lambda timeout_seconds, workspace_path=None, prefer_workspace_match=True: wait_calls.append(
-            (timeout_seconds, workspace_path, prefer_workspace_match)
-        )
-        or fallback_window,
+        "_try_find_trae_window",
+        lambda workspace_path=None, require_workspace_match=False: None
+        if require_workspace_match
+        else trae_window.TraeWindow(202),
     )
-    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "Trae CN")
+    monkeypatch.setattr(trae_window.subprocess, "Popen", lambda args: calls.append(args))
+    monkeypatch.setattr(trae_window.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(trae_window, "wait_for_stable_trae_window", lambda **_kwargs: trae_window.TraeWindow(303))
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "target-project - Trae CN")
     monkeypatch.setattr(
         trae_window,
         "trae_window_diagnostics",
-        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 0},
+        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 1},
     )
 
     result = trae_window.ensure_trae_running(
@@ -481,10 +626,10 @@ def test_ensure_trae_running_falls_back_for_existing_window_title_missing(
         launch_timeout_seconds=10,
     )
 
-    assert result["status"] == "already_running"
-    assert result["window_title"] == "Trae CN"
-    assert result["workspace_match"] is False
-    assert wait_calls == [(6.0, workspace, True)]
+    assert calls == [[str(Path("C:/Trae/Trae.exe")), "--reuse-window", str(workspace)]]
+    assert result["status"] == "launched"
+    assert result["reuse_window"] is True
+    assert result["workspace_match"] is True
 
 
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -656,6 +801,20 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
+    monkeypatch.setattr(
+        command_runner.CommandRunner,
+        "_stop_current_task",
+        lambda self, payload: {
+            "stopped": True,
+            "message": "Worker stop completed.",
+            "stop_report": {
+                "stop_confirmed": True,
+                "worker_command_cancelled": True,
+                "cleanup_status": "no_matching_processes",
+                "trae_stop_clicked": False,
+            },
+        },
+    )
     runner = CommandRunner(worker_id="worker-test", cancellation_checker=lambda command_id: command_id == "cmd-cancel")
 
     result = runner.run(
@@ -668,12 +827,14 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
 
     assert result["status"] == "cancelled"
     assert "cancelled" in result["message"].lower()
+    assert result["data"]["stop_report"]["stop_confirmed"] is True
+    assert result["data"]["stop_reason"] == "server_cancelled_current_command"
 
 
 def test_capture_screenshot_routes_quality_payload(monkeypatch: pytest.MonkeyPatch):
     received = {}
 
-    def fake_capture_screenshot(target: str, timeout_seconds: float, quality_required: bool):
+    def fake_capture_screenshot(target: str, timeout_seconds: float, quality_required: bool, **_kwargs):
         received["target"] = target
         received["timeout_seconds"] = timeout_seconds
         received["quality_required"] = quality_required
@@ -691,6 +852,40 @@ def test_capture_screenshot_routes_quality_payload(monkeypatch: pytest.MonkeyPat
 
     assert result["status"] == "success"
     assert received == {"target": "full_screen", "timeout_seconds": 4.0, "quality_required": False}
+
+
+def test_diagnose_ui_routes_visual_recovery_payload(monkeypatch: pytest.MonkeyPatch):
+    received = {}
+
+    def fake_diagnose_ui(timeout_seconds, scroll_bottom, ui_analyst, task, **_kwargs):
+        received["timeout_seconds"] = timeout_seconds
+        received["scroll_bottom"] = scroll_bottom
+        received["ui_analyst"] = ui_analyst
+        received["task"] = task
+        return {"state": "prompt_ready"}
+
+    monkeypatch.setattr(command_runner, "diagnose_ui", fake_diagnose_ui)
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {
+            "command_id": "cmd-diagnose",
+            "type": "diagnose_ui",
+            "payload": {
+                "task": "find_prompt_input_and_send_button",
+                "timeout_seconds": 6,
+                "scroll_bottom": False,
+                "use_ai_ui_analyst": False,
+            },
+        }
+    )
+
+    assert result["status"] == "success"
+    assert received == {
+        "timeout_seconds": 6.0,
+        "scroll_bottom": False,
+        "ui_analyst": None,
+        "task": "find_prompt_input_and_send_button",
+    }
 
 
 def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
@@ -725,7 +920,7 @@ def test_copy_latest_reply_routes_payload(monkeypatch: pytest.MonkeyPatch):
     assert result["data"]["raw_text"] == trace
     assert result["data"]["timeout_seconds"] == 7.0
     assert result["data"]["cancellable"] is True
-    assert result["data"]["kwargs"]["allow_local_fallback"] is True
+    assert result["data"]["kwargs"]["allow_local_fallback"] is False
     assert result["data"]["current_turn_gate"]["passed"] is True
     assert result["data"]["supervisor_decision"]["action"] == "collect_trace_candidate"
 
@@ -1002,6 +1197,20 @@ def test_probe_trace_reports_full_trace_shape():
     assert result["reason"] == "ok"
 
 
+def test_probe_trace_rejects_single_tool_fragment():
+    trace = (
+        "toolName: view_folder\n"
+        "status: success\n"
+        "d:\\code-space\\coding-soler\\workspace-dashboard-analytics-19cc3bb3\n"
+        + ("我先探索相关代码文件。\n" * 80)
+    )
+
+    result = probe_trace(trace)
+
+    assert result["complete_like"] is False
+    assert result["reason"] == "partial_tool_trace"
+
+
 def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.MonkeyPatch):
     class FakeButton:
         def __init__(self, text):
@@ -1021,8 +1230,8 @@ def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.Monkey
         ]
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton("summary")), ("trace copy", FakeButton("trace"))])
     monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
@@ -1036,7 +1245,144 @@ def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.Monkey
     assert result["copy_candidates"][1]["reason"] == "ok"
 
 
-def test_copy_latest_reply_uses_local_trace_when_clipboard_is_incomplete(monkeypatch: pytest.MonkeyPatch):
+def test_copy_latest_reply_uses_visual_copy_button_when_uia_has_no_copy(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class FakeWindow:
+        def window_text(self):
+            return "demo - Trae CN"
+
+    clicked = {}
+    trace = (
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: npm.cmd run check\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: (_ for _ in ()).throw(TraeAutomationError("No Trae assistant reply copy button was found")))
+    monkeypatch.setattr(
+        trace_copy,
+        "capture_screenshot",
+        lambda target, timeout_seconds, workspace_path=None: {
+            "path": str(tmp_path / "trae.png"),
+            "filename": "trae.png",
+            "status": "captured",
+            "size_bytes": 123,
+            "capture": {"bounds": {"left": 0, "top": 0, "right": 1000, "bottom": 800, "width": 1000, "height": 800}},
+        },
+    )
+    monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
+    monkeypatch.setattr(trace_copy, "_wait_for_clipboard_change", lambda before, timeout_seconds: trace)
+
+    def fake_mouse_click_target(target):
+        clicked.update(target)
+
+    monkeypatch.setattr(trace_copy, "_mouse_click_target", fake_mouse_click_target)
+
+    def fake_ui_analyst(path, context):
+        assert context["desired_action"] == "copy_trace_button"
+        return {
+            "analysis": {
+                "status": "found",
+                "targets": [
+                    {
+                        "action": "copy_trace_button",
+                        "label": "copy",
+                        "center": {"x": 360, "y": 620},
+                        "ratio": {"x": 0.36, "y": 0.775},
+                        "confidence": 0.88,
+                        "risk": "safe",
+                    }
+                ],
+            }
+        }
+
+    result = trace_copy.copy_latest_reply(timeout_seconds=1, ui_analyst=fake_ui_analyst)
+
+    assert clicked["action"] == "copy_trace_button"
+    assert result["copy_method"] == "ai_visual_trace_copy_button"
+    assert result["trace_probe"]["reason"] == "ok"
+
+
+def test_copy_latest_reply_opens_more_menu_when_copy_is_hidden(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    class FakeWindow:
+        def window_text(self):
+            return "demo - Trae CN"
+
+    clicks: list[str] = []
+    trace = (
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: npm.cmd run check\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        trace_copy,
+        "_copy_buttons",
+        lambda window: (_ for _ in ()).throw(TraeAutomationError("No Trae assistant reply copy button was found")),
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "capture_screenshot",
+        lambda target, timeout_seconds, workspace_path=None: {
+            "path": str(tmp_path / f"trae-{len(clicks)}.png"),
+            "filename": "trae.png",
+            "status": "captured",
+            "size_bytes": 123,
+            "capture": {"bounds": {"left": 0, "top": 0, "right": 1000, "bottom": 800, "width": 1000, "height": 800}},
+        },
+    )
+    monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
+    monkeypatch.setattr(trace_copy, "_wait_for_clipboard_change", lambda before, timeout_seconds: trace)
+
+    def fake_mouse_click_target(target):
+        clicks.append(target["action"])
+
+    monkeypatch.setattr(trace_copy, "_mouse_click_target", fake_mouse_click_target)
+
+    def fake_ui_analyst(path, context):
+        if not context.get("overflow_menu_open"):
+            return {
+                "analysis": {
+                    "status": "found",
+                    "targets": [
+                        {
+                            "action": "more_actions_button",
+                            "label": "...",
+                            "center": {"x": 380, "y": 620},
+                            "ratio": {"x": 0.38, "y": 0.775},
+                            "confidence": 0.86,
+                            "risk": "safe",
+                        }
+                    ],
+                }
+            }
+        return {
+            "analysis": {
+                "status": "found",
+                "targets": [
+                    {
+                        "action": "copy_trace_button",
+                        "label": "Copy",
+                        "center": {"x": 390, "y": 660},
+                        "ratio": {"x": 0.39, "y": 0.825},
+                        "confidence": 0.91,
+                        "risk": "safe",
+                    }
+                ],
+            }
+        }
+
+    result = trace_copy.copy_latest_reply(timeout_seconds=1, ui_analyst=fake_ui_analyst)
+
+    assert clicks == ["more_actions_button", "copy_trace_button"]
+    assert result["copy_method"] == "ai_visual_trace_copy_button"
+    assert result["visual_copy"]["overflow_menu"]["opened"] is True
+
+
+def test_copy_latest_reply_does_not_use_local_trace_by_default(monkeypatch: pytest.MonkeyPatch):
     class FakeButton:
         def click_input(self):
             return None
@@ -1050,8 +1396,8 @@ def test_copy_latest_reply_uses_local_trace_when_clipboard_is_incomplete(monkeyp
         + ("trace detail line\n" * 80)
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton())])
     monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
@@ -1070,6 +1416,52 @@ def test_copy_latest_reply_uses_local_trace_when_clipboard_is_incomplete(monkeyp
 
     result = trace_copy.copy_latest_reply(timeout_seconds=1, trae_turn={"session_id": "s1"}, prompt="demo", workspace_path="D:/work/demo")
 
+    assert result["copy_method"] == "assistant_bottom_toolbar_best_effort"
+    assert result["raw_text"] == "summary only"
+    assert "trace_source" not in result
+    assert result["trace_probe"]["reason"] == "missing_tool_trace_markers"
+
+
+def test_copy_latest_reply_uses_local_trace_only_when_explicitly_allowed(monkeypatch: pytest.MonkeyPatch):
+    class FakeButton:
+        def click_input(self):
+            return None
+
+    class FakeWindow:
+        pass
+
+    local_trace = (
+        "Trae raw execution trace for session s1, user message u1.\n"
+        "toolName: edit\nstatus: success\nfilePath: app.py\ncommand: pytest\nTodos updated: done\n"
+        + ("trace detail line\n" * 80)
+    )
+
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton())])
+    monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
+    monkeypatch.setattr(trace_copy, "_wait_for_clipboard_change", lambda before, timeout_seconds: "summary only")
+    monkeypatch.setattr(
+        trace_copy,
+        "collect_local_trace",
+        lambda trae_turn, prompt, workspace_path: {
+            "status": "collected",
+            "raw_text": local_trace,
+            "chars": len(local_trace),
+            "trace_source": "trae_local_raw_log_trace",
+            "trace_probe": trace_copy.probe_trace(local_trace),
+        },
+    )
+
+    result = trace_copy.copy_latest_reply(
+        timeout_seconds=1,
+        trae_turn={"session_id": "s1"},
+        prompt="demo",
+        workspace_path="D:/work/demo",
+        allow_local_fallback=True,
+    )
+
     assert result["copy_method"] == "trae_local_raw_log_trace"
     assert result["trace_source"] == "trae_local_raw_log_trace"
     assert result["raw_text"] == local_trace
@@ -1087,8 +1479,8 @@ def test_copy_latest_reply_uses_low_confidence_turn_candidate_for_local_trace(mo
     )
     seen_turns: list[dict] = []
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda timeout_seconds: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [])
 
@@ -1116,6 +1508,7 @@ def test_copy_latest_reply_uses_low_confidence_turn_candidate_for_local_trace(mo
         },
         prompt="demo",
         workspace_path="D:/work/demo",
+        allow_local_fallback=True,
     )
 
     assert result["status"] == "copied"
@@ -1140,6 +1533,21 @@ def test_probe_trace_reports_service_interruption():
 
     assert result["complete_like"] is False
     assert result["reason"] == "service_interrupted"
+
+
+def test_probe_trace_reports_manual_stop_before_generic_interruption():
+    trace = "toolName: edit\nstatus: success\n" + ("trace detail line\n" * 80) + "\u5f53\u524d\u4efb\u52a1\u88ab\u624b\u52a8\u4e2d\u65ad\n\u624b\u52a8\u7ec8\u6b62\u8f93\u51fa"
+
+    result = probe_trace(trace)
+
+    assert result["complete_like"] is False
+    assert result["reason"] == "manual_stopped"
+
+
+def test_reply_scroll_click_guard_rejects_bottom_toolbar_area():
+    assert trace_copy._is_safe_reply_scroll_point(0.30, 0.58) is True
+    assert trace_copy._is_safe_reply_scroll_point(0.32, 0.72) is False
+    assert trace_copy._is_safe_reply_scroll_point(0.37, 0.945) is False
 
 
 def test_probe_trace_reports_model_request_3003_interruption():

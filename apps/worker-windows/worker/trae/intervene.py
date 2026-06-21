@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ctypes
+from pathlib import Path
 import time
 from typing import Any, Callable
 
@@ -9,7 +10,7 @@ from worker.trae import ui_cache
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.prompt import send_prompt, _send_keys
 from worker.trae.screenshot import capture_screenshot
-from worker.trae.trace_copy import scroll_assistant_to_bottom
+from worker.trae.trace_copy import scroll_assistant_to_bottom, scroll_inner_reply_panel
 from worker.trae.ui_locator import normalize_action, target_for_action, validate_target
 from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
 
@@ -59,13 +60,31 @@ UNSAFE_MARKERS = (
 def click_continue(
     timeout_seconds: float = 10.0,
     recovery_reason: str = "",
+    workspace_path: str | Path | None = None,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
-    focus_trae(timeout_seconds=timeout_seconds)
-    diagnosis = diagnose_ui(timeout_seconds=timeout_seconds, scroll_bottom=True)
+    if workspace_path:
+        focus_trae(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+    else:
+        focus_trae(timeout_seconds=timeout_seconds)
+    diagnosis = diagnose_ui(
+        timeout_seconds=timeout_seconds,
+        scroll_bottom=True,
+        workspace_path=workspace_path,
+        ui_analyst=ui_analyst,
+    )
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
     if isinstance(suggested, dict) and suggested:
-        result = apply_intervention(suggested, timeout_seconds=timeout_seconds)
+        if str(suggested.get("mode") or "") == "manual-required":
+            raise TraeAutomationError(
+                str(suggested.get("manual_message") or "Trae requires manual confirmation before continuing."),
+                {"diagnosis": _compact_diagnosis(diagnosis), "suggested_intervention": suggested},
+            )
+        result = apply_intervention(suggested, timeout_seconds=timeout_seconds, workspace_path=workspace_path)
         action_taken = _action_taken_from_result(result)
         return {
             "status": "clicked" if result.get("status") == "applied" else result.get("status", "attempted"),
@@ -74,7 +93,14 @@ def click_continue(
             "diagnosis": _compact_diagnosis(diagnosis),
         }
 
-    window = find_trae_window(timeout_seconds=timeout_seconds)
+    if workspace_path:
+        window = find_trae_window(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+    else:
+        window = find_trae_window(timeout_seconds=timeout_seconds)
     candidates = _matching_buttons(window, CONTINUE_MARKERS)
     if candidates:
         button_text, button = candidates[0]
@@ -87,7 +113,11 @@ def click_continue(
         }
 
     if _should_type_continue(recovery_reason, diagnosis):
-        result = apply_intervention({"mode": "continue-text", "text": "\u7ee7\u7eed"}, timeout_seconds=timeout_seconds)
+        result = apply_intervention(
+            {"mode": "continue-text", "text": "\u7ee7\u7eed"},
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+        )
         return {
             "status": "clicked" if result.get("status") == "applied" else result.get("status", "attempted"),
             "action_taken": "typed_continue",
@@ -102,8 +132,8 @@ def click_continue(
     )
 
 
-def click_confirm() -> dict:
-    return click_continue()
+def click_confirm(ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None) -> dict:
+    return click_continue(ui_analyst=ui_analyst)
 
 
 def click_stop_generation(
@@ -123,20 +153,53 @@ def click_stop_generation(
     return {"status": "not_clicked", "reason": visual.get("reason") or "no_stop_button", "visual": visual}
 
 
-def apply_intervention(intervention: dict[str, Any], timeout_seconds: float = 10.0) -> dict:
+def apply_intervention(
+    intervention: dict[str, Any],
+    timeout_seconds: float = 10.0,
+    workspace_path: str | Path | None = None,
+) -> dict:
     mode = str(intervention.get("mode") or "")
     if mode == "click-point":
+        action = normalize_action(str(intervention.get("action") or ""))
+        if str(intervention.get("risk") or "safe") != "safe":
+            raise TraeAutomationError(f"LLM marked Trae click target as unsafe: {action}")
+        if workspace_path:
+            focus_trae(
+                timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
+                require_workspace_match=True,
+            )
+        else:
+            focus_trae(timeout_seconds=timeout_seconds)
         return click_screen_point(intervention.get("x"), intervention.get("y"))
     if mode == "terminal-input":
-        return send_text_to_trae(str(intervention.get("text") or "y"), submit=True)
+        return send_text_to_trae(str(intervention.get("text") or "y"), submit=True, workspace_path=workspace_path)
     if mode == "continue-text":
         text = str(intervention.get("text") or "\u7ee7\u7eed")
-        result = send_prompt(text, submit=True)
+        if workspace_path:
+            result = send_prompt(text, submit=True, workspace_path=workspace_path)
+        else:
+            result = send_prompt(text, submit=True)
         return {
             "status": "applied",
             "mode": "continue-text",
             "text": text,
             "input": result.get("input") or {},
+        }
+    if mode == "scroll-inner-panel":
+        if workspace_path:
+            window = find_trae_window(
+                timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
+                require_workspace_match=True,
+            )
+        else:
+            window = find_trae_window(timeout_seconds=timeout_seconds)
+        scroll = scroll_inner_reply_panel(window, wheel_steps=int(intervention.get("wheel_steps") or 8))
+        return {
+            "status": "applied" if scroll.get("status") == "scrolled" else "attempted",
+            "mode": "scroll-inner-panel",
+            "scroll": scroll,
         }
     if mode == "primary-fallback":
         return click_primary_fallback()
@@ -149,6 +212,8 @@ def _action_taken_from_result(result: dict[str, Any]) -> str:
         return "typed_continue"
     if mode == "terminal-input":
         return "typed_terminal_input"
+    if mode == "scroll-inner-panel":
+        return "scrolled_inner_panel"
     if mode == "click-point":
         return "clicked_button"
     if mode == "primary-fallback":
@@ -177,8 +242,11 @@ def _should_type_continue(recovery_reason: str, diagnosis: dict[str, Any]) -> bo
     return output_reason in {"awaiting_continuation", "service_interrupted"}
 
 
-def send_text_to_trae(text: str, submit: bool = True) -> dict:
-    focus_trae(timeout_seconds=10.0)
+def send_text_to_trae(text: str, submit: bool = True, workspace_path: str | Path | None = None) -> dict:
+    if workspace_path:
+        focus_trae(timeout_seconds=10.0, workspace_path=workspace_path, require_workspace_match=True)
+    else:
+        focus_trae(timeout_seconds=10.0)
     value = str(text or "")
     try:
         if value == "\n":

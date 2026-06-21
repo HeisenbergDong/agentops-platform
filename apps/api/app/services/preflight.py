@@ -70,6 +70,13 @@ def build_preflight(db: Session, user: User) -> dict[str, Any]:
         _worker_status_check(worker),
         _worker_capability_check(worker),
         _value_check(
+            "worker.trae_exe_path",
+            "Trae 安装路径",
+            worker_settings.get("trae_exe_path"),
+            missing_message="缺少 Worker 本机 Trae 安装路径，Worker 无法可靠打开 Trae CN。",
+        ),
+        _worker_runtime_trae_path_check(worker, worker_settings.get("trae_exe_path")),
+        _value_check(
             "worker.trae_workspace_path",
             "Trae 工作目录",
             worker_settings.get("trae_workspace_path"),
@@ -130,6 +137,7 @@ def build_preflight(db: Session, user: User) -> dict[str, Any]:
         ),
     ]
 
+    checks = _apply_worker_runtime_trae_path_fallback(checks, worker, worker_settings.get("trae_exe_path"))
     serialized = [item.as_dict() for item in checks]
     blocking = [item.label for item in checks if item.required and item.status == "fail"]
     warnings = [item.label for item in checks if item.status == "warning"]
@@ -166,6 +174,38 @@ def _value_check(
         return PreflightCheck(key, label, "pass", "已配置。", required)
     status = "fail" if required else "warning"
     return PreflightCheck(key, label, status, missing_message, required)
+
+
+def _apply_worker_runtime_trae_path_fallback(
+    checks: list[PreflightCheck],
+    worker: Worker | None,
+    configured_path: Any,
+) -> list[PreflightCheck]:
+    if str(configured_path or "").strip():
+        return checks
+    runtime = worker.runtime_status if worker and isinstance(worker.runtime_status, dict) else {}
+    if runtime.get("trae_exe_exists") is not True:
+        return checks
+    worker_path = str(runtime.get("trae_exe_resolved_path") or runtime.get("trae_exe_path") or "").strip()
+    if not worker_path:
+        return checks
+    return [
+        PreflightCheck(
+            item.key,
+            item.label,
+            "pass",
+            f"Worker 已上报本机 Trae 可执行文件：{worker_path}",
+            item.required,
+            {
+                **item.details,
+                "source": "worker_runtime_status",
+                "worker_path": worker_path,
+            },
+        )
+        if item.key == "worker.trae_exe_path"
+        else item
+        for item in checks
+    ]
 
 
 def _worker_binding_check(user: User, worker_id: str, worker: Worker | None) -> PreflightCheck:
@@ -227,6 +267,50 @@ def _worker_capability_check(worker: Worker | None) -> PreflightCheck:
         "fail",
         "Worker 缺少真实运行所需命令能力。",
         details={"missing": missing, "capabilities": sorted(capabilities)},
+    )
+
+
+def _worker_runtime_trae_path_check(worker: Worker | None, configured_path: Any) -> PreflightCheck:
+    if not worker or not str(configured_path or "").strip():
+        return PreflightCheck(
+            "worker.runtime.trae_exe_path",
+            "Worker Trae 路径校验",
+            "warning",
+            "Worker 尚未回报 Trae 路径校验结果。",
+            required=False,
+        )
+    runtime = worker.runtime_status if isinstance(worker.runtime_status, dict) else {}
+    if not runtime:
+        return PreflightCheck(
+            "worker.runtime.trae_exe_path",
+            "Worker Trae 路径校验",
+            "warning",
+            "Worker 下一次心跳后会回报本机 Trae 路径是否存在。",
+            required=False,
+            details={"configured_path": str(configured_path or "")},
+        )
+    details = {
+        "configured_path": str(configured_path or ""),
+        "worker_path": str(runtime.get("trae_exe_path") or ""),
+        "resolved_path": str(runtime.get("trae_exe_resolved_path") or ""),
+        "candidates": runtime.get("trae_exe_candidates") if isinstance(runtime.get("trae_exe_candidates"), list) else [],
+    }
+    if runtime.get("trae_exe_exists") is True:
+        return PreflightCheck(
+            "worker.runtime.trae_exe_path",
+            "Worker Trae 路径校验",
+            "pass",
+            "Worker 已确认本机 Trae 可执行文件存在。",
+            required=False,
+            details=details,
+        )
+    return PreflightCheck(
+        "worker.runtime.trae_exe_path",
+        "Worker Trae 路径校验",
+        "warning",
+        "Worker 当前找不到配置的 Trae 可执行文件，请确认个人配置里的安装路径。",
+        required=False,
+        details=details,
     )
 
 

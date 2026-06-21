@@ -8,7 +8,13 @@ from app.db.models import Job, RuntimeLog, TaskRound, Worker, WorkerCommand
 from app.db.models.base import now_utc
 from app.db.repositories import workers as worker_repo
 from app.db.session import Base
-from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType, WorkerResult
+from app.worker_gateway.contracts import (
+    CreateWorkerCommandRequest,
+    WorkerCommandType,
+    WorkerHeartbeat,
+    WorkerRegisterRequest,
+    WorkerResult,
+)
 
 
 def test_poll_assigns_lease_and_requeues_expired_claim(monkeypatch):
@@ -157,6 +163,205 @@ def test_stale_result_is_ignored_by_worker_api():
     assert response["reason"] == "stale_lease"
     assert command.status == "running"
     assert command.result == {}
+
+
+def test_cancelled_result_with_stop_report_is_accepted_after_server_cancelled_command():
+    db = _test_session()
+    worker = Worker(worker_id="worker1", user_id="user1", machine_name="host", token_hash="hash")
+    db.add(worker)
+    command = _create_command(db)
+    command.status = "cancelled"
+    command.lease_id = "run-current"
+    command.lease_expires_at = now_utc() + timedelta(minutes=5)
+    db.commit()
+
+    response = workers_api.post_result(
+        "worker1",
+        WorkerResult(
+            command_id=command.id,
+            worker_id="worker1",
+            lease_id="old-run",
+            status="cancelled",
+            data={
+                "stopped": True,
+                "stop_report": {
+                    "worker_command_cancelled": True,
+                    "stop_confirmed": True,
+                    "cleanup_status": "no_matching_processes",
+                },
+            },
+        ),
+        worker=worker,
+        db=db,
+    )
+    db.refresh(command)
+
+    assert response["status"] == "received"
+    assert command.status == "completed"
+    assert command.result["stop_report"]["stop_confirmed"] is True
+
+
+def test_registered_worker_is_not_reported_online_until_heartbeat():
+    db = _test_session()
+    code, _row = worker_repo.create_registration_code(db, created_by="admin1", assigned_user_id="user1")
+
+    worker, _token = worker_repo.register_worker(
+        db,
+        WorkerRegisterRequest(
+            registration_code=code,
+            worker_id="local-windows-worker",
+            machine_name="host",
+            display_name="Local Worker",
+            version="test",
+        ),
+    )
+
+    registered = workers_api.serialize_worker(worker)
+    assert registered["registered"] is True
+    assert registered["online"] is False
+    assert registered["status"] == "offline"
+    assert registered["busy"] is False
+
+    worker_repo.update_worker_heartbeat(
+        db,
+        worker,
+        WorkerHeartbeat(
+            worker_id="local-windows-worker",
+            machine_name="host",
+            display_name="Local Worker",
+            version="test",
+            busy=False,
+        ),
+    )
+    online = workers_api.serialize_worker(worker)
+    assert online["online"] is True
+    assert online["status"] == "online"
+    assert online["busy"] is False
+
+
+def test_register_worker_generates_id_when_default_local_id_is_sent():
+    db = _test_session()
+    code, _row = worker_repo.create_registration_code(db, created_by="admin1", assigned_user_id="user1")
+
+    worker, _token = worker_repo.register_worker(
+        db,
+        WorkerRegisterRequest(
+            registration_code=code,
+            worker_id="local-windows-worker",
+            machine_name="host",
+            display_name="Local Worker",
+            version="test",
+        ),
+    )
+
+    assert worker.worker_id.startswith("worker_")
+    assert worker.worker_id != "local-windows-worker"
+    assert worker.user_id == "user1"
+
+
+def test_register_worker_rejects_rebinding_existing_worker_to_another_user():
+    db = _test_session()
+    db.add(Worker(worker_id="shared-worker", user_id="user1", machine_name="host", token_hash="hash"))
+    db.commit()
+    code, _row = worker_repo.create_registration_code(db, created_by="admin1", assigned_user_id="user2")
+
+    try:
+        worker_repo.register_worker(
+            db,
+            WorkerRegisterRequest(
+                registration_code=code,
+                worker_id="shared-worker",
+                machine_name="host-2",
+                display_name="Local Worker",
+                version="test",
+            ),
+        )
+    except ValueError as exc:
+        assert "already bound to another user" in str(exc)
+    else:
+        raise AssertionError("Expected duplicate worker registration to fail")
+
+    worker = db.scalar(select(Worker).where(Worker.worker_id == "shared-worker"))
+    assert worker is not None
+    assert worker.user_id == "user1"
+    assert worker.machine_name == "host"
+
+
+def test_register_worker_allows_same_user_to_refresh_existing_worker_token():
+    db = _test_session()
+    db.add(Worker(worker_id="user-worker", user_id="user1", machine_name="old-host", token_hash="old"))
+    db.commit()
+    code, _row = worker_repo.create_registration_code(db, created_by="admin1", assigned_user_id="user1")
+
+    worker, token = worker_repo.register_worker(
+        db,
+        WorkerRegisterRequest(
+            registration_code=code,
+            worker_id="user-worker",
+            machine_name="new-host",
+            display_name="Local Worker",
+            version="test",
+        ),
+    )
+
+    assert token
+    assert worker.worker_id == "user-worker"
+    assert worker.user_id == "user1"
+    assert worker.machine_name == "new-host"
+
+
+def test_delete_worker_revokes_and_hides_offline_worker():
+    db = _test_session()
+    worker = Worker(worker_id="old-worker", user_id="user1", machine_name="host", token_hash="hash")
+    db.add(worker)
+    command = worker_repo.create_worker_command(
+        db,
+        worker_id="old-worker",
+        user_id="user1",
+        payload=CreateWorkerCommandRequest(
+            type=WorkerCommandType.WAIT_COMPLETION,
+            job_id=None,
+            round_id=None,
+            payload={},
+        ),
+    )
+
+    deleted = worker_repo.delete_worker(db, "old-worker")
+    db.refresh(command)
+
+    assert deleted is not None
+    assert deleted.revoked_at is not None
+    assert deleted.user_id is None
+    assert deleted.token_hash == ""
+    assert command.status == "cancelled"
+    assert worker_repo.list_workers(db) == []
+    assert worker_repo.get_worker_by_worker_id(db, "old-worker") is None
+    assert worker_repo.get_worker_by_worker_id(db, "old-worker", include_revoked=True) is not None
+
+
+def test_delete_worker_rejects_online_worker():
+    db = _test_session()
+    worker = Worker(
+        worker_id="online-worker",
+        user_id="user1",
+        machine_name="host",
+        token_hash="hash",
+        status="online",
+        last_seen_at=now_utc(),
+    )
+    db.add(worker)
+    db.commit()
+
+    try:
+        worker_repo.delete_worker(db, "online-worker")
+    except ValueError as exc:
+        assert "online Worker" in str(exc)
+    else:
+        raise AssertionError("Expected online Worker deletion to fail")
+
+    db.refresh(worker)
+    assert worker.revoked_at is None
+    assert worker_repo.get_worker_by_worker_id(db, "online-worker") is not None
 
 
 def _test_session():

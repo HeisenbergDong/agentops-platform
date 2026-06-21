@@ -27,9 +27,9 @@ def notify_manual_required(
         return {"status": "skipped", "reason": "missing_webhook_url"}
 
     text = _manual_required_text(job_id=job_id, round_id=round_id, message=message, details=details)
-    payload: dict[str, Any] = {"msg_type": "text", "content": {"text": text}}
+    payload = _webhook_payload(url, text)
     secret = safe_open_secret(webhook_config.get("secret"))
-    if secret:
+    if secret and not _is_flow_webhook(url):
         timestamp = str(int(time.time()))
         payload["timestamp"] = timestamp
         payload["sign"] = _feishu_sign(secret, timestamp)
@@ -48,9 +48,9 @@ def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
     url = str(webhook_config.get("url") or "").strip()
     if not url:
         return {"status": "skipped", "reason": "missing_webhook_url"}
-    payload: dict[str, Any] = {"msg_type": "text", "content": {"text": str(text or "").strip()}}
+    payload = _webhook_payload(url, str(text or "").strip())
     secret = safe_open_secret(webhook_config.get("secret"))
-    if secret:
+    if secret and not _is_flow_webhook(url):
         timestamp = str(int(time.time()))
         payload["timestamp"] = timestamp
         payload["sign"] = _feishu_sign(secret, timestamp)
@@ -60,7 +60,25 @@ def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
         raise WebhookNotifyError(f"Webhook notification failed: {exc.__class__.__name__}") from exc
     if response.status_code >= 400:
         raise WebhookNotifyError(f"Webhook notification failed with status {response.status_code}: {response.text[:200]}")
-    return {"status": "sent", "http_status": response.status_code}
+    return {"status": "sent", "http_status": response.status_code, "method": "flow_webhook" if _is_flow_webhook(url) else "webhook"}
+
+
+def _is_flow_webhook(url: str) -> bool:
+    return "/flow/api/trigger-webhook/" in str(url or "")
+
+
+def _webhook_payload(url: str, text: str) -> dict[str, Any]:
+    if not _is_flow_webhook(url):
+        return {"msg_type": "text", "content": {"text": text}}
+    title, reason = _split_title_reason(text)
+    return {"title": title, "reason": reason}
+
+
+def _split_title_reason(text: str) -> tuple[str, str]:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    title = lines[0] if lines else "AgentOps 通知"
+    reason = "\n".join(lines[1:]) if len(lines) > 1 else str(text or "")
+    return title[:120], reason[:4000]
 
 
 def _manual_required_text(*, job_id: str, round_id: str | None, message: str, details: dict[str, Any]) -> str:

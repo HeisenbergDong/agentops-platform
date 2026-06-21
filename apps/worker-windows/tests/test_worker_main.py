@@ -1,4 +1,5 @@
 from pathlib import Path
+import time
 
 from worker.config import WorkerSettings
 from worker import main as worker_main
@@ -13,6 +14,7 @@ class FakeClient:
         self.heartbeats = []
         self.results = []
         self.logs = []
+        self.command_reads = []
 
     def heartbeat(self, payload):
         self.heartbeats.append(payload)
@@ -23,6 +25,10 @@ class FakeClient:
 
     def ack_command(self, worker_id, command_id, lease_id=""):
         return self.ack_response
+
+    def get_command(self, worker_id, command_id, lease_id=""):
+        self.command_reads.append({"worker_id": worker_id, "command_id": command_id, "lease_id": lease_id})
+        return {**self.ack_response, "status": "running", "lease_id": lease_id or self.ack_response.get("lease_id", "")}
 
     def post_result(self, worker_id, payload):
         self.results.append(payload)
@@ -64,6 +70,18 @@ class FakeRunner:
             "data": {},
         }
 
+    def _cancelled_stop_data(self, payload):
+        return {
+            "stopped": True,
+            "message": "Worker stop completed.",
+            "stop_report": {
+                "worker_command_cancelled": True,
+                "stop_confirmed": True,
+                "cleanup_status": "no_matching_processes",
+                "trae_stop_clicked": False,
+            },
+        }
+
 
 def test_run_once_skips_command_cancelled_after_ack(tmp_path: Path):
     command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
@@ -85,11 +103,13 @@ def test_run_once_skips_command_cancelled_after_ack(tmp_path: Path):
 
 def test_run_once_heartbeat_reports_runtime_version(tmp_path: Path):
     client = FakeClient(commands=[], ack_response={})
+    trae_exe = tmp_path / "Trae.exe"
+    trae_exe.write_text("fake exe", encoding="utf-8")
     settings = WorkerSettings(
         worker_id="worker-test",
         token="test-token",
         workspace_root=tmp_path,
-        trae_exe_path=tmp_path / "Trae.exe",
+        trae_exe_path=trae_exe,
         version="0.1.0",
     )
 
@@ -99,6 +119,8 @@ def test_run_once_heartbeat_reports_runtime_version(tmp_path: Path):
     assert client.heartbeats[0]["version"] == WORKER_RUNTIME_VERSION
     assert client.heartbeats[0]["config_version"] == "0.1.0"
     assert "trae_workspace_title_fallback" in client.heartbeats[0]["capabilities"]
+    assert client.heartbeats[0]["runtime_status"]["trae_exe_exists"] is True
+    assert client.heartbeats[0]["runtime_status"]["trae_exe_resolved_path"] == str(trae_exe)
 
 
 def test_wait_completion_recovery_event_is_info_and_carries_result(tmp_path: Path):
@@ -139,6 +161,78 @@ def test_wait_completion_recovery_event_is_info_and_carries_result(tmp_path: Pat
     assert finished["level"] == "info"
     assert finished["extra"]["result_status"] == "failed"
     assert finished["extra"]["result"]["output_probe"]["reason"] == "trace_too_short"
+
+
+def test_run_once_renews_running_command_lease(monkeypatch, tmp_path: Path):
+    command = {
+        "command_id": "cmd1",
+        "job_id": "job1",
+        "round_id": "round1",
+        "type": "wait_completion",
+        "lease_id": "claim-1",
+        "payload": {},
+    }
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
+    monkeypatch.setattr(worker_main, "LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+
+    class SlowRunner(FakeRunner):
+        def run(self, command):
+            self.ran = True
+            time.sleep(0.05)
+            return {
+                "command_id": command["command_id"],
+                "worker_id": "worker-test",
+                "status": "success",
+                "message": "completed",
+                "data": {},
+            }
+
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=SlowRunner(), worker_settings=settings)
+
+    assert processed == 1
+    assert client.command_reads
+    assert client.command_reads[0]["lease_id"] == "run-1"
+    assert client.results[0]["status"] == "success"
+
+
+def test_run_once_converts_success_to_cancelled_stop_when_server_cancelled_after_run(tmp_path: Path):
+    command = {
+        "command_id": "cmd1",
+        "job_id": "job1",
+        "round_id": "round1",
+        "type": "send_prompt",
+        "lease_id": "claim-1",
+        "payload": {"workspace_path": str(tmp_path / "project")},
+    }
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
+
+    def cancelled_get_command(worker_id, command_id, lease_id=""):
+        client.command_reads.append({"worker_id": worker_id, "command_id": command_id, "lease_id": lease_id})
+        return {**command, "status": "cancelled", "lease_id": lease_id}
+
+    client.get_command = cancelled_get_command
+    runner = FakeRunner()
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=runner, worker_settings=settings)
+
+    assert processed == 1
+    assert runner.ran is True
+    assert client.results[0]["status"] == "cancelled"
+    assert client.results[0]["data"]["stop_report"]["stop_confirmed"] is True
+    assert client.results[0]["lease_id"] == "run-1"
 
 
 def test_run_once_uploads_screenshot_before_posting_result(tmp_path: Path):
@@ -245,6 +339,7 @@ def test_run_once_uploads_wait_completion_diagnostic_screenshot(tmp_path: Path):
 
 def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
     assigned_root = tmp_path / "assigned-root"
+    assigned_exe = tmp_path / "Trae CN.exe"
     client = FakeClient(
         commands=[],
         ack_response={},
@@ -252,6 +347,7 @@ def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
             "status": "ok",
             "assigned_config": {
                 "trae_workspace_path": str(assigned_root),
+                "trae_exe_path": str(assigned_exe),
                 "browser_url": "http://localhost:5173",
             },
         },
@@ -268,6 +364,7 @@ def test_run_once_applies_assigned_config_from_heartbeat(tmp_path: Path):
 
     assert processed == 0
     assert settings.workspace_root == assigned_root
+    assert settings.trae_exe_path == assigned_exe
     assert settings.browser_url == "http://localhost:5173"
     assert runner.settings is settings
 

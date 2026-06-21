@@ -7,7 +7,7 @@ from app.api.deps import require_admin
 from app.core.security import hash_password
 from app.db.models import User, WorkerRegistrationCode
 from app.db.repositories.users import get_user_by_email, list_users
-from app.db.repositories.workers import bind_worker, create_registration_code, list_registration_codes
+from app.db.repositories.workers import bind_worker, create_registration_code, delete_worker, list_registration_codes
 from app.db.session import get_db
 
 router = APIRouter()
@@ -113,6 +113,25 @@ def admin_bind_worker(
         "worker_id": worker.worker_id,
         "user_id": worker.user_id,
         "status": worker.status,
+    }
+
+
+@router.delete("/workers/{worker_id}")
+def admin_delete_worker(
+    worker_id: str,
+    admin: User = Depends(require_admin),
+    db: Session = Depends(get_db),
+) -> dict:
+    try:
+        worker = delete_worker(db, worker_id=worker_id)
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    if not worker:
+        raise HTTPException(status_code=404, detail="Worker not found")
+    return {
+        "status": "deleted",
+        "worker_id": worker.worker_id,
+        "revoked_at": worker.revoked_at.isoformat() if worker.revoked_at else None,
     }
 
 

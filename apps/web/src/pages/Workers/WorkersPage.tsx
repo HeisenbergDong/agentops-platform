@@ -1,5 +1,6 @@
 import {
   ApiOutlined,
+  DeleteOutlined,
   DownloadOutlined,
   LinkOutlined,
   PlusOutlined,
@@ -7,7 +8,7 @@ import {
   SettingOutlined
 } from "@ant-design/icons";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
-import { Alert, Button, Card, Col, Input, List, Row, Select, Space, Tag, Typography, message } from "antd";
+import { Alert, Button, Card, Col, Input, List, Popconfirm, Row, Select, Space, Tag, Typography, message } from "antd";
 import { useState } from "react";
 import { Link } from "react-router-dom";
 import { api } from "../../api/client";
@@ -24,9 +25,12 @@ type WorkerRecord = {
   current_window_title?: string;
   busy?: boolean;
   status?: string;
+  online?: boolean;
+  registered?: boolean;
   capabilities?: string[];
   supported_apps?: string[];
-  last_seen_at?: string;
+  last_seen_at?: string | null;
+  registered_at?: string | null;
   user_id?: string | null;
 };
 
@@ -45,6 +49,12 @@ type WorkerCommandRecord = {
   error?: string;
   updated_at?: string;
   finished_at?: string | null;
+};
+
+type WorkerPackageTicket = {
+  download_url: string;
+  expires_in: number;
+  filename: string;
 };
 
 const workerGuideSteps = [
@@ -74,6 +84,8 @@ export function WorkersPage() {
   const { user } = useAuth();
   const queryClient = useQueryClient();
   const [latestCode, setLatestCode] = useState("");
+  const [downloadingWorkerPackage, setDownloadingWorkerPackage] = useState(false);
+  const [deletingWorkerId, setDeletingWorkerId] = useState("");
   const workers = useQuery<WorkerRecord[]>({
     queryKey: ["workers"],
     queryFn: async () => (await api.get<WorkerRecord[]>("/workers")).data,
@@ -123,23 +135,35 @@ export function WorkersPage() {
     await queryClient.invalidateQueries({ queryKey: ["worker-recent-commands"] });
   }
 
-  async function downloadWorkerPackage() {
+  async function deleteWorker(workerId: string) {
+    setDeletingWorkerId(workerId);
     try {
-      const response = await api.get<Blob>("/workers/package", { responseType: "blob" });
-      const disposition = String(response.headers["content-disposition"] || "");
-      const filename = filenameFromDisposition(disposition) || "agentops-worker-windows.zip";
-      const url = window.URL.createObjectURL(response.data);
-      const link = document.createElement("a");
-      link.href = url;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      link.remove();
-      window.URL.revokeObjectURL(url);
+      await api.delete(`/admin/workers/${workerId}`);
+      message.success("Worker 已删除");
+      await queryClient.invalidateQueries({ queryKey: ["workers"] });
+      await queryClient.invalidateQueries({ queryKey: ["worker-recent-commands"] });
+    } catch (error: any) {
+      const detail = error?.response?.data?.detail;
+      message.error(typeof detail === "string" ? detail : "删除 Worker 失败");
+    } finally {
+      setDeletingWorkerId("");
+    }
+  }
+
+  async function downloadWorkerPackage() {
+    if (downloadingWorkerPackage) {
+      return;
+    }
+    setDownloadingWorkerPackage(true);
+    try {
+      const response = await api.post<WorkerPackageTicket>("/workers/package-ticket");
+      window.location.assign(response.data.download_url);
       message.success("Worker 安装包开始下载");
     } catch (error: any) {
       const detail = error?.response?.data?.detail;
       message.error(typeof detail === "string" ? detail : "Worker 安装包暂不可下载，请联系管理员");
+    } finally {
+      setDownloadingWorkerPackage(false);
     }
   }
 
@@ -157,7 +181,11 @@ export function WorkersPage() {
       <Card
         title="普通用户接入说明"
         extra={
-          <Button icon={<DownloadOutlined />} onClick={() => void downloadWorkerPackage()}>
+          <Button
+            icon={<DownloadOutlined />}
+            loading={downloadingWorkerPackage}
+            onClick={() => void downloadWorkerPackage()}
+          >
             下载 Windows Worker
           </Button>
         }
@@ -187,7 +215,11 @@ export function WorkersPage() {
             <Button icon={<SettingOutlined />}>
               <Link to="/settings#settings-worker">打开 Worker 配置</Link>
             </Button>
-            <Button icon={<DownloadOutlined />} onClick={() => void downloadWorkerPackage()}>
+            <Button
+              icon={<DownloadOutlined />}
+              loading={downloadingWorkerPackage}
+              onClick={() => void downloadWorkerPackage()}
+            >
               下载 Windows Worker 安装包
             </Button>
           </Space>
@@ -203,7 +235,7 @@ export function WorkersPage() {
         />
       ) : null}
 
-      <Card title="在线 / 已注册 Worker">
+      <Card title="Worker 状态">
         <List
           loading={workers.isLoading}
           dataSource={workers.data || []}
@@ -211,6 +243,7 @@ export function WorkersPage() {
             const capabilityText =
               (worker.capabilities?.length ? worker.capabilities : worker.supported_apps || []).join(", ") || "-";
             const latestCommand = recentCommands.data?.[worker.worker_id]?.[0];
+            const online = isWorkerOnline(worker);
             return (
               <List.Item className="worker-list-item">
                 <div className="worker-row">
@@ -220,8 +253,9 @@ export function WorkersPage() {
                       <Typography.Text strong className="worker-name">
                         {worker.display_name || worker.worker_id}
                       </Typography.Text>
-                      <Tag color={worker.busy ? "orange" : "green"}>{worker.busy ? "忙碌" : "空闲"}</Tag>
-                      <Tag>{worker.status || "-"}</Tag>
+                      {workerStatusTag(worker)}
+                      {workerActivityTag(worker)}
+                      {worker.registered || worker.registered_at ? <Tag color="default">已注册</Tag> : null}
                     </div>
 
                     <Space direction="vertical" size={4} className="worker-meta-lines">
@@ -255,9 +289,32 @@ export function WorkersPage() {
                   </div>
 
                   <div className="worker-actions">
-                    <Button icon={<SendOutlined />} onClick={() => void sendMockCommand(worker.worker_id)}>
+                    <Button
+                      icon={<SendOutlined />}
+                      disabled={!online}
+                      onClick={() => void sendMockCommand(worker.worker_id)}
+                    >
                       测试命令
                     </Button>
+                    {user?.role === "admin" ? (
+                      <Popconfirm
+                        title="删除这个 Worker？"
+                        description="删除后它会从列表消失，旧 token 会失效；历史命令记录会保留。"
+                        okText="删除"
+                        cancelText="取消"
+                        okButtonProps={{ danger: true }}
+                        onConfirm={() => void deleteWorker(worker.worker_id)}
+                      >
+                        <Button
+                          danger
+                          icon={<DeleteOutlined />}
+                          disabled={online}
+                          loading={deletingWorkerId === worker.worker_id}
+                        >
+                          删除
+                        </Button>
+                      </Popconfirm>
+                    ) : null}
                   </div>
                 </div>
 
@@ -314,8 +371,29 @@ function commandStatusColor(status?: string) {
   return "default";
 }
 
-function filenameFromDisposition(disposition: string) {
-  const match = disposition.match(/filename\*=UTF-8''([^;]+)|filename="?([^";]+)"?/i);
-  const value = match?.[1] || match?.[2] || "";
-  return value ? decodeURIComponent(value) : "";
+function isWorkerOnline(worker: WorkerRecord) {
+  return Boolean(worker.online) || worker.status === "online" || worker.status === "busy";
+}
+
+function workerStatusTag(worker: WorkerRecord) {
+  if (worker.status === "online") {
+    return <Tag color="green">在线</Tag>;
+  }
+  if (worker.status === "busy") {
+    return <Tag color="orange">在线</Tag>;
+  }
+  if (worker.status === "offline") {
+    return <Tag color="red">离线</Tag>;
+  }
+  if (worker.status === "revoked") {
+    return <Tag color="red">已停用</Tag>;
+  }
+  return <Tag>未知</Tag>;
+}
+
+function workerActivityTag(worker: WorkerRecord) {
+  if (!isWorkerOnline(worker)) {
+    return null;
+  }
+  return worker.busy || worker.status === "busy" ? <Tag color="orange">忙碌</Tag> : <Tag color="green">空闲</Tag>;
 }

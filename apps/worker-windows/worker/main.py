@@ -3,6 +3,7 @@ from __future__ import annotations
 import argparse
 import socket
 import sys
+import threading
 import time
 from datetime import datetime
 from pathlib import Path
@@ -19,10 +20,12 @@ from worker.registration import RegistrationOptions, is_registered, machine_fing
 from worker.runtime.supervisor import SupervisorOptions, run_supervisor
 from worker.runtime.windows_service import run_windows_service
 from worker.system.console import disable_quick_edit_mode
+from worker.trae.window import candidate_trae_paths
 
 ACTIVE_COMMAND_STATUSES = {"queued", "claimed", "running"}
 STALE_LEASE_STATUSES = {"stale_lease", "expired_lease"}
 MAX_COMMAND_STATUS_FAILURES = 3
+LEASE_RENEW_INTERVAL_SECONDS = 2.0
 
 
 def run_once(
@@ -47,6 +50,7 @@ def run_once(
         "capabilities": CAPABILITIES,
         "current_stage": runner.state.stage,
         "current_window_title": runner.state.current_window_title,
+        "runtime_status": worker_runtime_status(worker_settings),
         "busy": runner.state.busy,
     }
     heartbeat_result = client.heartbeat(heartbeat)
@@ -74,26 +78,128 @@ def run_once(
             processed += 1
             continue
         command = {**command, "lease_id": str(acked.get("lease_id") or command.get("lease_id") or "")}
-        post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
-        result = runner.run(command)
-        if command.get("lease_id") and "lease_id" not in result:
-            result["lease_id"] = command["lease_id"]
-        result = attach_worker_uploads(client, worker_settings.worker_id, command, result)
-        post_worker_event(
-            client,
-            worker_settings.worker_id,
-            command,
-            "worker_command_finished",
-            level=worker_command_finished_level(str(command.get("type") or ""), str(result.get("status") or "")),
-            extra={
-                "result_status": result.get("status"),
-                "error": result.get("error") or "",
-                "result": result.get("data") if isinstance(result.get("data"), dict) else {},
-            },
-        )
-        client.post_result(worker_settings.worker_id, result)
+        renewer = CommandLeaseRenewer(client, worker_settings.worker_id, command, runner)
+        renewer.start()
+        try:
+            post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
+            result = runner.run(command)
+            refresh_cancelled_state_after_run(client, worker_settings.worker_id, command, runner)
+            if should_convert_to_cancelled_stop(command, runner, result):
+                result = cancelled_stop_result(
+                    worker_settings.worker_id,
+                    command,
+                    runner,
+                    "Command was cancelled by server stop request; local stop cleanup was executed.",
+                )
+            if command.get("lease_id") and "lease_id" not in result:
+                result["lease_id"] = command["lease_id"]
+            result = attach_worker_uploads(client, worker_settings.worker_id, command, result)
+            post_worker_event(
+                client,
+                worker_settings.worker_id,
+                command,
+                "worker_command_finished",
+                level=worker_command_finished_level(str(command.get("type") or ""), str(result.get("status") or "")),
+                extra={
+                    "result_status": result.get("status"),
+                    "error": result.get("error") or "",
+                    "result": result.get("data") if isinstance(result.get("data"), dict) else {},
+                },
+            )
+            client.post_result(worker_settings.worker_id, result)
+        finally:
+            renewer.stop()
         processed += 1
     return processed
+
+
+class CommandLeaseRenewer:
+    def __init__(self, client: WorkerClient, worker_id: str, command: dict, runner: Any) -> None:
+        self.client = client
+        self.worker_id = worker_id
+        self.command_id = str(command.get("command_id") or "")
+        self.lease_id = str(command.get("lease_id") or "")
+        self.runner = runner
+        self._stop = threading.Event()
+        self._thread: threading.Thread | None = None
+        self._failures = 0
+
+    def start(self) -> None:
+        if not self.command_id or not self.lease_id:
+            return
+        self._thread = threading.Thread(
+            target=self._run,
+            name=f"agentops-lease-renewer-{self.command_id[:8]}",
+            daemon=True,
+        )
+        self._thread.start()
+
+    def stop(self) -> None:
+        self._stop.set()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2.0)
+
+    def _run(self) -> None:
+        while not self._stop.wait(LEASE_RENEW_INTERVAL_SECONDS):
+            try:
+                command = self.client.get_command(self.worker_id, self.command_id, lease_id=self.lease_id)
+            except Exception as exc:
+                self._failures += 1
+                log(
+                    f"Could not renew command lease for {self.command_id}: "
+                    f"{exc} ({self._failures}/{MAX_COMMAND_STATUS_FAILURES})."
+                )
+                if self._failures >= MAX_COMMAND_STATUS_FAILURES:
+                    self._request_stop()
+                    return
+                continue
+            self._failures = 0
+            if is_stale_lease_response(command):
+                log(f"Command lease became stale for {self.command_id}; stopping local execution.")
+                self._request_stop()
+                return
+            if is_cancelled_command(command):
+                log(f"Command was cancelled on server for {self.command_id}; stopping local execution.")
+                self._request_stop()
+                return
+
+    def _request_stop(self) -> None:
+        state = getattr(self.runner, "state", None)
+        if state is not None:
+            state.stop_requested = True
+            if not isinstance(getattr(state, "stop_cleanup_result", None), dict):
+                state.stop_cleanup_result = self._run_stop_cleanup()
+
+    def _run_stop_cleanup(self) -> dict:
+        if not hasattr(self.runner, "_cancelled_stop_data"):
+            return {}
+        payload = self._current_command_payload()
+        try:
+            return self.runner._cancelled_stop_data(payload)
+        except Exception as exc:
+            return {
+                "stopped": False,
+                "message": "Worker stop cleanup failed after server cancellation.",
+                "stop_reason": "server_cancelled_current_command",
+                "stop_report": {
+                    "worker_command_cancelled": True,
+                    "stop_confirmed": False,
+                    "cleanup_status": "failed",
+                    "cleanup_error": str(exc),
+                    "trae_stop_clicked": False,
+                    "local_processes_matched": 0,
+                    "local_processes_killed": 0,
+                    "local_process_kill_errors": 1,
+                },
+            }
+
+    def _current_command_payload(self) -> dict:
+        try:
+            command = self.client.get_command(self.worker_id, self.command_id, lease_id=self.lease_id)
+        except Exception:
+            return {}
+        payload = command.get("payload") if isinstance(command, dict) else {}
+        return payload if isinstance(payload, dict) else {}
 
 
 def run_forever(worker_settings: WorkerSettings | None = None) -> None:
@@ -345,6 +451,24 @@ def sync_runtime_config(worker_settings: WorkerSettings, runner: Any, heartbeat_
     return changes
 
 
+def worker_runtime_status(worker_settings: WorkerSettings) -> dict[str, Any]:
+    trae_path = Path(worker_settings.trae_exe_path).expanduser()
+    workspace_root = Path(worker_settings.workspace_root).expanduser()
+    candidates = candidate_trae_paths(trae_path)
+    resolved = next((candidate for candidate in candidates if candidate.exists() and candidate.is_file()), None)
+    return {
+        "trae_exe_path": str(trae_path),
+        "trae_exe_exists": bool(resolved),
+        "trae_exe_resolved_path": str(resolved or ""),
+        "trae_exe_candidates": [str(candidate) for candidate in candidates[:8]],
+        "workspace_root": str(workspace_root),
+        "workspace_root_exists": workspace_root.exists(),
+        "browser_url": worker_settings.browser_url,
+        "keep_trae_foreground": worker_settings.keep_trae_foreground,
+        "config_version": worker_settings.version,
+    }
+
+
 def format_runtime_config_changes(changes: dict[str, str]) -> str:
     ordered = []
     if "workspace_root" in changes:
@@ -561,6 +685,58 @@ def cancelled_result(worker_id: str, command: dict, message: str) -> dict:
         "data": {},
         "error": "",
     }
+
+
+def cancelled_stop_result(worker_id: str, command: dict, runner: Any, message: str) -> dict:
+    payload = command.get("payload") if isinstance(command.get("payload"), dict) else {}
+    try:
+        data = runner._cancelled_stop_data(payload) if hasattr(runner, "_cancelled_stop_data") else {}
+    except Exception as exc:
+        data = {
+            "stopped": False,
+            "message": "Worker stop cleanup failed after command cancellation.",
+            "stop_reason": "server_cancelled_current_command",
+            "stop_report": {
+                "worker_command_cancelled": True,
+                "stop_confirmed": False,
+                "cleanup_status": "failed",
+                "cleanup_error": str(exc),
+                "trae_stop_clicked": False,
+                "local_processes_matched": 0,
+                "local_processes_killed": 0,
+                "local_process_kill_errors": 1,
+            },
+        }
+    result = cancelled_result(worker_id, command, message)
+    result["data"] = data if isinstance(data, dict) else {}
+    return result
+
+
+def should_convert_to_cancelled_stop(command: dict, runner: Any, result: dict) -> bool:
+    if str(command.get("type") or "") == "stop_current_task":
+        return False
+    if str(result.get("status") or "") == "cancelled":
+        return False
+    state = getattr(runner, "state", None)
+    return bool(getattr(state, "stop_requested", False))
+
+
+def refresh_cancelled_state_after_run(client: WorkerClient, worker_id: str, command: dict, runner: Any) -> None:
+    if str(command.get("type") or "") == "stop_current_task":
+        return
+    lease_id = str(command.get("lease_id") or "")
+    command_id = str(command.get("command_id") or "")
+    if not lease_id or not command_id:
+        return
+    try:
+        latest = client.get_command(worker_id, command_id, lease_id=lease_id)
+    except Exception as exc:
+        log(f"Could not refresh command status after run for {command_id}: {exc}")
+        return
+    if is_cancelled_command(latest) or is_stale_lease_response(latest):
+        state = getattr(runner, "state", None)
+        if state is not None:
+            state.stop_requested = True
 
 
 def pause_before_exit() -> None:

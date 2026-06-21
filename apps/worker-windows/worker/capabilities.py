@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.7-completed-trace-stop"
+WORKER_RUNTIME_VERSION = "0.1.13-stop-session-browser"
 
 CAPABILITIES = [
     "auto_launch_trae",
@@ -20,6 +20,7 @@ CAPABILITIES = [
     "click_continue",
     "click_confirm",
     "copy_latest_reply",
+    "visual_trace_copy_button",
     "trae_local_trace_fallback",
     "capture_screenshot",
     "scan_project",
@@ -31,4 +32,14 @@ CAPABILITIES = [
     "workspace_process_cleanup",
     "structured_stop_confirmation",
     "stop_log_noise_filter",
+    "worker_command_lease_renewer",
+    "cancelled_command_stop_cleanup",
+    "windows_node_cmd_shims",
+    "trae_delete_confirmation_cleanup",
+    "project_local_npm_cache_prompt",
+    "browser_acceptance_log_url_probe",
+    "browser_acceptance_route_probe",
+    "stop_cleanup_browser_port_listeners",
+    "stop_cleanup_child_process_tree",
+    "session_probe_diagnostics",
 ]

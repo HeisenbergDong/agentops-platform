@@ -14,16 +14,31 @@ PROMPT_SEND_Y_RATIO = 0.945
 SAFE_ACTIONS = {
     "prompt_input",
     "send_button",
+    "copy_trace_button",
+    "more_actions_button",
     "continue_button",
     "stop_button",
     "run_button",
     "confirm_button",
     "keep_button",
     "save_button",
+    "delete_button",
+    "discard_button",
+    "remove_button",
+    "reset_button",
+    "cancel_button",
 }
 ACTION_ALIASES = {
     "continue": "continue_button",
     "continue-text": "continue_button",
+    "copy_trace": "copy_trace_button",
+    "copy_reply": "copy_trace_button",
+    "copy_button": "copy_trace_button",
+    "more": "more_actions_button",
+    "more_actions": "more_actions_button",
+    "overflow": "more_actions_button",
+    "overflow_menu": "more_actions_button",
+    "ellipsis": "more_actions_button",
     "stop": "stop_button",
     "cancel_generation": "stop_button",
     "run": "run_button",
@@ -32,14 +47,25 @@ ACTION_ALIASES = {
     "confirm": "confirm_button",
     "keep": "keep_button",
     "save": "save_button",
+    "delete": "delete_button",
+    "remove": "remove_button",
+    "discard": "discard_button",
+    "reset": "reset_button",
+    "cancel": "cancel_button",
 }
-BLOCKED_ACTIONS = {
-    "delete_button",
-    "discard_button",
-    "remove_button",
-    "reset_button",
-    "cancel_button",
-}
+SEND_BUTTON_BLOCKLIST = (
+    "voice",
+    "mic",
+    "microphone",
+    "audio",
+    "speech",
+    "dictation",
+    "语音",
+    "麦克风",
+    "话筒",
+    "听写",
+    "录音",
+)
 
 
 def default_targets(window_rect: tuple[int, int, int, int] | None) -> list[dict[str, Any]]:
@@ -85,14 +111,19 @@ def normalize_action(action: str) -> str:
 
 def target_for_action(analysis: dict[str, Any], action: str, min_confidence: float = 0.6) -> dict[str, Any] | None:
     targets = analysis.get("targets") if isinstance(analysis.get("targets"), list) else []
-    candidates = [
-        item
-        for item in targets
-        if isinstance(item, dict)
-        and item.get("action") == action
-        and str(item.get("risk") or "safe") == "safe"
-        and float(item.get("confidence") or 0) >= min_confidence
-    ]
+    candidates = []
+    for item in targets:
+        if not isinstance(item, dict):
+            continue
+        normalized_action = normalize_action(str(item.get("action") or ""))
+        if (
+            normalized_action == action
+            and str(item.get("risk") or "safe") == "safe"
+            and float(item.get("confidence") or 0) >= min_confidence
+        ):
+            candidate = dict(item)
+            candidate["action"] = normalized_action
+            candidates.append(candidate)
     if not candidates:
         return None
     return sorted(candidates, key=lambda item: float(item.get("confidence") or 0), reverse=True)[0]
@@ -105,14 +136,16 @@ def validate_target(
     *,
     min_confidence: float = 0.75,
 ) -> tuple[bool, str]:
-    if action in BLOCKED_ACTIONS:
-        return False, "blocked_action"
     if action not in SAFE_ACTIONS:
         return False, "unknown_action"
-    if target.get("action") != action:
+    target_action = normalize_action(str(target.get("action") or ""))
+    if target_action != action:
         return False, "action_mismatch"
+    target["action"] = target_action
     if str(target.get("risk") or "safe") != "safe":
         return False, "target_not_safe"
+    if action == "send_button" and _looks_like_non_send_composer_tool(target):
+        return False, "send_button_looks_like_voice_or_toolbar_tool"
     if float(target.get("confidence") or 0) < min_confidence:
         return False, "confidence_too_low"
     center = target.get("center") if isinstance(target.get("center"), dict) else {}
@@ -135,9 +168,33 @@ def validate_target(
             return False, "prompt_input_outside_expected_region"
         if action == "send_button" and not (0.20 <= rx <= 0.55 and 0.75 <= ry <= 0.99):
             return False, "send_button_outside_expected_region"
-        if action in {"run_button", "confirm_button", "continue_button", "stop_button"} and not (0.0 <= rx <= 0.55 and 0.08 <= ry <= 0.96):
+        if action == "copy_trace_button" and not (0.0 <= rx <= 0.42 and 0.16 <= ry <= 0.96):
+            return False, "copy_trace_button_outside_assistant_region"
+        if action == "more_actions_button" and not (0.0 <= rx <= 0.46 and 0.16 <= ry <= 0.96):
+            return False, "more_actions_button_outside_assistant_region"
+        if action in {
+            "run_button",
+            "confirm_button",
+            "continue_button",
+            "stop_button",
+            "keep_button",
+            "save_button",
+            "delete_button",
+            "discard_button",
+            "remove_button",
+            "reset_button",
+            "cancel_button",
+        } and not (0.0 <= rx <= 0.55 and 0.08 <= ry <= 0.96):
             return False, "assistant_action_outside_expected_region"
     return True, "ok"
+
+
+def _looks_like_non_send_composer_tool(target: dict[str, Any]) -> bool:
+    text = " ".join(
+        str(target.get(key) or "")
+        for key in ("label", "name", "reason", "description", "aria_label", "text")
+    ).lower()
+    return any(marker.lower() in text for marker in SEND_BUTTON_BLOCKLIST)
 
 
 def locate_visible_action_targets(
@@ -164,7 +221,7 @@ def locate_visible_action_targets(
     }
 
 
-def _find_prompt_input_area(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any]:
+def _find_prompt_input_area(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any] | None:
     left, top, right, bottom = window_rect
     width = max(1, right - left)
     height = max(1, bottom - top)
@@ -172,8 +229,41 @@ def _find_prompt_input_area(image: Image.Image, window_rect: tuple[int, int, int
     # local fallback, not a replacement for AI vision.
     x = int(left + width * PROMPT_INPUT_X_RATIO)
     y = int(top + height * PROMPT_INPUT_Y_RATIO)
+    image_x = x - left
+    image_y = y - top
+    if not _looks_like_prompt_input_panel(image, image_x, image_y):
+        return None
     confidence = 0.62
     return _target("prompt_input", x, y, window_rect, confidence, "local_vision", "bottom-left composer estimate")
+
+
+def _looks_like_prompt_input_panel(image: Image.Image, cx: int, cy: int) -> bool:
+    if not (0 <= cx < image.width and 0 <= cy < image.height):
+        return False
+    left = max(0, cx - 220)
+    right = min(image.width, cx + 260)
+    top = max(0, cy - 95)
+    bottom = min(image.height, cy + 125)
+    if right - left < 180 or bottom - top < 80:
+        return False
+    pixels = image.load()
+    panel_pixels = 0
+    border_pixels = 0
+    green_pixels = 0
+    samples = 0
+    for y in range(top, bottom, 4):
+        for x in range(left, right, 4):
+            red, green, blue = pixels[x, y]
+            samples += 1
+            if 30 <= red <= 58 and 30 <= green <= 62 and 34 <= blue <= 70 and max(red, green, blue) - min(red, green, blue) <= 20:
+                panel_pixels += 1
+            if 55 <= red <= 95 and 55 <= green <= 95 and 58 <= blue <= 105 and max(red, green, blue) - min(red, green, blue) <= 25:
+                border_pixels += 1
+            if green >= 60 and green > red * 1.2 and green > blue * 1.05:
+                green_pixels += 1
+    panel_ratio = panel_pixels / max(1, samples)
+    border_ratio = border_pixels / max(1, samples)
+    return panel_ratio >= 0.18 and (border_pixels >= 8 or border_ratio >= 0.02 or green_pixels >= 10)
 
 
 def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any] | None:

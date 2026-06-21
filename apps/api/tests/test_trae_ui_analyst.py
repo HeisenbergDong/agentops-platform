@@ -82,22 +82,126 @@ def test_trae_ui_analyst_normalizes_decision_schema_from_target():
     assert result["evidence"] == ["visible continue button"]
 
 
-def test_trae_ui_analyst_blocks_unsafe_target():
+def test_trae_ui_analyst_blocks_delete_by_default_even_if_llm_marks_safe():
     data = {
         "status": "found",
-        "screen_state": "awaiting_keep_changes",
-        "recommended_action": "click_keep_button",
+        "screen_state": "awaiting_delete_confirmation",
+        "recommended_action": "click_delete_button",
         "risk": "safe",
-        "target": {"action": "delete_button", "label": "Delete all changes", "center": {"x": 10, "y": 20}},
+        "target": {"action": "delete_button", "label": "Delete generated draft", "center": {"x": 10, "y": 20}},
     }
     result = trae_ui_analyst._normalize_analysis(data, {"window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}})
 
     assert result["risk"] == "blocked"
     assert result["recommended_action"] == "do_not_click"
-    assert result["blocked_reason"] == "unsafe_target_label"
+    assert result["target"]["action"] == "delete_button"
 
 
-def test_trae_ui_analyst_treats_keep_bar_as_trace_candidate_during_wait_completion():
+def test_trae_ui_analyst_blocks_delete_target_list_by_default():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_delete_confirmation",
+        "recommended_action": "click_delete_button",
+        "risk": "safe",
+        "targets": [
+            {
+                "action": "delete_button",
+                "label": "确认删除 4 个文件",
+                "center": {"x": 10, "y": 20},
+                "confidence": 0.91,
+                "risk": "safe",
+            }
+        ],
+    }
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}},
+    )
+
+    assert result["risk"] == "blocked"
+    assert result["recommended_action"] == "do_not_click"
+    assert result["targets"][0]["risk"] == "blocked"
+
+
+def test_trae_ui_analyst_blocks_waiting_delete_even_if_llm_says_completed():
+    data = {
+        "status": "found",
+        "screen_state": "completed",
+        "recommended_action": "collect_trace_candidate",
+        "confidence": 0.93,
+        "risk": "safe",
+        "evidence": ["left task card looks stable"],
+    }
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {
+            "task": "wait_completion_state",
+            "visible_text_sample": "正在等待你的操作\n删除 startup.log\n保留\n删除",
+            "uia_buttons": [{"name": "保留"}, {"name": "删除"}],
+            "window": {"bounds": {"left": 0, "top": 0, "width": 1000, "height": 800}},
+        },
+    )
+
+    assert result["screen_state"] == "manual_required"
+    assert result["recommended_action"] == "do_not_click"
+    assert result["risk"] == "blocked"
+    assert result["blocked_reason"] == "visible_waiting_destructive_confirmation"
+
+
+def test_trae_ui_analyst_prompt_teaches_waiting_delete_card():
+    prompt = trae_ui_analyst._build_prompt(
+        {
+            "task": "wait_completion_state",
+            "visible_text_sample": "正在等待你的操作\n删除 startup.log\n保留\n删除",
+        }
+    )
+
+    assert "manual_required" in prompt
+    assert "do_not_click" in prompt
+    assert "删除 startup.log" in prompt
+    assert "not completed" in prompt
+
+
+def test_trae_ui_analyst_blocks_target_when_llm_marks_blocked():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_delete_confirmation",
+        "recommended_action": "click_delete_button",
+        "risk": "blocked",
+        "target": {
+            "action": "delete_button",
+            "label": "Delete all changes",
+            "center": {"x": 10, "y": 20},
+            "risk": "blocked",
+        },
+    }
+    result = trae_ui_analyst._normalize_analysis(data, {"window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}})
+
+    assert result["risk"] == "blocked"
+    assert result["recommended_action"] == "do_not_click"
+
+
+def test_trae_ui_analyst_normalizes_inner_panel_scroll_action():
+    data = {
+        "status": "partial",
+        "screen_state": "needs_scroll_inner_panel",
+        "recommended_action": "scroll_inner_panel",
+        "confidence": 0.87,
+        "risk": "safe",
+        "evidence": ["正在等待你的操作", "操作卡片内部未完整显示"],
+    }
+
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}},
+    )
+
+    assert result["screen_state"] == "needs_scroll_inner_panel"
+    assert result["recommended_action"] == "scroll_inner_panel"
+    assert result["risk"] == "safe"
+
+
+def test_trae_ui_analyst_treats_keep_bar_as_click_target_during_wait_completion():
     data = {
         "status": "found",
         "screen_state": "awaiting_keep_changes",
@@ -113,5 +217,5 @@ def test_trae_ui_analyst_treats_keep_bar_as_trace_candidate_during_wait_completi
     )
 
     assert result["screen_state"] == "awaiting_keep_changes"
-    assert result["recommended_action"] == "collect_trace_candidate"
+    assert result["recommended_action"] == "click_keep_button"
     assert result["target"]["action"] == "keep_button"
