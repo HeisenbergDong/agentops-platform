@@ -232,6 +232,7 @@ def test_run_once_converts_success_to_cancelled_stop_when_server_cancelled_after
     assert runner.ran is True
     assert client.results[0]["status"] == "cancelled"
     assert client.results[0]["data"]["stop_report"]["stop_confirmed"] is True
+    assert client.results[0]["data"]["stop_report"]["trae_stop_clicked"] is False
     assert client.results[0]["lease_id"] == "run-1"
 
 

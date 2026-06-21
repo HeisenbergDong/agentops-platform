@@ -823,6 +823,8 @@ def test_wait_completion_progress_posts_worker_log(monkeypatch: pytest.MonkeyPat
 
 
 def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
+    stop_calls = []
+
     def fake_wait_completion(
         timeout_seconds: float,
         stable_seconds: float,
@@ -839,20 +841,8 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
-    monkeypatch.setattr(
-        command_runner.CommandRunner,
-        "_stop_current_task",
-        lambda self, payload: {
-            "stopped": True,
-            "message": "Worker stop completed.",
-            "stop_report": {
-                "stop_confirmed": True,
-                "worker_command_cancelled": True,
-                "cleanup_status": "no_matching_processes",
-                "trae_stop_clicked": False,
-            },
-        },
-    )
+    monkeypatch.setattr(command_runner, "_try_click_trae_stop", lambda **_kwargs: stop_calls.append(_kwargs) or {"status": "clicked"})
+    monkeypatch.setattr(command_runner, "cleanup_local_activity", lambda **_kwargs: {"status": "no_matching_processes", "killed": [], "errors": []})
     runner = CommandRunner(worker_id="worker-test", cancellation_checker=lambda command_id: command_id == "cmd-cancel")
 
     result = runner.run(
@@ -866,7 +856,11 @@ def test_wait_completion_cancelled_by_server(monkeypatch: pytest.MonkeyPatch):
     assert result["status"] == "cancelled"
     assert "cancelled" in result["message"].lower()
     assert result["data"]["stop_report"]["stop_confirmed"] is True
+    assert result["data"]["stop_report"]["trae_stop_clicked"] is False
+    assert result["data"]["stop_report"]["cleanup_only"] is True
+    assert result["data"]["stop_report"]["trae_stop_click"]["reason"] == "server_cancelled_current_command_does_not_click_trae_stop"
     assert result["data"]["stop_reason"] == "server_cancelled_current_command"
+    assert stop_calls == []
 
 
 def test_capture_screenshot_routes_quality_payload(monkeypatch: pytest.MonkeyPatch):

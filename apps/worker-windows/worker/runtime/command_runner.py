@@ -535,18 +535,11 @@ class CommandRunner:
         }
 
     def _cancelled_stop_data(self, payload: dict[str, Any]) -> dict:
-        stop_payload = {
-            **(payload or {}),
-            "reason": "server_cancelled_current_command",
-            "use_ai_ui_analyst": True,
-        }
         try:
             cached = self.state.stop_cleanup_result if isinstance(self.state.stop_cleanup_result, dict) else None
             if cached:
                 return {**cached, "stop_report": {**cached.get("stop_report", {}), "cleanup_source": "async_cancel"}}
-            data = self._stop_current_task(stop_payload)
-            data["stop_reason"] = "server_cancelled_current_command"
-            return data
+            return self._cancelled_local_cleanup(payload)
         except Exception as exc:
             return {
                 "stopped": False,
@@ -563,6 +556,61 @@ class CommandRunner:
                     "local_process_kill_errors": 1,
                 },
             }
+
+    def _cancelled_local_cleanup(self, payload: dict[str, Any]) -> dict:
+        workspace_path = None
+        workspace_error = ""
+        raw_workspace_path = (payload or {}).get("trae_workspace_path") or (payload or {}).get("workspace_path")
+        if raw_workspace_path:
+            try:
+                workspace_path = self._workspace_path(raw_workspace_path)
+            except Exception as exc:
+                workspace_error = str(exc)
+        cleanup = cleanup_local_activity(
+            workspace_path=workspace_path,
+            project_name=str((payload or {}).get("project_name") or (payload or {}).get("project_slug") or ""),
+            browser_url=str(
+                (payload or {}).get("url")
+                or (payload or {}).get("browser_url")
+                or (payload or {}).get("acceptance_url")
+                or ""
+            ),
+            kill_trae=bool((payload or {}).get("kill_trae", False)),
+        )
+        if workspace_error:
+            cleanup["workspace_path_error"] = workspace_error
+        cleanup_status = str(cleanup.get("status") or "")
+        cleanup_failed = cleanup_status in {"failed", "partial"} and bool(cleanup.get("errors"))
+        stop_confirmed = not cleanup_failed
+        stop_report = {
+            "worker_command_cancelled": True,
+            "stop_confirmed": stop_confirmed,
+            "cleanup_status": cleanup_status,
+            "trae_stop_clicked": False,
+            "trae_stop_click": {
+                "status": "skipped",
+                "reason": "server_cancelled_current_command_does_not_click_trae_stop",
+            },
+            "local_processes_matched": int(cleanup.get("matched_count") or 0),
+            "local_processes_killed": int(cleanup.get("killed_count") or len(cleanup.get("killed") or [])),
+            "local_process_kill_errors": int(cleanup.get("error_count") or len(cleanup.get("errors") or [])),
+            "sandbox_killed": len(cleanup.get("killed") or []),
+            "trae_ui_stopped_verified": False,
+            "still_generating_suspected": False,
+            "requires_resume_prompt": False,
+            "cleanup_only": True,
+        }
+        return {
+            "stopped": True,
+            "message": (
+                "Worker local activity stopped after command cancellation; Trae generation was left untouched."
+                if stop_confirmed
+                else "Worker local cleanup after command cancellation completed with warnings."
+            ),
+            "cleanup": cleanup,
+            "stop_reason": "server_cancelled_current_command",
+            "stop_report": stop_report,
+        }
 
     def _cancelled(self, command_id: str, message: str, lease_id: str = "", data: dict | None = None) -> dict:
         return {
