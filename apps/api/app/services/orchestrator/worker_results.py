@@ -255,6 +255,8 @@ def _queue_send_prompt_visual_diagnosis(
     recovery_reason = _send_prompt_recovery_reason(extra)
     retry_payload = {
         **source_command.payload,
+        "open_new_task": False,
+        "open_new_task_suppressed_reason": "send_prompt_visual_recovery",
         "send_prompt_visual_recovery_attempts": attempts,
         "max_send_prompt_visual_recovery_attempts": max_attempts,
         "retry_of_command_id": source_command.id,
@@ -545,7 +547,12 @@ def _handle_send_prompt_visual_diagnosis(
                 "display_message": "视觉诊断未确认提示词已发出，调度重试一次发送提示词并继续启用视觉定位。",
             },
         )
-        next_command = _enqueue_worker_command(db, command, WorkerCommandType.SEND_PROMPT, resume_payload)
+        next_command = _enqueue_worker_command(
+            db,
+            command,
+            WorkerCommandType.SEND_PROMPT,
+            _suppress_open_new_task_for_retry(resume_payload, "send_prompt_visual_recovery"),
+        )
         add_log(
             db,
             job_id=job.id,
@@ -595,6 +602,8 @@ def _queue_resume_previous_worker_step(
         "resume_after_pause": True,
         "resume_diagnosis_state": extra.get("diagnosis_state", ""),
     }
+    if command_type == WorkerCommandType.SEND_PROMPT:
+        resume_payload = _suppress_open_new_task_for_retry(resume_payload, "resume_after_pause")
     stage = _resume_stage_for_worker_command(command_type)
     job.status = stage
     if round_:
@@ -670,6 +679,14 @@ def _send_prompt_recovery_reason(extra: dict) -> str:
     if error:
         return "send_prompt_failed"
     return "prompt_submission_unconfirmed"
+
+
+def _suppress_open_new_task_for_retry(payload: dict, reason: str) -> dict:
+    result = dict(payload)
+    if result.get("open_new_task"):
+        result["open_new_task_suppressed_reason"] = reason
+    result["open_new_task"] = False
+    return result
 
 
 def _visual_diagnosis_blocked(data: dict) -> bool:
@@ -3706,7 +3723,6 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "job_id",
         "round_id",
         "round_index",
-        "open_new_task",
         "directions",
         "url",
         "browser_url",

@@ -56,6 +56,8 @@ def test_round_label_does_not_cap_at_fifth_round():
 def test_send_prompt_unconfirmed_result_queues_visual_diagnosis():
     db = _test_session()
     job, round_, command = _create_send_prompt_rows(db)
+    command.payload = {**command.payload, "open_new_task": True}
+    db.commit()
 
     handle_worker_result(
         db,
@@ -88,6 +90,9 @@ def test_send_prompt_unconfirmed_result_queues_visual_diagnosis():
     assert diagnose_command.payload["resume_previous_payload"]["send_prompt_visual_recovery_attempts"] == 1
     assert diagnose_command.payload["resume_previous_payload"]["verify_visual_submission"] is True
     assert diagnose_command.payload["resume_previous_payload"]["strict_submission_verification"] is True
+    assert diagnose_command.payload["resume_previous_payload"]["open_new_task"] is False
+    assert diagnose_command.payload["resume_previous_payload"]["open_new_task_suppressed_reason"] == "send_prompt_visual_recovery"
+    assert "open_new_task" not in diagnose_command.payload
     assert db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED)) is None
 
 
@@ -99,6 +104,7 @@ def test_send_prompt_visual_diagnosis_retries_prompt_when_not_submitted():
         "previous_command_type": WorkerCommandType.SEND_PROMPT.value,
         "resume_previous_payload": {
             "prompt": "demo prompt",
+            "open_new_task": True,
             "send_prompt_visual_recovery_attempts": 1,
             "max_send_prompt_visual_recovery_attempts": 3,
         },
@@ -134,6 +140,8 @@ def test_send_prompt_visual_diagnosis_retries_prompt_when_not_submitted():
     assert next_command.id != command.id
     assert next_command.payload["prompt"] == "demo prompt"
     assert next_command.payload["send_prompt_visual_recovery_attempts"] == 1
+    assert next_command.payload["open_new_task"] is False
+    assert next_command.payload["open_new_task_suppressed_reason"] == "send_prompt_visual_recovery"
 
 
 def test_send_prompt_visual_diagnosis_waits_when_prompt_submitted():

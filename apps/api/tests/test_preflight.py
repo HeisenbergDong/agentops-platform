@@ -1522,6 +1522,42 @@ def test_retry_worker_command_requeues_failed_command_with_current_settings():
     assert round_.status == JobState.BROWSER_ACCEPTING
 
 
+def test_retry_send_prompt_command_does_not_open_new_trae_task():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    job, round_ = _create_manual_required_job(db, user.id)
+    previous = WorkerCommand(
+        id="cmd1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.SEND_PROMPT.value,
+        payload={"prompt": "demo", "open_new_task": True, "trae_workspace_path": "D:/old"},
+        status="failed",
+        error="submission unconfirmed",
+    )
+    db.add(previous)
+    db.commit()
+
+    retry_worker_command(user=user, db=db)
+
+    new_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.id != previous.id)
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    assert new_command is not None
+    assert new_command.command_type == WorkerCommandType.SEND_PROMPT.value
+    assert new_command.payload["retry_of_command_id"] == previous.id
+    assert new_command.payload["open_new_task"] is False
+    assert new_command.payload["open_new_task_suppressed_reason"] == "manual_retry"
+    assert new_command.payload["trae_workspace_path"] == "D:/mr-d"
+
+
 def test_retry_worker_command_rejects_active_command():
     db = _test_session()
     user = _create_user(db, "user1")

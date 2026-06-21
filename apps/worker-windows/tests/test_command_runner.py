@@ -357,6 +357,44 @@ def test_send_prompt_opens_new_task_only_when_payload_requests_it(monkeypatch: p
 
     assert result["status"] == "success"
     assert result["data"]["open_new_task"] is True
+    assert result["data"]["open_new_task_requested"] is True
+    assert result["data"]["open_new_task_effective"] is True
+
+
+def test_send_prompt_retry_does_not_open_new_task(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+
+    monkeypatch.setattr(command_runner.settings, "workspace_root", tmp_path)
+    monkeypatch.setattr(
+        command_runner,
+        "ensure_trae_running",
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+    )
+    monkeypatch.setattr(
+        command_runner,
+        "send_prompt",
+        lambda prompt, submit, submit_hotkey, **kwargs: {"status": "sent", "open_new_task": kwargs.get("open_new_task")},
+    )
+
+    result = CommandRunner(worker_id="worker-test").run(
+        {
+            "command_id": "cmd-retry-open-new",
+            "type": "send_prompt",
+            "payload": {
+                "prompt": "Build the feature",
+                "trae_workspace_path": "project",
+                "open_new_task": True,
+                "retry_of_command_id": "cmd-original",
+            },
+        }
+    )
+
+    assert result["status"] == "success"
+    assert result["data"]["open_new_task"] is False
+    assert result["data"]["open_new_task_requested"] is True
+    assert result["data"]["open_new_task_effective"] is False
+    assert result["data"]["open_new_task_suppressed_reason"] == "retry_command"
 
 
 def test_send_prompt_auto_starts_trae_without_workspace_payload(

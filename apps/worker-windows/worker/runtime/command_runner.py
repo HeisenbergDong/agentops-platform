@@ -31,6 +31,29 @@ RECOVERABLE_TURN_GATE_REASONS = {
 }
 
 
+def _send_prompt_open_new_task(payload: dict[str, Any]) -> tuple[bool, str]:
+    requested = bool(payload.get("open_new_task", False))
+    suppression_reason = _open_new_task_suppression_reason(payload)
+    return requested and not suppression_reason, suppression_reason
+
+
+def _open_new_task_suppression_reason(payload: dict[str, Any]) -> str:
+    configured_reason = str(payload.get("open_new_task_suppressed_reason") or "").strip()
+    if configured_reason:
+        return configured_reason
+    if payload.get("retry_of_command_id"):
+        return "retry_command"
+    if payload.get("resume_after_pause"):
+        return "resume_after_pause"
+    try:
+        recovery_attempts = int(payload.get("send_prompt_visual_recovery_attempts") or 0)
+    except (TypeError, ValueError):
+        recovery_attempts = 0
+    if recovery_attempts > 0:
+        return "send_prompt_visual_recovery"
+    return ""
+
+
 class CommandRunner:
     def __init__(
         self,
@@ -176,6 +199,7 @@ class CommandRunner:
         )
         prompt_workspace_path = self._launch_workspace_path(workspace_path)
         sent_at_epoch = time.time()
+        open_new_task, open_new_task_suppressed_reason = _send_prompt_open_new_task(payload)
         try:
             send_result = send_prompt(
                 prompt,
@@ -187,7 +211,7 @@ class CommandRunner:
                 sent_at_epoch=sent_at_epoch,
                 submission_timeout_seconds=float(payload.get("submission_timeout_seconds", 30)),
                 ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
-                open_new_task=bool(payload.get("open_new_task", False)),
+                open_new_task=open_new_task,
                 verify_visual_submission=bool(payload.get("verify_visual_submission", True)),
                 progress_callback=lambda event: self._post_send_prompt_progress(command_id, payload, event),
             )
@@ -209,6 +233,10 @@ class CommandRunner:
                 details.setdefault("current_window", {"status": "not_focused", "error": str(focus_exc)})
             raise PromptSendError(str(exc), details) from exc
         send_result["sent_at_epoch"] = sent_at_epoch
+        send_result["open_new_task_requested"] = bool(payload.get("open_new_task", False))
+        send_result["open_new_task_effective"] = open_new_task
+        if open_new_task_suppressed_reason:
+            send_result["open_new_task_suppressed_reason"] = open_new_task_suppressed_reason
         send_result["open_trae"] = open_result
         send_result["workspace"] = workspace_info
         self.state.current_window_title = str(send_result.get("window_title") or self.state.current_window_title)
