@@ -502,6 +502,77 @@ def test_wait_completion_worker_command_error_requeues_observation_without_click
     assert retry is not None
 
 
+def test_wait_completion_observation_limit_queues_visual_diagnosis_before_manual_required():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {
+        "prompt": "demo",
+        "workspace_path": "project-a",
+        "wait_observation_attempts": 1,
+        "max_wait_observation_attempts": 1,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="No explicit Trae intervention target was found; diagnosis_state=idle_or_running",
+            data={},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    diagnose = _latest_command(db, WorkerCommandType.DIAGNOSE_UI)
+    manual_error = db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required"))
+
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert diagnose is not None
+    assert diagnose.payload["task"] == "wait_completion_state"
+    assert diagnose.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
+    assert diagnose.payload["wait_recovery_diagnosis_attempts"] == 1
+    assert diagnose.payload["workspace_path"] == "project-a"
+    assert manual_error is None
+
+
+def test_wait_completion_after_continue_reobserves_without_second_continue_command():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {
+        "prompt": "demo",
+        "continue_text_sent": True,
+        "continue_sent_at": "2026-06-22T00:00:00+00:00",
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Trae supervisor could not recover current turn (awaiting_continuation)",
+            data={"output_probe": {"reason": "awaiting_continuation"}},
+        ),
+    )
+
+    retry = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+    click_continue = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert click_continue is None
+    assert retry.id != command.id
+    assert retry.payload["continue_text_sent"] is True
+    assert retry.payload["continue_action_sent"] is True
+
+
 def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
@@ -2151,8 +2222,7 @@ def test_copy_latest_reply_incomplete_trace_queues_visual_diagnosis_before_retry
     assert recovery_log is not None
     assert recovery_log.level == "info"
     assert recovery_log.extra["trace_recovery_diagnosis_attempts"] == 1
-    return
-    assert "先重试滚底和复制" in recovery_log.display_message
+    assert "截图给视觉诊断" in recovery_log.display_message
     assert "人工处理" not in recovery_log.display_message
 
 

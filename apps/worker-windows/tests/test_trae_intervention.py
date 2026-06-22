@@ -4,7 +4,7 @@ from PIL import Image, ImageDraw
 from worker.trae import wait as wait_module
 from worker.trae.diagnose import diagnose_ui
 from worker.trae.intervene import TraeAutomationError, apply_intervention, click_continue
-from worker.trae.ui_locator import locate_visible_action_targets, target_for_action
+from worker.trae.ui_locator import locate_prompt_targets, locate_visible_action_targets, target_for_action
 
 
 def _watcher_observation(recent: bool = False) -> dict:
@@ -57,7 +57,7 @@ def test_diagnose_ui_classifies_safe_action_button(monkeypatch: pytest.MonkeyPat
     assert result["suggested_intervention"]["mode"] == "click-point"
 
 
-def test_diagnose_ui_marks_local_delete_confirmation_manual_required(monkeypatch: pytest.MonkeyPatch):
+def test_diagnose_ui_allows_local_delete_confirmation(monkeypatch: pytest.MonkeyPatch):
     class Rect:
         left = 325
         top = 555
@@ -91,11 +91,12 @@ def test_diagnose_ui_marks_local_delete_confirmation_manual_required(monkeypatch
     assert result["ok"] is True
     assert result["state"] == "awaiting_delete_confirmation"
     assert result["suggested_intervention"]["action"] == "delete_button"
-    assert result["suggested_intervention"]["mode"] == "manual-required"
-    assert result["suggested_intervention"]["risk"] == "blocked"
+    assert result["suggested_intervention"]["mode"] == "click-point"
+    assert result["suggested_intervention"]["risk"] == "safe"
+    assert result["suggested_intervention"]["recommended_action"] == "click_delete_button"
 
 
-def test_diagnose_ui_blocks_waiting_delete_card_even_if_vision_says_completed(monkeypatch: pytest.MonkeyPatch, tmp_path):
+def test_diagnose_ui_allows_waiting_delete_card_even_if_vision_says_completed(monkeypatch: pytest.MonkeyPatch, tmp_path):
     screenshot = tmp_path / "trae-waiting-delete-card.png"
     Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
     seen_context = {}
@@ -153,13 +154,13 @@ def test_diagnose_ui_blocks_waiting_delete_card_even_if_vision_says_completed(mo
     result = diagnose_ui(ui_analyst=fake_analyst)
 
     assert result["ok"] is True
-    assert result["state"] == "awaiting_destructive_confirmation"
-    assert result["reason"] == "local_waiting_destructive_confirmation"
-    assert result["suggested_intervention"]["mode"] == "manual-required"
-    assert result["suggested_intervention"]["recommended_action"] == "do_not_click"
-    assert result["suggested_intervention"]["risk"] == "blocked"
+    assert result["state"] == "awaiting_delete_confirmation"
+    assert result["reason"] == "local_delete_confirmation_allowed"
+    assert result["suggested_intervention"]["mode"] == "click-point"
+    assert result["suggested_intervention"]["recommended_action"] == "click_delete_button"
+    assert result["suggested_intervention"]["risk"] == "safe"
     assert any("waiting-for-user-action" in item for item in seen_context["manual_required_rules"])
-    assert "\u5220\u9664/delete/remove/discard/cancel/reset" in seen_context["manual_required_rules"][1]
+    assert "click_delete_button" in seen_context["manual_required_rules"][1]
 
 
 def test_diagnose_ui_scrolls_again_when_action_card_is_below_view(monkeypatch: pytest.MonkeyPatch):
@@ -342,7 +343,7 @@ def test_diagnose_ui_uses_llm_visual_when_webview_buttons_are_hidden(monkeypatch
     assert result["suggested_intervention"]["source"] == "ai_vision"
 
 
-def test_diagnose_ui_blocks_llm_delete_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path):
+def test_diagnose_ui_allows_llm_delete_confirmation(monkeypatch: pytest.MonkeyPatch, tmp_path):
     screenshot = tmp_path / "trae-delete-card.png"
     Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
 
@@ -388,9 +389,62 @@ def test_diagnose_ui_blocks_llm_delete_confirmation(monkeypatch: pytest.MonkeyPa
     )
 
     assert result["ok"] is True
-    assert result["state"] == "awaiting_delete_confirmation"
-    assert result["suggested_intervention"]["mode"] == "manual-required"
-    assert result["suggested_intervention"]["risk"] == "blocked"
+    assert result["state"] == "awaiting_safe_delete_confirmation"
+    assert result["suggested_intervention"]["mode"] == "click-point"
+    assert result["suggested_intervention"]["risk"] == "safe"
+    assert result["suggested_intervention"]["recommended_action"] == "click_delete_button"
+
+
+def test_locate_prompt_targets_does_not_treat_stop_square_as_send(tmp_path):
+    image = Image.new("RGB", (1000, 800), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((40, 610, 420, 790), fill=(40, 42, 48), outline=(70, 72, 82), width=2)
+    send_x = int(1000 * 0.364)
+    send_y = int(800 * 0.945)
+    draw.rounded_rectangle((send_x - 20, send_y - 20, send_x + 20, send_y + 20), radius=8, fill=(37, 220, 132))
+    draw.rectangle((send_x - 7, send_y - 7, send_x + 7, send_y + 7), fill=(22, 48, 47))
+    screenshot = tmp_path / "trae-stop-square.png"
+    image.save(screenshot)
+
+    result = locate_prompt_targets(screenshot, (0, 0, 1000, 800))
+    actions = {item["action"] for item in result["targets"]}
+
+    assert "prompt_input" in actions
+    assert "send_button" not in actions
+
+
+def test_apply_intervention_rejects_bottom_stop_button_region(monkeypatch: pytest.MonkeyPatch):
+    clicks = []
+
+    class FakeWindow:
+        hwnd = 101
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.intervene.find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr("worker.trae.intervene._window_rect", lambda _hwnd: (0, 0, 1000, 800))
+    monkeypatch.setattr("worker.trae.intervene._mouse_click", lambda x, y: clicks.append((x, y)))
+
+    with pytest.raises(TraeAutomationError):
+        apply_intervention({"mode": "click-point", "action": "continue_button", "risk": "safe", "x": 364, "y": 756})
+
+    assert clicks == []
+
+
+def test_apply_intervention_rejects_misclassified_send_button_in_stop_region(monkeypatch: pytest.MonkeyPatch):
+    clicks = []
+
+    class FakeWindow:
+        hwnd = 101
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda **_kwargs: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.intervene.find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr("worker.trae.intervene._window_rect", lambda _hwnd: (0, 0, 1000, 800))
+    monkeypatch.setattr("worker.trae.intervene._mouse_click", lambda x, y: clicks.append((x, y)))
+
+    with pytest.raises(TraeAutomationError):
+        apply_intervention({"mode": "click-point", "action": "send_button", "risk": "safe", "x": 364, "y": 756})
+
+    assert clicks == []
 
 
 def test_diagnose_ui_uses_llm_inner_panel_scroll(monkeypatch: pytest.MonkeyPatch, tmp_path):

@@ -16,20 +16,26 @@ Coordinates must be absolute screen coordinates when window.bounds is provided, 
 Allowed click targets include prompt_input, send_button, copy_trace_button, more_actions_button, continue_button, run_button, confirm_button, keep_button, save_button, delete_button, discard_button, remove_button, reset_button, cancel_button.
 Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bottom, scroll_inner_panel, click_run_button, click_confirm_button, click_keep_button, click_save_button, click_continue_button, click_delete_button, click_discard_button, click_cancel_button, type_continue, answer_terminal_prompt, do_not_click, need_more_context.
 If the screenshot contains "正在等待你的操作", "等待您的操作", "确认执行", "保留", "删除", "应用", "继续", "运行", "允许", or "拒绝", classify it as a pending user action instead of ordinary generation.
-Hard rule: a visible waiting-for-user-action card is never a completed task. If that card includes destructive choices like "删除", "移除", "清空", "重置", "放弃", "丢弃", "取消", delete, remove, clear, reset, discard, cancel, or abandon, return screen_state "manual_required", recommended_action "do_not_click", risk "blocked", and explain blocked_reason.
-Example: if Trae shows "正在等待你的操作" with "删除 startup.log" and buttons "保留" / "删除", the correct answer is manual_required + do_not_click, not completed and not click_delete_button.
+Hard rule: a visible waiting-for-user-action card is never a completed task. If that card explicitly asks whether Trae can delete/remove something, return awaiting_delete_confirmation + click_delete_button with risk "safe". If it asks to clear, reset, discard, cancel, or abandon, return screen_state "manual_required", recommended_action "do_not_click", risk "blocked", and explain blocked_reason.
+Example: if Trae shows "正在等待你的操作" with "删除 startup.log" and buttons "保留" / "删除", the correct answer is awaiting_delete_confirmation + click_delete_button with risk safe, not completed.
 If the pending action is inside a nested reply card or small inner panel and the card content is cut off or not fully visible, use screen_state "needs_scroll_inner_panel" and recommended_action "scroll_inner_panel".
-For destructive-looking actions such as delete, remove, clear, reset, discard, cancel, or abandon, use risk "blocked" and recommended_action "do_not_click" unless task context explicitly allows that exact destructive action. Prefer manual confirmation for file deletion cards.
+For destructive-looking actions such as clear, reset, discard, cancel, or abandon, use risk "blocked" and recommended_action "do_not_click" unless task context explicitly allows that exact destructive action. Trae delete/remove confirmation cards are allowed when explicit.
 If the model request failed with 3003 or service interruption, prefer recommended_action "type_continue" with risk "safe".
 If the assistant appears to still be generating or tools are running, use recommended_action "wait".
 If the left task card or assistant area visibly says the task is complete, classify screen_state "completed" and recommended_action "collect_trace_candidate" unless there is a visible generating spinner, terminal prompt, service error, or explicit continue prompt.
 When task context desired_action is copy_trace_button, locate the safe copy button/icon for the latest completed assistant reply or its execution trace. Prefer the assistant message bottom toolbar copy control. Do not choose code-block copy buttons, editor toolbar copy icons, file explorer controls, or window chrome. If the reply area is narrow and the toolbar has a "..." / more / overflow button where copy may be hidden, return a safe more_actions_button target first, not not_found. If the overflow menu is already open, choose the Copy item inside that menu only when it belongs to the latest assistant reply toolbar. If no direct copy or overflow menu path is visible, return status "not_found" and need_scroll true when scrolling may reveal it.
 When task context desired_action is send_button, the target must be the active green send/up-arrow/paper-plane button at the lower-right of the Trae chat composer. Never choose microphone, voice input, audio, lightning, attachment, model selector, seed selector, or any toolbar icon as send_button. If the visible candidate is a microphone/voice icon, return not_found or do_not_click and explain it.
-When task context desired_action is verify_prompt_submission, classify only whether the prompt submission succeeded. If the prompt text still appears in the composer or the active green send button is still visible beside a filled composer, return screen_state "prompt_still_in_composer", recommended_action "do_not_click", risk "blocked". If no submitted user prompt or generation is visible, return screen_state "prompt_not_submitted". If the prompt has left the composer and Trae is generating or waiting for a safe follow-up action, return screen_state "prompt_submitted" or the more specific generating/awaiting_* state. Do not return click targets for this task.
+When task context desired_action is verify_prompt_submission, classify only whether the prompt submission succeeded. If the prompt text still appears in the composer or the active green send/up-arrow button is still visible beside a filled composer, return screen_state "prompt_still_in_composer", recommended_action "do_not_click", risk "blocked". If the composer button is a green stop/square while Trae is working, treat that as submitted/generating, not as an active send button. If no submitted user prompt or generation is visible, return screen_state "prompt_not_submitted". If the prompt has left the composer and Trae is generating or waiting for a safe follow-up action, return screen_state "prompt_submitted" or the more specific generating/awaiting_* state. Do not return click targets for this task.
 If Trae is asking whether to execute, continue, or keep/adopt/save changes, classify the prompt and return the exact visible safe button target when that is the correct next action.
-If Trae is asking whether to delete, remove, discard, reset, or cancel something, classify it as manual_required/do_not_click unless task context explicitly allows that destructive action.
+If Trae is asking whether to delete/remove something, classify it as awaiting_delete_confirmation/click_delete_button with risk safe. Keep discard/reset/cancel/clear prompts manual_required/do_not_click unless task context explicitly allows that destructive action.
 When task context asks for wait_completion_state, the screenshot is the source of truth for pending UI actions; do not treat visible confirmation cards as completion unless the prompt is already resolved.
 """.strip()
+
+SYSTEM_INSTRUCTIONS += (
+    "\nTrae delete confirmation policy: when Trae explicitly asks whether it can delete/remove something, "
+    "click_delete_button may be risk=safe. Discard/reset/cancel/clear prompts or uncertain destructive prompts "
+    "must remain manual_required/do_not_click."
+)
 
 
 OUTPUT_SCHEMA = {
@@ -254,6 +260,16 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
     if not risk:
         risk = _risk_from_target(target, targets)
     blocked_reason = str(data.get("blocked_reason") or "")
+    if _should_force_delete_confirmation(screen_state, recommended_action, target, targets, data, context):
+        screen_state = "awaiting_delete_confirmation"
+        recommended_action = "click_delete_button"
+        risk = "safe"
+        blocked_reason = ""
+        if target and str(target.get("action") or "") in {"delete_button", "remove_button"}:
+            target["risk"] = "safe"
+        for item in targets:
+            if str(item.get("action") or "") in {"delete_button", "remove_button"}:
+                item["risk"] = "safe"
     if _should_block_destructive_analysis(screen_state, recommended_action, target, targets, data, context):
         if screen_state == "completed":
             screen_state = "manual_required"
@@ -394,7 +410,7 @@ def _should_block_destructive_analysis(
     data: dict[str, Any],
     context: dict[str, Any],
 ) -> bool:
-    if _destructive_action_allowed(target, context):
+    if _delete_confirmation_allowed(target, targets, data, context):
         return False
     if screen_state in DESTRUCTIVE_SCREEN_STATES or recommended_action in DESTRUCTIVE_RECOMMENDED_ACTIONS:
         return True
@@ -439,7 +455,7 @@ def _destructive_block_reason(data: dict[str, Any], context: dict[str, Any]) -> 
 def _should_block_unsafe_target(target: dict, data: dict[str, Any], context: dict[str, Any]) -> bool:
     if not _looks_unsafe_target(target):
         return False
-    if not _destructive_action_allowed(target, context):
+    if not _destructive_action_allowed(target, context, data):
         return True
     if str(target.get("risk") or "") != "safe" or str(data.get("risk") or "") == "blocked":
         return True
@@ -453,7 +469,7 @@ def _should_block_unsafe_target(target: dict, data: dict[str, Any], context: dic
     return not (screen_state == expected_state and recommended_action == expected_action)
 
 
-def _destructive_action_allowed(target: dict, context: dict[str, Any]) -> bool:
+def _destructive_action_allowed(target: dict, context: dict[str, Any], data: dict[str, Any] | None = None) -> bool:
     action = str(target.get("action") or "")
     if action not in DESTRUCTIVE_CONFIRMATION_ACTIONS:
         return False
@@ -462,7 +478,102 @@ def _destructive_action_allowed(target: dict, context: dict[str, Any]) -> bool:
     allowed = context.get("allowed_destructive_actions")
     if isinstance(allowed, list) and action in {str(item) for item in allowed}:
         return True
+    if action in {"delete_button", "remove_button"} and _looks_like_allowed_trae_delete_confirmation(target, context, data or {}):
+        return True
     return False
+
+
+def _delete_confirmation_allowed(
+    target: dict,
+    targets: list[dict],
+    data: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    for item in ([target] if target else []) + targets:
+        if _destructive_action_allowed(item, context, data):
+            return True
+    return _context_or_analysis_has_allowed_delete_confirmation(context, data)
+
+
+def _should_force_delete_confirmation(
+    screen_state: str,
+    recommended_action: str,
+    target: dict,
+    targets: list[dict],
+    data: dict[str, Any],
+    context: dict[str, Any],
+) -> bool:
+    if str(data.get("risk") or "") == "blocked":
+        return False
+    if target and str(target.get("risk") or "") == "blocked":
+        return False
+    if any(str(item.get("risk") or "") == "blocked" for item in targets):
+        return False
+    if not _delete_confirmation_allowed(target, targets, data, context):
+        return False
+    return screen_state == "completed" or recommended_action in {"collect_trace_candidate", "do_not_click", "need_more_context", ""}
+
+
+def _looks_like_allowed_trae_delete_confirmation(target: dict, context: dict[str, Any], data: dict[str, Any]) -> bool:
+    if bool(context.get("allow_trae_delete_confirmations")):
+        return True
+    if str(data.get("screen_state") or "") == "awaiting_delete_confirmation":
+        return True
+    if str(data.get("recommended_action") or "") == "click_delete_button":
+        return True
+    return _context_or_analysis_has_allowed_delete_confirmation(context, data, target)
+
+
+def _context_or_analysis_has_allowed_delete_confirmation(
+    context: dict[str, Any],
+    data: dict[str, Any],
+    target: dict | None = None,
+) -> bool:
+    text_parts = [
+        str((target or {}).get("label") or ""),
+        str((target or {}).get("reason") or ""),
+        str(data.get("reason") or ""),
+        str(data.get("blocked_reason") or ""),
+        str(data.get("screen_state") or ""),
+        str(data.get("recommended_action") or ""),
+        str(context.get("visible_text_sample") or ""),
+    ]
+    buttons = context.get("uia_buttons")
+    if isinstance(buttons, list):
+        for item in buttons:
+            if isinstance(item, dict):
+                text_parts.extend(str(item.get(key) or "") for key in ("name", "label", "action", "reason"))
+    evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+    text_parts.extend(str(item) for item in evidence)
+    targets = data.get("targets") if isinstance(data.get("targets"), list) else []
+    for item in targets:
+        if isinstance(item, dict):
+            text_parts.extend(str(item.get(key) or "") for key in ("action", "label", "reason"))
+    text = "\n".join(text_parts).lower().replace("/", "\\")
+    delete_markers = (
+        "delete",
+        "remove",
+        "删除",
+        "移除",
+    )
+    if not any(marker in text for marker in delete_markers):
+        return False
+    confirmation_markers = (
+        "awaiting_delete_confirmation",
+        "click_delete_button",
+        "waiting for your operation",
+        "waiting for your action",
+        "正在等待你的操作",
+        "正在等待您的操作",
+        "等待你的操作",
+        "等待您的操作",
+        "确认删除",
+        "是否要删除",
+        "是否仍要删除",
+    )
+    if any(marker in text for marker in confirmation_markers):
+        return True
+    return bool(target and str(target.get("action") or "") in {"delete_button", "remove_button"})
 
 
 def _target_in_list(target: dict, targets: list[dict]) -> bool:

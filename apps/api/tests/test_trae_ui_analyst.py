@@ -82,7 +82,7 @@ def test_trae_ui_analyst_normalizes_decision_schema_from_target():
     assert result["evidence"] == ["visible continue button"]
 
 
-def test_trae_ui_analyst_blocks_delete_by_default_even_if_llm_marks_safe():
+def test_trae_ui_analyst_allows_trae_delete_by_default_when_llm_marks_safe():
     data = {
         "status": "found",
         "screen_state": "awaiting_delete_confirmation",
@@ -92,12 +92,12 @@ def test_trae_ui_analyst_blocks_delete_by_default_even_if_llm_marks_safe():
     }
     result = trae_ui_analyst._normalize_analysis(data, {"window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}})
 
-    assert result["risk"] == "blocked"
-    assert result["recommended_action"] == "do_not_click"
+    assert result["risk"] == "safe"
+    assert result["recommended_action"] == "click_delete_button"
     assert result["target"]["action"] == "delete_button"
 
 
-def test_trae_ui_analyst_blocks_delete_target_list_by_default():
+def test_trae_ui_analyst_allows_trae_file_delete_target_list_by_default():
     data = {
         "status": "found",
         "screen_state": "awaiting_delete_confirmation",
@@ -118,12 +118,12 @@ def test_trae_ui_analyst_blocks_delete_target_list_by_default():
         {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 100, "height": 100}}},
     )
 
-    assert result["risk"] == "blocked"
-    assert result["recommended_action"] == "do_not_click"
-    assert result["targets"][0]["risk"] == "blocked"
+    assert result["risk"] == "safe"
+    assert result["recommended_action"] == "click_delete_button"
+    assert result["targets"][0]["risk"] == "safe"
 
 
-def test_trae_ui_analyst_blocks_waiting_delete_even_if_llm_says_completed():
+def test_trae_ui_analyst_forces_waiting_delete_even_if_llm_says_completed():
     data = {
         "status": "found",
         "screen_state": "completed",
@@ -142,10 +142,10 @@ def test_trae_ui_analyst_blocks_waiting_delete_even_if_llm_says_completed():
         },
     )
 
-    assert result["screen_state"] == "manual_required"
-    assert result["recommended_action"] == "do_not_click"
-    assert result["risk"] == "blocked"
-    assert result["blocked_reason"] == "visible_waiting_destructive_confirmation"
+    assert result["screen_state"] == "awaiting_delete_confirmation"
+    assert result["recommended_action"] == "click_delete_button"
+    assert result["risk"] == "safe"
+    assert result["blocked_reason"] == ""
 
 
 def test_trae_ui_analyst_prompt_teaches_waiting_delete_card():
@@ -156,8 +156,8 @@ def test_trae_ui_analyst_prompt_teaches_waiting_delete_card():
         }
     )
 
-    assert "manual_required" in prompt
-    assert "do_not_click" in prompt
+    assert "click_delete_button" in prompt
+    assert "risk safe" in prompt
     assert "删除 startup.log" in prompt
     assert "not completed" in prompt
 

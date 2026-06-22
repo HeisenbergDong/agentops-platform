@@ -60,11 +60,16 @@ SEND_BUTTON_BLOCKLIST = (
     "audio",
     "speech",
     "dictation",
+    "stop",
+    "stop generating",
+    "cancel generation",
     "语音",
     "麦克风",
     "话筒",
     "听写",
     "录音",
+    "停止",
+    "停止生成",
 )
 
 
@@ -293,6 +298,8 @@ def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int
         confidence = 0.68
     else:
         confidence = 0.86
+    if _looks_like_stop_generation_icon(image, cx, cy):
+        return None
     return _target(
         "send_button",
         left + cx,
@@ -302,6 +309,40 @@ def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int
         "local_vision",
         "green send button cluster in composer area",
     )
+
+
+def _looks_like_stop_generation_icon(image: Image.Image, cx: int, cy: int) -> bool:
+    # During generation Trae reuses the green send-button slot for a stop square.
+    dark_points: list[tuple[int, int]] = []
+    radius = 9
+    for y in range(max(0, cy - radius), min(image.height, cy + radius + 1)):
+        for x in range(max(0, cx - radius), min(image.width, cx + radius + 1)):
+            red, green, blue = image.getpixel((x, y))
+            if red <= 70 and green <= 95 and blue <= 95:
+                dark_points.append((x - cx, y - cy))
+    total = max(1, (radius * 2 + 1) ** 2)
+    dark_ratio = len(dark_points) / total
+    if dark_ratio < 0.18 or dark_ratio > 0.82:
+        return False
+    green_ring_points = 0
+    for y in range(max(0, cy - 22), min(image.height, cy + 23), 2):
+        for x in range(max(0, cx - 22), min(image.width, cx + 23), 2):
+            distance = max(abs(x - cx), abs(y - cy))
+            if distance < 12:
+                continue
+            red, green, blue = image.getpixel((x, y))
+            if green >= 90 and green > red * 1.25 and green > blue * 1.05:
+                green_ring_points += 1
+    if green_ring_points < 16:
+        return False
+    row_counts: dict[int, int] = {}
+    col_counts: dict[int, int] = {}
+    for dx, dy in dark_points:
+        row_counts[dy] = row_counts.get(dy, 0) + 1
+        col_counts[dx] = col_counts.get(dx, 0) + 1
+    dense_rows = sum(1 for count in row_counts.values() if count >= 6)
+    dense_cols = sum(1 for count in col_counts.values() if count >= 6)
+    return dense_rows >= 5 and dense_cols >= 5
 
 
 def _find_run_confirmation_button(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any] | None:

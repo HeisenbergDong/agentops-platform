@@ -31,6 +31,7 @@ VISUAL_SUBMISSION_SETTLE_SECONDS = 1.2
 VISUAL_SUBMISSION_PASS_STATES = {
     "prompt_submitted",
     "generating",
+    "still_generating",
     "awaiting_run_confirmation",
     "awaiting_confirm",
     "awaiting_keep_changes",
@@ -52,6 +53,13 @@ PROMPT_INPUT_NAME_MARKERS = (
     "\u8f93\u5165",
     "\u53d1\u9001",
     "\u63d0\u95ee",
+)
+STOP_SEND_BUTTON_MARKERS = (
+    "stop",
+    "stop generating",
+    "cancel generation",
+    "停止",
+    "停止生成",
 )
 
 
@@ -1011,6 +1019,9 @@ def _verify_send_button_visual(
     workspace_path: str | Path | None,
 ) -> dict[str, Any]:
     """Reject obvious microphone/toolbar mis-targets before clicking send."""
+    label_text = _target_text(target)
+    if any(marker in label_text for marker in STOP_SEND_BUTTON_MARKERS):
+        return {"status": "failed", "reason": "send_target_is_stop_generation_button"}
     try:
         screenshot = capture_screenshot(
             target="trae_window",
@@ -1047,6 +1058,7 @@ def _verify_send_button_visual(
     radius = 18
     green_pixels = 0
     bright_pixels = 0
+    dark_points: list[tuple[int, int]] = []
     total = 0
     for y in range(max(0, cy - radius), min(image.height, cy + radius + 1), 2):
         for x in range(max(0, cx - radius), min(image.width, cx + radius + 1), 2):
@@ -1056,7 +1068,17 @@ def _verify_send_button_visual(
                 green_pixels += 1
             if red >= 170 and green >= 170 and blue >= 170:
                 bright_pixels += 1
+            if abs(x - cx) <= 9 and abs(y - cy) <= 9 and red <= 70 and green <= 95 and blue <= 95:
+                dark_points.append((x - cx, y - cy))
     green_ratio = green_pixels / max(1, total)
+    if _looks_like_stop_generation_icon(dark_points):
+        return {
+            "status": "failed",
+            "reason": "send_target_is_stop_generation_button",
+            "green_pixels": green_pixels,
+            "green_ratio": round(green_ratio, 4),
+            "dark_pixels": len(dark_points),
+        }
     # The valid Trae send control has a green square background. A microphone
     # button is mostly grey/white and should fail this guard.
     if green_pixels >= 10 and green_ratio >= 0.06:
@@ -1073,6 +1095,29 @@ def _verify_send_button_visual(
         "green_ratio": round(green_ratio, 4),
         "bright_pixels": bright_pixels,
     }
+
+
+def _target_text(target: dict[str, Any]) -> str:
+    return " ".join(
+        str(target.get(key) or "").lower()
+        for key in ("label", "name", "reason", "description", "aria_label", "text", "button")
+    )
+
+
+def _looks_like_stop_generation_icon(dark_points: list[tuple[int, int]]) -> bool:
+    if not dark_points:
+        return False
+    total = 19 * 19
+    if len(dark_points) / total < 0.18:
+        return False
+    row_counts: dict[int, int] = {}
+    col_counts: dict[int, int] = {}
+    for dx, dy in dark_points:
+        row_counts[dy] = row_counts.get(dy, 0) + 1
+        col_counts[dx] = col_counts.get(dx, 0) + 1
+    dense_rows = sum(1 for count in row_counts.values() if count >= 3)
+    dense_cols = sum(1 for count in col_counts.values() if count >= 3)
+    return dense_rows >= 5 and dense_cols >= 5
 
 
 def _unconfirmed_submission(error: PromptSendError) -> dict[str, Any]:
@@ -1489,6 +1534,8 @@ def _submission_analysis_context(
             "has left the composer and Trae is processing or waiting for a safe next step. "
             "Return screen_state=prompt_still_in_composer if the prompt text is still visible in the composer or "
             "the active green send button is still present next to a filled prompt input. "
+            "If the green composer control shows a stop/square icon while Trae is working, that means the prompt was submitted; "
+            "return generating or prompt_submitted and do not classify it as an active send button. "
             "Return screen_state=prompt_not_submitted if no submitted user prompt or generation is visible. "
             "Do not choose any click target for this task; classify only."
         ),

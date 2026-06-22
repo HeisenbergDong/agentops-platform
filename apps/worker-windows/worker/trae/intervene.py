@@ -55,6 +55,7 @@ UNSAFE_MARKERS = (
     "Cancel",
     "Discard",
 )
+BLOCKED_CLICK_POINT_ACTIONS = {"stop_button", "cancel_generation", "cancel_generation_button"}
 
 
 def click_continue(
@@ -161,6 +162,8 @@ def apply_intervention(
     mode = str(intervention.get("mode") or "")
     if mode == "click-point":
         action = normalize_action(str(intervention.get("action") or ""))
+        if action in BLOCKED_CLICK_POINT_ACTIONS:
+            raise TraeAutomationError(f"Refusing to click Trae generation stop target during recovery: {action}")
         if str(intervention.get("risk") or "safe") != "safe":
             raise TraeAutomationError(f"LLM marked Trae click target as unsafe: {action}")
         if workspace_path:
@@ -171,6 +174,8 @@ def apply_intervention(
             )
         else:
             focus_trae(timeout_seconds=timeout_seconds)
+        if _is_forbidden_generation_stop_point(intervention, workspace_path, timeout_seconds):
+            raise TraeAutomationError("Refusing to click the Trae composer stop-button region during recovery")
         return click_screen_point(intervention.get("x"), intervention.get("y"))
     if mode == "terminal-input":
         return send_text_to_trae(str(intervention.get("text") or "y"), submit=True, workspace_path=workspace_path)
@@ -221,6 +226,38 @@ def _action_taken_from_result(result: dict[str, Any]) -> str:
     if "visual-intervention" in mode:
         return "clicked_visual_target"
     return mode or "attempted"
+
+
+def _is_forbidden_generation_stop_point(
+    intervention: dict[str, Any],
+    workspace_path: str | Path | None,
+    timeout_seconds: float,
+) -> bool:
+    try:
+        x = int(float(intervention.get("x")))
+        y = int(float(intervention.get("y")))
+    except (TypeError, ValueError):
+        return False
+    try:
+        window = find_trae_window(
+            timeout_seconds=min(2.0, max(0.5, timeout_seconds)),
+            workspace_path=workspace_path,
+            require_workspace_match=bool(workspace_path),
+        )
+        rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
+    except Exception:
+        rect = None
+    if not rect:
+        return False
+    left, top, right, bottom = rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    rx = (x - left) / width
+    ry = (y - top) / height
+    action = normalize_action(str(intervention.get("action") or ""))
+    if action == "prompt_input":
+        return False
+    return 0.30 <= rx <= 0.43 and 0.86 <= ry <= 0.99
 
 
 def _should_type_continue(recovery_reason: str, diagnosis: dict[str, Any]) -> bool:

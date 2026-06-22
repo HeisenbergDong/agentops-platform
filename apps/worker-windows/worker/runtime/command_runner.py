@@ -362,6 +362,7 @@ class CommandRunner:
             sent_at_epoch=_float_or_none(payload.get("sent_at_epoch") or payload.get("prompt_sent_at_epoch")),
             sent_at=str(payload.get("sent_at") or payload.get("prompt_sent_at") or ""),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+            continue_text_already_sent=bool(payload.get("continue_text_sent") or payload.get("continue_text_already_sent")),
         )
 
     def _post_wait_progress(self, command_id: str, payload: dict[str, Any], event: dict[str, Any]) -> None:

@@ -59,6 +59,7 @@ TRACE_COPY_RETRY_REASONS = {
 DEFAULT_MAX_TRACE_COPY_ATTEMPTS = 5
 DEFAULT_MAX_SEND_PROMPT_VISUAL_RECOVERY_ATTEMPTS = 3
 DEFAULT_MAX_TRACE_RECOVERY_DIAGNOSIS_ATTEMPTS = 2
+DEFAULT_MAX_WAIT_RECOVERY_DIAGNOSIS_ATTEMPTS = 2
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
@@ -332,7 +333,7 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         _queue_trace_collection_after_wait(db, command, job, round_, extra, result.data)
         return
 
-    if _wait_failure_can_collect_trace(extra):
+    if _wait_failure_can_collect_trace(extra) or _continuation_after_continue_can_collect_trace(command, extra):
         _queue_trace_collection_after_wait(
             db,
             command,
@@ -352,6 +353,17 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
             round_,
             "Worker did not find a safe Trae recovery action; continuing observation without clicking.",
             extra,
+        ):
+            return
+
+    if _continue_action_was_sent(command, extra):
+        if _queue_wait_observation_retry(
+            db,
+            command,
+            job,
+            round_,
+            "Worker already sent a Trae continue recovery; observing the continuation result without sending another continue.",
+            {**extra, "continue_action_sent": True},
         ):
             return
 
@@ -433,6 +445,16 @@ def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: Work
             diagnostic_extra,
             {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_completed"}},
             message="Continue diagnosis says Trae is complete; collecting the full assistant trace.",
+        )
+        return
+    if suggested and not _diagnosis_suggests_continue_recovery(suggested):
+        _queue_wait_observation_retry(
+            db,
+            command,
+            job,
+            round_,
+            "Continue diagnosis found a safe non-continue Trae action; scheduler will re-observe so Worker can apply it in the wait loop.",
+            {**diagnostic_extra, "intervention_idle_seconds": 1},
         )
         return
     if state in {"needs_scroll_inner_panel", "service_interrupted", "awaiting_continuation", "awaiting_terminal_input"} or suggested:
@@ -1161,6 +1183,9 @@ def _handle_click_continue_result(db: Session, command: WorkerCommand, result: W
             {
                 "continue_attempts": command.payload.get("continue_attempts", 0),
                 "max_continue_attempts": command.payload.get("max_continue_attempts", 20),
+                "continue_action_sent": _click_continue_action_was_sent(result.data),
+                "continue_text_sent": _click_continue_action_was_sent(result.data),
+                "continue_sent_at": datetime.now(timezone.utc).isoformat(),
             },
         ),
     )
@@ -2424,6 +2449,99 @@ def _queue_trace_recovery_diagnosis(
     return True
 
 
+def _queue_wait_recovery_diagnosis(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    attempts = int(source_command.payload.get("wait_recovery_diagnosis_attempts") or 0) + 1
+    max_attempts = int(
+        source_command.payload.get("max_wait_recovery_diagnosis_attempts")
+        or DEFAULT_MAX_WAIT_RECOVERY_DIAGNOSIS_ATTEMPTS
+    )
+    if attempts > max_attempts:
+        return False
+
+    job.status = JobState.AWAITING_CONTINUE
+    if round_:
+        round_.status = JobState.AWAITING_CONTINUE
+    recovery_reason = _recovery_reason(extra)
+    resume_payload = _wait_completion_payload(
+        source_command,
+        round_,
+        {
+            "wait_observation_attempts": source_command.payload.get("wait_observation_attempts", 0),
+            "max_wait_observation_attempts": source_command.payload.get(
+                "max_wait_observation_attempts",
+                DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS,
+            ),
+            "wait_recovery_diagnosis_attempts": attempts,
+            "max_wait_recovery_diagnosis_attempts": max_attempts,
+            "continue_attempts": source_command.payload.get("continue_attempts", 0),
+            "max_continue_attempts": source_command.payload.get("max_continue_attempts", 20),
+            "continue_action_sent": bool(
+                source_command.payload.get("continue_action_sent") or _wait_result_has_continue_action(extra)
+            ),
+            "continue_text_sent": bool(
+                source_command.payload.get("continue_text_sent") or _wait_result_has_continue_action(extra)
+            ),
+            "continue_sent_at": source_command.payload.get("continue_sent_at") or extra.get("continue_sent_at", ""),
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.AWAITING_CONTINUE,
+        message=message,
+        level="info",
+        extra={
+            **extra,
+            "wait_recovery_diagnosis_attempts": attempts,
+            "max_wait_recovery_diagnosis_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "display_message": (
+                f"等待 Trae 收口仍不明确，调度先让 Worker 截图给视觉诊断，判断该点击、继续等待还是采集轨迹"
+                f"（第 {attempts}/{max_attempts} 次）。"
+            ),
+        },
+    )
+    diagnose_command = _enqueue_worker_command(
+        db,
+        source_command,
+        WorkerCommandType.DIAGNOSE_UI,
+        {
+            "task": "wait_completion_state",
+            "timeout_seconds": source_command.payload.get("diagnose_timeout_seconds", 10),
+            "scroll_bottom": True,
+            "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+            "resume_previous_payload": resume_payload,
+            "retry_of_command_id": source_command.id,
+            "wait_recovery_diagnosis_attempts": attempts,
+            "max_wait_recovery_diagnosis_attempts": max_attempts,
+            "recovery_reason": recovery_reason,
+            "use_ai_ui_analyst": source_command.payload.get("use_ai_ui_analyst", True),
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.AWAITING_CONTINUE,
+        message="diagnose_ui worker command queued for wait completion recovery decision.",
+        extra={
+            "worker_id": diagnose_command.worker_id,
+            "command_id": diagnose_command.id,
+            "recovery_reason": recovery_reason,
+            "display_message": "已安排 Worker 截图诊断 Trae 是否完成、是否需要点击确认或继续等待。",
+        },
+    )
+    return True
+
+
 def _queue_wait_observation_retry(
     db: Session,
     source_command: WorkerCommand,
@@ -2437,6 +2555,15 @@ def _queue_wait_observation_retry(
         source_command.payload.get("max_wait_observation_attempts") or DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS
     )
     if attempts > max_attempts:
+        if _queue_wait_recovery_diagnosis(
+            db,
+            source_command,
+            job,
+            round_,
+            "Worker repeatedly could not read a safe Trae completion signal; scheduler will request a visual diagnosis before stopping.",
+            {**extra, "wait_observation_attempts": attempts, "max_wait_observation_attempts": max_attempts},
+        ):
+            return True
         _mark_manual_required(
             db,
             job,
@@ -2480,6 +2607,17 @@ def _queue_wait_observation_retry(
                 "max_wait_observation_attempts": max_attempts,
                 "continue_attempts": source_command.payload.get("continue_attempts", 0),
                 "max_continue_attempts": source_command.payload.get("max_continue_attempts", 20),
+                "intervention_idle_seconds": extra.get(
+                    "intervention_idle_seconds",
+                    source_command.payload.get("intervention_idle_seconds", _default_wait_intervention_idle_seconds(round_)),
+                ),
+                "continue_action_sent": bool(
+                    source_command.payload.get("continue_action_sent") or _wait_result_has_continue_action(extra)
+                ),
+                "continue_text_sent": bool(
+                    source_command.payload.get("continue_text_sent") or _wait_result_has_continue_action(extra)
+                ),
+                "continue_sent_at": source_command.payload.get("continue_sent_at") or extra.get("continue_sent_at", ""),
             },
         ),
     )
@@ -2682,6 +2820,85 @@ def _wait_failure_can_collect_trace(extra: dict) -> bool:
         if tool_count > 0 and trace_id and not recent and quiet_value >= 30.0:
             return True
     return False
+
+
+def _wait_result_has_continue_action(extra: dict) -> bool:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    if bool(extra.get("continue_action_sent") or extra.get("continue_text_sent")):
+        return True
+    if bool(data.get("continue_action_sent") or data.get("continue_text_sent")):
+        return True
+    interventions = data.get("interventions") if isinstance(data.get("interventions"), list) else []
+    return any(_intervention_is_continue_action(item) for item in interventions)
+
+
+def _continue_action_was_sent(command: WorkerCommand, extra: dict) -> bool:
+    return bool(
+        command.payload.get("continue_action_sent")
+        or command.payload.get("continue_text_sent")
+        or _wait_result_has_continue_action(extra)
+    )
+
+
+def _continuation_after_continue_can_collect_trace(command: WorkerCommand, extra: dict) -> bool:
+    if not _continue_action_was_sent(command, extra):
+        return False
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    if str(supervisor.get("action") or "") == "collect_trace":
+        return True
+    completion = supervisor.get("trae_turn_completion_decision") if isinstance(supervisor.get("trae_turn_completion_decision"), dict) else {}
+    if completion.get("is_complete") is True and str(completion.get("next_action") or "") == "copy_trace":
+        return True
+    gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
+    if gate.get("passed") is True:
+        return True
+    turn = data.get("trae_turn") if isinstance(data.get("trae_turn"), dict) else {}
+    return turn.get("status") == "found" and str(turn.get("turn_status") or "") == "completed"
+
+
+def _click_continue_action_was_sent(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    action_taken = str(data.get("action_taken") or "").strip()
+    mode = str(data.get("mode") or "").strip()
+    intervention = data.get("intervention") if isinstance(data.get("intervention"), dict) else {}
+    result = data.get("result") if isinstance(data.get("result"), dict) else {}
+    return (
+        action_taken in {"typed_continue", "clicked_button", "clicked_visual_target", "clicked_primary_fallback"}
+        or mode in {"continue-text", "click-point", "primary-fallback"}
+        or _intervention_is_continue_action(intervention)
+        or _intervention_is_continue_action(result)
+    )
+
+
+def _intervention_is_continue_action(item: object) -> bool:
+    if not isinstance(item, dict):
+        return False
+    suggested = item.get("suggested_intervention") if isinstance(item.get("suggested_intervention"), dict) else {}
+    result = item.get("result") if isinstance(item.get("result"), dict) else {}
+    for candidate in (item, suggested, result):
+        if not isinstance(candidate, dict):
+            continue
+        mode = str(candidate.get("mode") or "").strip()
+        action = str(candidate.get("action") or "").strip()
+        recommended = str(candidate.get("recommended_action") or "").strip()
+        action_taken = str(candidate.get("action_taken") or "").strip()
+        if mode == "continue-text":
+            return True
+        if action in {"continue", "continue_button"}:
+            return True
+        if recommended == "click_continue_button":
+            return True
+        if action_taken == "typed_continue":
+            return True
+    return False
+
+
+def _diagnosis_suggests_continue_recovery(suggested: dict) -> bool:
+    if not isinstance(suggested, dict):
+        return False
+    return _intervention_is_continue_action(suggested) or str(suggested.get("mode") or "") == "terminal-input"
 
 
 def _recovery_reason(extra: dict) -> str:

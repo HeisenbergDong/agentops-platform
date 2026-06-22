@@ -703,6 +703,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         sent_at_epoch: float | None = None,
         sent_at: str = "",
         ui_analyst=None,
+        continue_text_already_sent: bool = False,
     ):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
@@ -717,6 +718,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         received["sent_at_epoch"] = sent_at_epoch
         received["sent_at"] = sent_at
         received["ui_analyst"] = callable(ui_analyst)
+        received["continue_text_already_sent"] = continue_text_already_sent
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
@@ -737,6 +739,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
                 "sent_at_epoch": 123.5,
                 "sent_at": "2026-06-13T00:00:00Z",
                 "progress_interval_seconds": 7,
+                "continue_text_sent": True,
             },
         }
     )
@@ -756,6 +759,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "sent_at_epoch": 123.5,
         "sent_at": "2026-06-13T00:00:00Z",
         "ui_analyst": True,
+        "continue_text_already_sent": True,
     }
 
 

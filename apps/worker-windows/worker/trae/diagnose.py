@@ -80,6 +80,9 @@ DESTRUCTIVE_CHOICE_MARKERS = (
     "reset",
     "discard",
 )
+DESTRUCTIVE_ACTIONS = {"delete_button", "remove_button", "discard_button", "reset_button", "cancel_button"}
+DELETE_CONFIRM_ACTIONS = {"delete_button", "remove_button"}
+DELETE_CHOICE_MARKERS = ("\u5220\u9664", "\u79fb\u9664", "delete", "remove")
 WAITING_ACTION_MARKERS = (
     "\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c",
     "\u6b63\u5728\u7b49\u5f85\u60a8\u7684\u64cd\u4f5c",
@@ -175,7 +178,13 @@ def diagnose_ui(
     visual_suggested = _visual_suggested_intervention(visual, window_rect)
     delete_confirmation = _delete_confirmation_intervention(text, matches)
     destructive_waiting = _destructive_waiting_intervention(text, buttons)
-    if delete_confirmation:
+    safe_destructive_visual = _safe_destructive_visual_intervention(visual_suggested, text, visual, workspace_path)
+    if safe_destructive_visual:
+        state = str(safe_destructive_visual.get("state") or "awaiting_safe_delete_confirmation")
+        confidence = float(safe_destructive_visual.get("confidence") or 0.86)
+        suggested = safe_destructive_visual["suggested_intervention"]
+        reason = str(safe_destructive_visual.get("reason") or "safe_destructive_visual_action")
+    elif delete_confirmation:
         state = "awaiting_delete_confirmation"
         confidence = float(delete_confirmation.get("confidence") or 0.86)
         suggested = delete_confirmation["suggested_intervention"]
@@ -382,18 +391,18 @@ def _delete_confirmation_intervention(text: str, matches: list[dict]) -> dict[st
     button = confirm.get("button") if isinstance(confirm.get("button"), dict) else {}
     return {
         "confidence": min(0.92, max(0.86, float(confirm.get("confidence") or 0.86))),
-        "reason": "local_delete_confirmation",
+        "reason": "local_delete_confirmation_allowed",
         "suggested_intervention": {
-            "mode": "manual-required",
+            "mode": "click-point",
             "action": "delete_button",
             "x": button.get("center_x"),
             "y": button.get("center_y"),
             "button": button.get("name") or "\u786e\u8ba4",
             "confidence": confirm.get("confidence") or 0.86,
             "source": "local_uia",
-            "risk": "blocked",
-            "recommended_action": "do_not_click",
-            "manual_message": "Trae 正在等待删除确认，涉及文件删除，已暂停等待人工确认。",
+            "risk": "safe",
+            "recommended_action": "click_delete_button",
+            "manual_message": "Trae 正在等待删除确认，按策略可自动点击删除。",
         },
     }
 
@@ -401,6 +410,25 @@ def _delete_confirmation_intervention(text: str, matches: list[dict]) -> dict[st
 def _destructive_waiting_intervention(text: str, buttons: list[dict[str, Any]]) -> dict[str, Any]:
     if not _has_waiting_action_text(text) or not _has_destructive_choice_text(text):
         return {}
+    delete_button = _first_button_with_markers(buttons, DELETE_CHOICE_MARKERS)
+    if delete_button:
+        return {
+            "state": "awaiting_delete_confirmation",
+            "confidence": 0.92,
+            "reason": "local_delete_confirmation_allowed",
+            "suggested_intervention": {
+                "mode": "click-point",
+                "action": "delete_button",
+                "x": delete_button.get("center_x"),
+                "y": delete_button.get("center_y"),
+                "button": delete_button.get("name") or "",
+                "confidence": 0.92,
+                "source": "local_uia",
+                "risk": "safe",
+                "recommended_action": "click_delete_button",
+                "policy": "trae_delete_confirmation_allowed",
+            },
+        }
     button = _first_button_with_markers(buttons, DESTRUCTIVE_CHOICE_MARKERS)
     return {
         "state": "awaiting_destructive_confirmation",
@@ -422,6 +450,71 @@ def _destructive_waiting_intervention(text: str, buttons: list[dict[str, Any]]) 
             ),
         },
     }
+
+
+def _safe_destructive_visual_intervention(
+    visual_suggested: dict[str, Any],
+    text: str,
+    visual: dict[str, Any],
+    workspace_path: str | Path | None,
+) -> dict[str, Any]:
+    if not isinstance(visual_suggested, dict) or not visual_suggested:
+        return {}
+    suggested = visual_suggested.get("suggested_intervention")
+    if not isinstance(suggested, dict):
+        return {}
+    action = normalize_action(str(suggested.get("action") or ""))
+    if action not in DELETE_CONFIRM_ACTIONS:
+        return {}
+    if str(suggested.get("risk") or "") != "safe":
+        return {}
+    analysis = {}
+    if isinstance(visual, dict):
+        analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    if not _is_delete_confirmation_context(text, analysis):
+        return {}
+    enriched = {
+        **suggested,
+        "risk": "safe",
+        "policy": "trae_delete_confirmation_allowed",
+        "recommended_action": "click_delete_button" if action in {"delete_button", "remove_button"} else suggested.get("recommended_action"),
+    }
+    return {
+        **visual_suggested,
+        "state": "awaiting_safe_delete_confirmation",
+        "reason": visual_suggested.get("reason") or "trae_delete_confirmation_allowed",
+        "suggested_intervention": enriched,
+    }
+
+
+def _is_delete_confirmation_context(text: str, analysis: dict[str, Any]) -> bool:
+    blob = _delete_confirmation_text(text, analysis)
+    normalized = _normalize(blob)
+    return bool(
+        any(_normalize(marker) in normalized for marker in DELETE_CHOICE_MARKERS)
+        and (
+            _has_waiting_action_text(blob)
+            or any(_normalize(marker) in normalized for marker in DELETE_CONFIRMATION_MARKERS)
+            or "delete" in normalized
+            or "\u5220\u9664" in normalized
+        )
+    )
+
+
+def _delete_confirmation_text(text: str, analysis: dict[str, Any]) -> str:
+    parts = [str(text or "")]
+    if isinstance(analysis, dict):
+        for key in ("reason", "blocked_reason"):
+            parts.append(str(analysis.get(key) or ""))
+        evidence = analysis.get("evidence") if isinstance(analysis.get("evidence"), list) else []
+        parts.extend(str(item) for item in evidence)
+        target = analysis.get("target") if isinstance(analysis.get("target"), dict) else {}
+        parts.extend(str(target.get(key) or "") for key in ("label", "reason"))
+        targets = analysis.get("targets") if isinstance(analysis.get("targets"), list) else []
+        for item in targets:
+            if isinstance(item, dict):
+                parts.extend(str(item.get(key) or "") for key in ("label", "reason"))
+    return "\n".join(parts)
 
 
 def _first_button_with_markers(buttons: list[dict[str, Any]], markers: tuple[str, ...]) -> dict[str, Any] | None:
@@ -550,19 +643,26 @@ def _visual_diagnosis_context(
         ],
         "manual_required_rules": [
             "Never return screen_state=completed or recommended_action=collect_trace_candidate when a waiting-for-user-action card is visible.",
-            "If a destructive choice is visible (\u5220\u9664/delete/remove/discard/cancel/reset), return recommended_action=do_not_click, risk=blocked, screen_state=manual_required, and explain blocked_reason.",
+            "If Trae asks whether it can delete/remove something, returning click_delete_button with risk=safe is allowed.",
+            "Discard, reset, cancel, clear, or uncertain destructive prompts must stay manual_required/do_not_click.",
             "If only part of the action card is visible, return recommended_action=scroll_inner_panel instead of completed.",
-            "Safe click actions are only for explicit run/continue/keep/save buttons with risk=safe; destructive buttons are not safe.",
+            "Safe click actions are explicit run/continue/keep/save buttons and explicit Trae delete confirmations.",
         ],
         "required_json_shape": {
             "status": "found|partial|not_found",
             "screen_state": "completed|still_generating|prompt_submitted|prompt_still_in_composer|prompt_not_submitted|manual_required|awaiting_action|needs_scroll_inner_panel",
-            "recommended_action": "wait|collect_trace_candidate|click_run_button|click_continue_button|click_keep_button|click_save_button|scroll_inner_panel|do_not_click|type_continue|answer_terminal_prompt",
+            "recommended_action": "wait|collect_trace_candidate|click_run_button|click_continue_button|click_keep_button|click_save_button|click_delete_button|scroll_inner_panel|do_not_click|type_continue|answer_terminal_prompt",
             "risk": "safe|blocked",
             "blocked_reason": "required when risk is blocked",
         },
         "visible_text_sample": text_sample,
         "uia_buttons": buttons or [],
+        "allow_trae_delete_confirmations": True,
+        "allowed_destructive_actions": ["delete_button", "remove_button"],
+        "safe_destructive_action_policy": {
+            "delete_button": "Allowed when Trae explicitly asks whether it can delete/remove something.",
+            "manual_required": "Required for discard/reset/cancel/clear or uncertain destructive prompts.",
+        },
         "instructions": _visual_task_instructions(task),
     }
 
@@ -580,7 +680,7 @@ def _visual_task_instructions(task: str) -> str:
     return (
         "Decide whether the current Trae task is completed, still generating, or waiting for a user action. "
         "Treat waiting-for-user-action cards as blockers, not completion evidence. "
-        "If a visible confirmation card asks to delete/remove/discard/cancel/reset, return do_not_click with risk=blocked. "
+        "If a visible confirmation card asks whether Trae can delete/remove something, return the delete button target with risk=safe. Keep discard/reset/cancel/clear prompts blocked unless explicitly safe. "
         "If a safe confirmation card asks to execute, continue, or keep/save changes, return the exact visible button target. "
         "Return JSON only."
     )
@@ -633,7 +733,7 @@ def _visual_suggested_intervention(visual: dict[str, Any], window_rect: dict | N
                 "manual_message": str(analysis.get("blocked_reason") or analysis.get("reason") or "Trae 正在等待人工确认。"),
             },
         }
-    if recommended in {"click_delete_button", "click_discard_button", "click_cancel_button"}:
+    if recommended in {"click_delete_button", "click_discard_button", "click_cancel_button"} and str(analysis.get("risk") or "") != "safe":
         return {
             "state": str(analysis.get("screen_state") or "manual_required"),
             "confidence": analysis.get("confidence") or 0.82,

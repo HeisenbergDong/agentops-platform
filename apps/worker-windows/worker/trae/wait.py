@@ -50,6 +50,7 @@ def wait_completion(
     sent_at_epoch: float | None = None,
     sent_at: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
+    continue_text_already_sent: bool = False,
 ) -> dict:
     if workspace_path:
         focus_trae(
@@ -116,6 +117,7 @@ def wait_completion(
                     timeout_seconds=timeout_seconds,
                     workspace_path=workspace_path,
                     ui_analyst=ui_analyst,
+                    suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
                 )
                 if outcome.get("status") == "completed":
                     return outcome
@@ -175,6 +177,7 @@ def wait_completion(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
+                suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
             )
             if visual_completion:
                 return visual_completion
@@ -205,6 +208,7 @@ def wait_completion(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
+                suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
             )
             if outcome.get("status") == "completed":
                 return outcome
@@ -265,6 +269,7 @@ def _try_visual_completion(
     timeout_seconds: float,
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None,
+    suppress_continue_text: bool = False,
 ) -> dict | None:
     if not ui_analyst:
         return None
@@ -273,6 +278,7 @@ def _try_visual_completion(
         timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
         workspace_path=workspace_path,
         ui_analyst=ui_analyst,
+        suppress_continue_text=suppress_continue_text,
     )
     if intervention.get("status") != "completed":
         return None
@@ -459,6 +465,7 @@ def _handle_supervisor_decision(
     timeout_seconds: float,
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
+    suppress_continue_text: bool = False,
 ) -> dict:
     action = str(decision.get("action") or "wait")
     if action == "collect_trace":
@@ -489,6 +496,7 @@ def _handle_supervisor_decision(
             timeout_seconds=min(10.0, max(2.0, timeout_seconds)),
             workspace_path=workspace_path,
             ui_analyst=ui_analyst,
+            suppress_continue_text=suppress_continue_text,
         )
         intervention["supervisor_action"] = action
         intervention["supervisor_reason"] = str(decision.get("reason") or "")
@@ -589,6 +597,7 @@ def _try_auto_intervention(
     timeout_seconds: float,
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
+    suppress_continue_text: bool = False,
 ) -> dict:
     try:
         diagnosis = diagnose_ui(
@@ -624,6 +633,14 @@ def _try_auto_intervention(
             "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
             "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
         }
+    if suppress_continue_text and _is_continue_text_intervention(suggested):
+        return {
+            "status": "skipped",
+            "reason": "continue_text_already_sent",
+            "suggested_intervention": suggested,
+            "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
+            "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
+        }
     try:
         if workspace_path:
             result = apply_intervention(
@@ -650,6 +667,25 @@ def _try_auto_intervention(
         "diagnosis_state": diagnosis.get("state") if isinstance(diagnosis, dict) else "",
         "diagnosis": _compact_diagnosis(diagnosis) if isinstance(diagnosis, dict) else {},
     }
+
+
+def _is_continue_text_intervention(intervention: object) -> bool:
+    if not isinstance(intervention, dict):
+        return False
+    return (
+        str(intervention.get("mode") or "") == "continue-text"
+        or str(intervention.get("action") or "") in {"continue", "continue_button"}
+        or str(intervention.get("recommended_action") or "") == "click_continue_button"
+    )
+
+
+def _has_continue_text_intervention(interventions: list[dict]) -> bool:
+    for item in interventions:
+        suggested = item.get("suggested_intervention") if isinstance(item, dict) else {}
+        result = item.get("result") if isinstance(item, dict) else {}
+        if _is_continue_text_intervention(suggested) or _is_continue_text_intervention(result):
+            return True
+    return False
 
 
 def _compact_diagnosis(diagnosis: dict[str, object]) -> dict[str, object]:
