@@ -144,12 +144,14 @@ class CommandRunner:
         workspace_path: Path | None = None,
         launch_timeout_seconds: float = 30.0,
         force_open_workspace: bool = False,
+        launch_if_workspace_mismatch: bool = True,
     ) -> dict:
         result = ensure_trae_running(
             self.settings.trae_exe_path,
             self._launch_workspace_path(workspace_path),
             launch_timeout_seconds=launch_timeout_seconds,
             force_open_workspace=force_open_workspace,
+            launch_if_workspace_mismatch=launch_if_workspace_mismatch,
         )
         self.state.current_window_title = str(result.get("window_title") or "")
         return result
@@ -161,6 +163,7 @@ class CommandRunner:
             workspace_path,
             launch_timeout_seconds=float(payload.get("launch_timeout_seconds", payload.get("timeout_seconds", 30))),
             force_open_workspace=bool(payload.get("force_open_workspace", False)),
+            launch_if_workspace_mismatch=bool(payload.get("launch_if_workspace_mismatch", False)),
         )
 
     def _focus_trae(self, payload: dict[str, Any]) -> dict:
@@ -196,6 +199,7 @@ class CommandRunner:
             workspace_path,
             launch_timeout_seconds=float(payload.get("launch_timeout_seconds", 30)),
             force_open_workspace=bool(payload.get("force_open_workspace", False)),
+            launch_if_workspace_mismatch=bool(payload.get("launch_if_workspace_mismatch", True)),
         )
         prompt_workspace_path = self._launch_workspace_path(workspace_path)
         sent_at_epoch = time.time()

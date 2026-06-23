@@ -35,6 +35,8 @@ CONTROL_TYPES = {
     "Pane": 50033,
 }
 TRAE_EXECUTABLE_NAMES = ("Trae CN.exe", "Trae.exe", "trae.exe")
+RECENT_WORKSPACE_LAUNCH_SUPPRESS_SECONDS = 45.0
+_recent_workspace_launches: dict[tuple[str, str], float] = {}
 
 
 @dataclass(frozen=True)
@@ -149,6 +151,8 @@ def open_trae(trae_exe_path: Path, workspace_path: Path | None = None, reuse_win
     if workspace_path:
         args.append(str(workspace_path))
     subprocess.Popen(args)
+    _remember_workspace_launch(trae_exe_path, workspace_path)
+    _remember_workspace_launch(exe_path, workspace_path)
     return {
         "status": "launched",
         "trae_exe_path": str(exe_path),
@@ -162,6 +166,7 @@ def ensure_trae_running(
     workspace_path: Path | None = None,
     launch_timeout_seconds: float = 30.0,
     force_open_workspace: bool = False,
+    launch_if_workspace_mismatch: bool = True,
 ) -> dict:
     workspace_required = bool(workspace_path)
     existing = _try_find_trae_window(
@@ -184,6 +189,46 @@ def ensure_trae_running(
         }
 
     existing_any = _try_find_trae_window()
+    if existing_any and workspace_required and not force_open_workspace:
+        if not launch_if_workspace_mismatch:
+            window = wait_for_stable_trae_window(
+                timeout_seconds=min(launch_timeout_seconds, 6.0),
+                workspace_path=workspace_path,
+                require_workspace_match=False,
+            )
+            title = _focus_window(window)
+            return {
+                "status": "already_running_unverified_workspace",
+                "window_title": title,
+                "workspace_path": str(workspace_path) if workspace_path else "",
+                "workspace_match": _title_matches_workspace(title, workspace_path),
+                "workspace_match_required": False,
+                "workspace_focus_fallback": {
+                    "requested_workspace_path": str(workspace_path),
+                    "reason": "workspace title match not found; reused existing Trae window without launching another one",
+                },
+                "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd, workspace_path=workspace_path),
+            }
+        recent_age = _recent_workspace_launch_age(trae_exe_path, workspace_path)
+        if recent_age is not None and recent_age < RECENT_WORKSPACE_LAUNCH_SUPPRESS_SECONDS:
+            window = wait_for_stable_trae_window(
+                timeout_seconds=min(launch_timeout_seconds, 6.0),
+                workspace_path=workspace_path,
+                require_workspace_match=False,
+            )
+            title = _focus_window(window)
+            return {
+                "status": "recent_launch_reused",
+                "window_title": title,
+                "workspace_path": str(workspace_path),
+                "workspace_match": _title_matches_workspace(title, workspace_path),
+                "launch_suppressed": {
+                    "reason": "same workspace was launched recently",
+                    "age_seconds": round(float(recent_age), 3),
+                    "window_seconds": RECENT_WORKSPACE_LAUNCH_SUPPRESS_SECONDS,
+                },
+                "window_diagnostics": trae_window_diagnostics(selected_hwnd=window.hwnd, workspace_path=workspace_path),
+            }
     reuse_window = bool(existing_any and workspace_path)
     launch_result = open_trae(trae_exe_path, workspace_path, reuse_window=reuse_window)
     if existing_any:
@@ -313,6 +358,32 @@ def focus_trae(
     }
 
 
+def focus_trae_workspace_or_any(
+    timeout_seconds: float = 10.0,
+    workspace_path: Path | str | None = None,
+    prefer_workspace_match: bool = True,
+) -> dict:
+    if not workspace_path or not prefer_workspace_match:
+        return focus_trae(timeout_seconds=timeout_seconds)
+    try:
+        return focus_trae(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=True,
+        )
+    except TraeAutomationError as exc:
+        fallback = focus_trae(
+            timeout_seconds=timeout_seconds,
+            workspace_path=workspace_path,
+            require_workspace_match=False,
+        )
+        fallback["workspace_focus_fallback"] = {
+            "requested_workspace_path": str(workspace_path),
+            "reason": str(exc),
+        }
+        return fallback
+
+
 def trae_window_diagnostics(selected_hwnd: int | None = None, workspace_path: Path | str | None = None) -> dict:
     windows = _find_top_level_windows("Trae")
     marker = _workspace_title_marker(workspace_path)
@@ -357,6 +428,37 @@ def _title_matches_workspace(title: str, workspace_path: Path | str | None) -> b
     if not marker:
         return False
     return marker.lower() in str(title or "").lower()
+
+
+def _workspace_launch_key(trae_exe_path: Path | str, workspace_path: Path | str | None) -> tuple[str, str] | None:
+    if not workspace_path:
+        return None
+    return (
+        str(trae_exe_path).strip().lower(),
+        str(workspace_path).strip().rstrip("\\/").replace("\\", "/").lower(),
+    )
+
+
+def _remember_workspace_launch(trae_exe_path: Path | str, workspace_path: Path | str | None) -> None:
+    key = _workspace_launch_key(trae_exe_path, workspace_path)
+    if not key:
+        return
+    now = time.monotonic()
+    _recent_workspace_launches[key] = now
+    stale_before = now - max(RECENT_WORKSPACE_LAUNCH_SUPPRESS_SECONDS * 4, 120.0)
+    for item_key, launched_at in list(_recent_workspace_launches.items()):
+        if launched_at < stale_before:
+            _recent_workspace_launches.pop(item_key, None)
+
+
+def _recent_workspace_launch_age(trae_exe_path: Path | str, workspace_path: Path | str | None) -> float | None:
+    key = _workspace_launch_key(trae_exe_path, workspace_path)
+    if not key:
+        return None
+    launched_at = _recent_workspace_launches.get(key)
+    if launched_at is None:
+        return None
+    return max(0.0, time.monotonic() - launched_at)
 
 
 def _select_top_level_window(

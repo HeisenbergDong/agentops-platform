@@ -6,7 +6,13 @@ from worker.system.clipboard import ClipboardError, get_clipboard_text, set_clip
 from worker.trae.local_trace import collect_local_trace
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.ui_locator import target_for_action, validate_target
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
+from worker.trae.window import (
+    TraeAutomationError,
+    find_trae_window,
+    focus_trae,
+    focus_trae_workspace_or_any,
+    wait_for_workspace_window_or_any,
+)
 
 COPY_BUTTON_MARKERS = ("\u590d\u5236", "Copy", "copy")
 CODE_COPY_HINTS = ("\u590d\u5236\u4ee3\u7801", "Copy code", "copy code")
@@ -67,9 +73,17 @@ def copy_latest_reply(
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     _raise_if_cancelled(cancellation_check)
-    focus_trae(timeout_seconds=timeout_seconds, workspace_path=workspace_path or None, require_workspace_match=bool(workspace_path))
+    focus_trae_workspace_or_any(
+        timeout_seconds=timeout_seconds,
+        workspace_path=workspace_path or None,
+        prefer_workspace_match=bool(workspace_path),
+    )
     _raise_if_cancelled(cancellation_check)
-    window = find_trae_window(timeout_seconds=timeout_seconds, workspace_path=workspace_path or None, require_workspace_match=bool(workspace_path))
+    window = wait_for_workspace_window_or_any(
+        timeout_seconds=timeout_seconds,
+        workspace_path=workspace_path or None,
+        prefer_workspace_match=bool(workspace_path),
+    )
     scroll_result = scroll_assistant_to_bottom(window)
     sentinel = f"agentops-copy-sentinel-{time.time_ns()}"
     failures: list[dict] = []

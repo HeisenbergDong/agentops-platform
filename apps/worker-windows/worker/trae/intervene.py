@@ -12,7 +12,13 @@ from worker.trae.prompt import send_prompt, _send_keys
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import scroll_assistant_to_bottom, scroll_inner_reply_panel
 from worker.trae.ui_locator import normalize_action, target_for_action, validate_target
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
+from worker.trae.window import (
+    TraeAutomationError,
+    find_trae_window,
+    focus_trae,
+    focus_trae_workspace_or_any,
+    wait_for_workspace_window_or_any,
+)
 
 CONTINUE_MARKERS = (
     "\u7ee7\u7eed",
@@ -65,10 +71,9 @@ def click_continue(
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
 ) -> dict:
     if workspace_path:
-        focus_trae(
+        focus_trae_workspace_or_any(
             timeout_seconds=timeout_seconds,
             workspace_path=workspace_path,
-            require_workspace_match=True,
         )
     else:
         focus_trae(timeout_seconds=timeout_seconds)
@@ -95,10 +100,9 @@ def click_continue(
         }
 
     if workspace_path:
-        window = find_trae_window(
+        window = wait_for_workspace_window_or_any(
             timeout_seconds=timeout_seconds,
             workspace_path=workspace_path,
-            require_workspace_match=True,
         )
     else:
         window = find_trae_window(timeout_seconds=timeout_seconds)
@@ -167,10 +171,9 @@ def apply_intervention(
         if str(intervention.get("risk") or "safe") != "safe":
             raise TraeAutomationError(f"LLM marked Trae click target as unsafe: {action}")
         if workspace_path:
-            focus_trae(
+            focus_trae_workspace_or_any(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
-                require_workspace_match=True,
             )
         else:
             focus_trae(timeout_seconds=timeout_seconds)
@@ -193,10 +196,9 @@ def apply_intervention(
         }
     if mode == "scroll-inner-panel":
         if workspace_path:
-            window = find_trae_window(
+            window = wait_for_workspace_window_or_any(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
-                require_workspace_match=True,
             )
         else:
             window = find_trae_window(timeout_seconds=timeout_seconds)
@@ -239,10 +241,10 @@ def _is_forbidden_generation_stop_point(
     except (TypeError, ValueError):
         return False
     try:
-        window = find_trae_window(
+        window = wait_for_workspace_window_or_any(
             timeout_seconds=min(2.0, max(0.5, timeout_seconds)),
             workspace_path=workspace_path,
-            require_workspace_match=bool(workspace_path),
+            prefer_workspace_match=bool(workspace_path),
         )
         rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
     except Exception:
@@ -281,7 +283,7 @@ def _should_type_continue(recovery_reason: str, diagnosis: dict[str, Any]) -> bo
 
 def send_text_to_trae(text: str, submit: bool = True, workspace_path: str | Path | None = None) -> dict:
     if workspace_path:
-        focus_trae(timeout_seconds=10.0, workspace_path=workspace_path, require_workspace_match=True)
+        focus_trae_workspace_or_any(timeout_seconds=10.0, workspace_path=workspace_path)
     else:
         focus_trae(timeout_seconds=10.0)
     value = str(text or "")

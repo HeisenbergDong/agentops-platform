@@ -9,7 +9,7 @@ from typing import Any
 
 from PIL import Image
 
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae
+from worker.trae.window import TraeAutomationError, focus_trae_workspace_or_any, wait_for_workspace_window_or_any
 
 
 MIN_CAPTURE_WIDTH = 500
@@ -82,15 +82,15 @@ def _capture_target(
 
 
 def _capture_trae_window(path: Path, timeout_seconds: float, workspace_path: str | Path | None = None) -> dict:
-    focus_result = focus_trae(
+    focus_result = focus_trae_workspace_or_any(
         timeout_seconds=timeout_seconds,
         workspace_path=workspace_path,
-        require_workspace_match=bool(workspace_path),
+        prefer_workspace_match=bool(workspace_path),
     )
-    window = find_trae_window(
+    window = wait_for_workspace_window_or_any(
         timeout_seconds=timeout_seconds,
         workspace_path=workspace_path,
-        require_workspace_match=bool(workspace_path),
+        prefer_workspace_match=bool(workspace_path),
     )
     time.sleep(0.25)
     rect = _window_rect(int(window.hwnd))

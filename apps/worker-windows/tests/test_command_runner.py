@@ -288,8 +288,8 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
-            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace, launch_if_workspace_mismatch)
         )
         or {"status": "launched", "workspace_path": str(workspace_path), "window_title": "Trae"},
     )
@@ -328,7 +328,7 @@ def test_send_prompt_uses_workspace_without_forcing_new_trae_window(monkeypatch:
     assert result["data"]["open_new_task"] is False
     assert result["data"]["workspace_path"] == str(workspace)
     assert result["data"]["open_trae"]["status"] == "launched"
-    assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False)]
+    assert ensured == [(Path("C:/Trae/Trae.exe"), workspace, 30.0, False, True)]
 
 
 def test_send_prompt_opens_new_task_only_when_payload_requests_it(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):
@@ -339,7 +339,9 @@ def test_send_prompt_opens_new_task_only_when_payload_requests_it(monkeypatch: p
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: {
+            "status": "already_running"
+        },
     )
     monkeypatch.setattr(
         command_runner,
@@ -369,7 +371,9 @@ def test_send_prompt_retry_does_not_open_new_task(monkeypatch: pytest.MonkeyPatc
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: {
+            "status": "already_running"
+        },
     )
     monkeypatch.setattr(
         command_runner,
@@ -409,8 +413,8 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
-            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace, launch_if_workspace_mismatch)
         )
         or {"status": "already_running", "workspace_path": str(workspace_path), "window_title": "Trae"},
     )
@@ -437,7 +441,7 @@ def test_send_prompt_auto_starts_trae_without_workspace_payload(
     assert result["data"]["verify_submission"] is True
     assert result["data"]["strict_submission_verification"] is True
     assert result["data"]["workspace_path"] == ""
-    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False)]
+    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False, True)]
 
 
 def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytest.MonkeyPatch):
@@ -447,7 +451,9 @@ def test_send_prompt_gui_failure_requires_manual_intervention(monkeypatch: pytes
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: {
+            "status": "already_running"
+        },
     )
     monkeypatch.setattr(command_runner, "send_prompt", raise_no_window)
 
@@ -469,7 +475,9 @@ def test_send_prompt_manual_required_preserves_diagnostics(monkeypatch: pytest.M
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: {"status": "already_running"},
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: {
+            "status": "already_running"
+        },
     )
     monkeypatch.setattr(command_runner, "send_prompt", raise_prompt_error)
 
@@ -492,8 +500,8 @@ def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyP
     monkeypatch.setattr(
         command_runner,
         "ensure_trae_running",
-        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False: ensured.append(
-            (exe, workspace_path, launch_timeout_seconds, force_open_workspace)
+        lambda exe, workspace_path, launch_timeout_seconds, force_open_workspace=False, launch_if_workspace_mismatch=True: ensured.append(
+            (exe, workspace_path, launch_timeout_seconds, force_open_workspace, launch_if_workspace_mismatch)
         )
         or {"status": "launched", "window_title": "Trae"},
     )
@@ -504,7 +512,7 @@ def test_focus_trae_launches_when_missing_by_default(monkeypatch: pytest.MonkeyP
 
     assert result["status"] == "success"
     assert result["data"]["status"] == "launched"
-    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False)]
+    assert ensured == [(Path("C:/Trae/Trae.exe"), None, 30.0, False, True)]
 
 
 def test_trae_window_diagnostics_lists_multiple_windows(monkeypatch: pytest.MonkeyPatch):
@@ -668,6 +676,79 @@ def test_ensure_trae_running_opens_workspace_when_existing_window_title_missing(
     assert result["status"] == "launched"
     assert result["reuse_window"] is True
     assert result["workspace_match"] is True
+
+
+def test_ensure_trae_running_reuses_existing_window_when_launch_on_mismatch_disabled(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    workspace = tmp_path / "target-project"
+    calls = []
+
+    monkeypatch.setattr(trae_window, "resolve_trae_executable", lambda path: Path("C:/Trae/Trae.exe"))
+    monkeypatch.setattr(
+        trae_window,
+        "_try_find_trae_window",
+        lambda workspace_path=None, require_workspace_match=False: None
+        if require_workspace_match
+        else trae_window.TraeWindow(202),
+    )
+    monkeypatch.setattr(trae_window.subprocess, "Popen", lambda args: calls.append(args))
+    monkeypatch.setattr(trae_window, "wait_for_stable_trae_window", lambda **_kwargs: trae_window.TraeWindow(202))
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "Trae CN")
+    monkeypatch.setattr(
+        trae_window,
+        "trae_window_diagnostics",
+        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 0},
+    )
+
+    result = trae_window.ensure_trae_running(
+        Path("C:/Trae/Trae.exe"),
+        workspace,
+        launch_timeout_seconds=10,
+        launch_if_workspace_mismatch=False,
+    )
+
+    assert calls == []
+    assert result["status"] == "already_running_unverified_workspace"
+    assert result["workspace_match"] is False
+    assert result["workspace_focus_fallback"]["requested_workspace_path"] == str(workspace)
+
+
+def test_ensure_trae_running_suppresses_recent_duplicate_workspace_launch(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    workspace = tmp_path / "target-project"
+    calls = []
+    now = {"value": 1000.0}
+
+    monkeypatch.setattr(trae_window, "resolve_trae_executable", lambda path: Path("C:/Trae/Trae.exe"))
+    monkeypatch.setattr(
+        trae_window,
+        "_try_find_trae_window",
+        lambda workspace_path=None, require_workspace_match=False: None
+        if require_workspace_match
+        else trae_window.TraeWindow(202),
+    )
+    monkeypatch.setattr(trae_window.subprocess, "Popen", lambda args: calls.append(args))
+    monkeypatch.setattr(trae_window.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(trae_window.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(trae_window, "wait_for_stable_trae_window", lambda **_kwargs: trae_window.TraeWindow(202))
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "Trae CN")
+    monkeypatch.setattr(
+        trae_window,
+        "trae_window_diagnostics",
+        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 0},
+    )
+    monkeypatch.setattr(trae_window, "_recent_workspace_launches", {})
+
+    first = trae_window.ensure_trae_running(Path("C:/Trae/Trae.exe"), workspace, launch_timeout_seconds=10)
+    now["value"] += 5.0
+    second = trae_window.ensure_trae_running(Path("C:/Trae/Trae.exe"), workspace, launch_timeout_seconds=10)
+
+    assert calls == [[str(Path("C:/Trae/Trae.exe")), "--reuse-window", str(workspace)]]
+    assert first["status"] == "launched"
+    assert second["status"] == "recent_launch_reused"
+    assert second["launch_suppressed"]["reason"] == "same workspace was launched recently"
 
 
 def test_workspace_path_rejects_outside_root(monkeypatch: pytest.MonkeyPatch, tmp_path: Path):

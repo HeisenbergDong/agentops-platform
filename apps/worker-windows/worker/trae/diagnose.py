@@ -9,7 +9,14 @@ from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae.supervisor import has_ui_completion_text
 from worker.trae.ui_locator import normalize_action, validate_target
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
+from worker.trae.window import (
+    TraeAutomationError,
+    find_trae_window,
+    focus_trae,
+    focus_trae_workspace_or_any,
+    wait_for_workspace_window_or_any,
+    window_text_snapshot,
+)
 
 ACTION_BUTTON_MARKERS = {
     "run_anyway": (
@@ -125,15 +132,13 @@ def diagnose_ui(
     workspace_path: str | Path | None = None,
 ) -> dict:
     if workspace_path:
-        focus_trae(
+        focus_trae_workspace_or_any(
             timeout_seconds=timeout_seconds,
             workspace_path=workspace_path,
-            require_workspace_match=True,
         )
-        window = find_trae_window(
+        window = wait_for_workspace_window_or_any(
             timeout_seconds=timeout_seconds,
             workspace_path=workspace_path,
-            require_workspace_match=True,
         )
     else:
         focus_trae(timeout_seconds=timeout_seconds)

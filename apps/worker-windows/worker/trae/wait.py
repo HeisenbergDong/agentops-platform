@@ -8,7 +8,14 @@ from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.supervisor import SupervisorObservation, decide_next_action
 from worker.trae.trace_copy import probe_trace
 from worker.trae.watcher import build_trae_observation
-from worker.trae.window import TraeAutomationError, find_trae_window, focus_trae, window_text_snapshot
+from worker.trae.window import (
+    TraeAutomationError,
+    find_trae_window,
+    focus_trae,
+    focus_trae_workspace_or_any,
+    wait_for_workspace_window_or_any,
+    window_text_snapshot,
+)
 
 BUSY_MARKERS = (
     "\u751f\u6210\u4e2d",
@@ -53,10 +60,9 @@ def wait_completion(
     continue_text_already_sent: bool = False,
 ) -> dict:
     if workspace_path:
-        focus_trae(
+        focus_trae_workspace_or_any(
             timeout_seconds=min(10.0, timeout_seconds),
             workspace_path=workspace_path,
-            require_workspace_match=True,
         )
     else:
         focus_trae(timeout_seconds=min(10.0, timeout_seconds))
@@ -73,10 +79,9 @@ def wait_completion(
         if cancellation_check:
             cancellation_check()
         if workspace_path:
-            window = find_trae_window(
+            window = wait_for_workspace_window_or_any(
                 timeout_seconds=2.0,
                 workspace_path=workspace_path,
-                require_workspace_match=True,
             )
         else:
             window = find_trae_window(timeout_seconds=2.0)
