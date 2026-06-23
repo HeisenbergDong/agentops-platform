@@ -610,6 +610,48 @@ def test_start_job_fallback_prompt_when_llm_prompt_contains_meta_phrase(monkeypa
     assert fallback_log.extra["quality_error"] == "prompt_contains_meta_phrase:产物不满意"
 
 
+def test_start_job_prompt_adds_trae_self_test_guard(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id)
+
+    class Result:
+        text = json.dumps(
+            {
+                "prompt": (
+                    "请做一个订单看板，包含订单列表、详情、筛选、状态流转、本地模拟数据和统计联动，"
+                    "完成后说明复查入口和关键操作路径。"
+                ),
+                "prompt_kind": "feature",
+                "focus": "订单看板",
+                "acceptance_checks": ["列表筛选", "详情联动", "状态流转"],
+                "difference_from_previous": "首个可操作业务骨架",
+                "used_module": "订单看板",
+                "should_scheduler_consider_switch": False,
+                "reason": "当前范围需要业务骨架",
+            },
+            ensure_ascii=False,
+        )
+        model = "gpt-test"
+        wire_api = "responses"
+
+    class GuardLLMClient:
+        def complete(self, *_args, **_kwargs):
+            return Result()
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", GuardLLMClient)
+
+    start_job(StartJobRequest(directions=["做一个订单看板"]), user=user, db=db)
+
+    command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    assert command is not None
+    assert "不要自行启动开发服务器" in command.payload["prompt"]
+    assert "不要运行浏览器验收" in command.payload["prompt"]
+    assert "不要运行耗时测试或构建" in command.payload["prompt"]
+    assert "我后续统一执行" in command.payload["prompt"]
+
+
 def test_first_round_prompt_ignores_combined_intent_brief_for_direction_queue():
     db = _test_session()
     user = _create_user(db, "user1")

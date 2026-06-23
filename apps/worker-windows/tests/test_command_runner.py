@@ -678,6 +678,34 @@ def test_ensure_trae_running_opens_workspace_when_existing_window_title_missing(
     assert result["workspace_match"] is True
 
 
+def test_ensure_trae_running_opens_cold_workspace_without_reuse_window(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+):
+    workspace = tmp_path / "target-project"
+    calls = []
+
+    monkeypatch.setattr(trae_window, "resolve_trae_executable", lambda path: Path("C:/Trae/Trae.exe"))
+    monkeypatch.setattr(trae_window, "_try_find_trae_window", lambda **_kwargs: None)
+    monkeypatch.setattr(trae_window.subprocess, "Popen", lambda args: calls.append(args))
+    monkeypatch.setattr(trae_window, "wait_for_stable_trae_window", lambda **_kwargs: trae_window.TraeWindow(303))
+    monkeypatch.setattr(trae_window, "_focus_window", lambda window: "target-project - Trae CN")
+    monkeypatch.setattr(
+        trae_window,
+        "trae_window_diagnostics",
+        lambda selected_hwnd=None, workspace_path=None: {"selected_hwnd": selected_hwnd, "matching_count": 1},
+    )
+
+    result = trae_window.ensure_trae_running(
+        Path("C:/Trae/Trae.exe"),
+        workspace,
+        launch_timeout_seconds=10,
+    )
+
+    assert calls == [[str(Path("C:/Trae/Trae.exe")), str(workspace)]]
+    assert result["status"] == "launched"
+    assert result["reuse_window"] is False
+
+
 def test_ensure_trae_running_reuses_existing_window_when_launch_on_mismatch_disabled(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ):

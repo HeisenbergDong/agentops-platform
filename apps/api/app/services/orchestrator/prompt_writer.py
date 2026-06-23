@@ -59,11 +59,16 @@ FIRST_ROUND_TEMPLATE_PREFIXES = (
     "基于这个项目方向做一个能继续迭代的系统雏形",
 )
 PROMPT_WRITER_RETRY_LIMIT = 1
+TRAE_SELF_TEST_GUARD = (
+    "执行边界：你只负责完成代码改动和说明复查路径，不要自行启动开发服务器、"
+    "不要运行浏览器验收，也不要运行耗时测试或构建；需要验证时只写出建议命令和预期结果，"
+    "我后续统一执行。"
+)
 PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。你不能直接写飞书，不能决定作业完成，只负责给编码助手的本轮或下一轮用户提示词提案。
 要求：
 1. 你是长期任务设计角色，不是简单改写器。调度会告诉你当前范围、轮次、模式和范围计划，你只为当前范围生成当前轮 Trae prompt。
 2. 用户给多个范围时，每个范围是独立项目；你只能写 current_direction/current_range，不能合并其他 queued directions，也不能提前写下一个范围。同一范围可以分多组 1-5 轮在同一个项目里续作，新组第一轮是新 Trae 会话但不是重搭项目。
-3. 任务粒度必须中等：一个明确业务模块、两到四个相关区域、三到六个可验证交互、本地模拟数据或简单接口、多文件结构，并能运行或构建。
+3. 任务粒度必须中等：一个明确业务模块、两到四个相关区域、三到六个可验证交互、本地模拟数据或简单接口、多文件结构，并保留清楚的运行入口和复查路径。
 4. 任务不能太小：不能只是改标题、颜色、按钮文案、单字段、README，不能小到单文件静态页。
 5. 任务不能太大：不能一次要求完整商业平台、前后台移动端全套、过多模块，避免 Trae 迟迟做不完。
 6. 首轮要做可运行业务骨架：列表、详情、操作入口、统计状态、本地模拟数据，不能是说明页或单文件 demo。
@@ -73,6 +78,7 @@ PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。
 10. 不能在提示词里出现“产物不满意”“过程不满意”“结果不满意”“不满意原因”“证据：”“日志”“轨迹”“扫描”“工具调用”“watcher”“trace”“session”“LLM”“AI”。
 11. 提示词要像真实用户给开发助手的需求：明确现象、期望结果、复查路径。
 12. 如果上一轮问题是内部证据不足、轨迹缺失、GitHub/飞书链路失败，除非当前产品本身就是 AgentOps，否则不要让编码助手修这些内部链路，而要回到当前业务系统的可验证交互或工程交付。
+13. 不要让 Trae 自行启动开发服务器、运行浏览器验收或跑耗时测试/构建；提示词里只要求说明建议命令、预期结果和页面复查路径，平台后续会统一验收。
 只输出 JSON：{"prompt": "...", "prompt_kind": "bugfix|feature|workflow|edge_case|engineering|closure", "focus": "...", "acceptance_checks": ["..."], "difference_from_previous": "...", "used_module": "...", "should_scheduler_consider_switch": false, "reason": "..."}"""
 
 PROMPT_WRITER_SYSTEM += """
@@ -82,6 +88,7 @@ AgentOps 流程上下文：
 - 发给 Trae 的提示词必须像普通用户的开发需求，不要写成内部调度指令。
 - 如果本轮是暂停后的继续，请让 Trae 从中断点继续，保留已有文件和结构，避免从零重做。
 - 不要提到内部轨迹门禁、Worker 停止报告、调度状态或证据提交，除非正在开发的产品本身就是 AgentOps 且这些是真实产品功能。
+- Trae 不要自己跑测试、构建、浏览器验收或启动长时间服务；让它写清建议命令和复查路径即可。
 - 编码环境是 Windows PowerShell；如果提示词提到 Node.js 验证命令，请要求先把 npm 缓存设到当前项目的 .npm-cache，再使用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd 或 cmd /c，避免被 npm.ps1 执行策略拦截和全局缓存沙箱限制。
 """.strip()
 
@@ -157,6 +164,7 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
                         "must_generate_medium_sized_tasks": True,
                         "must_not_repeat_same_bug_loop": True,
                         "satisfied_round_should_expand_next_module": True,
+                        "must_not_run_self_tests": True,
                     },
                     "state": state,
                     "current": current,
@@ -404,7 +412,7 @@ def build_fallback_prompt(
             "统计区或概览区要跟当前数据变化联动，不要只是写死装饰数字",
         ],
         data="先用本地模拟数据或轻量接口组织业务对象，字段要能支撑列表、详情、状态、负责人、时间和操作记录。",
-        verification="完成后运行构建或本地检查；如果依赖安装受限，请说明使用的命令、失败原因和还能人工复查的页面路径。",
+        verification="完成后不要自行启动服务或跑测试；请说明建议检查命令、预期结果和还能人工复查的页面路径。",
     )
 
 
@@ -445,6 +453,18 @@ def _append_windows_command_note(prompt: str) -> str:
     return _naturalize_prompt(f"{text}\n\n{note}")
 
 
+def _append_trae_self_test_guard(prompt: str) -> str:
+    text = str(prompt or "").strip()
+    has_guard = (
+        ("不要自行启动开发服务器" in text and "不要运行浏览器验收" in text)
+        or ("不要运行耗时测试" in text and "浏览器验收" in text)
+        or ("不要自行启动服务" in text and "跑测试" in text)
+    )
+    if has_guard:
+        return text
+    return _naturalize_prompt(f"{text}\n\n{TRAE_SELF_TEST_GUARD}")
+
+
 def append_windows_command_note(prompt: str) -> str:
     return _append_windows_command_note(prompt)
 
@@ -479,7 +499,7 @@ def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason:
                 "补上失败提示、空数据反馈或边界状态，保证用户能看懂当前结果",
             ],
             data="沿用当前项目已有的数据结构；如果字段不足，可以补少量必要字段，但不要把业务重做成另一个系统。",
-            verification="完成后跑构建或本地检查，并说明从哪个页面入口复查、怎么操作、操作后应该看到什么变化。",
+            verification="完成后不要自行启动服务或跑测试；请说明从哪个页面入口复查、怎么操作、操作后应该看到什么变化，以及建议检查命令。",
         )
     module_prompt = _module_map_followup_prompt(job, round_, topic)
     if module_prompt:
@@ -500,7 +520,7 @@ def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason:
             "保留已有结构和页面风格，避免从零重建",
         ],
         data="继续使用当前项目的数据模型，必要时补模拟数据、状态枚举和操作记录。",
-        verification="完成后跑构建或本地检查，并在最终回复里写清楚复查路径。",
+        verification="完成后不要自行启动服务或跑测试；请在最终回复里写清楚复查路径、建议检查命令和预期结果。",
     )
 
 
@@ -527,7 +547,7 @@ def _module_map_followup_prompt(job: Job, round_: TaskRound, topic: str) -> str:
             "补空状态、校验失败和成功反馈，保证复查时能看出真实流程",
         ],
         data="沿用当前项目已有模拟数据或接口组织方式，补足这个模块需要的字段、状态和关联记录。",
-        verification="完成后跑构建或本地检查，并说明复查入口和关键操作路径。",
+        verification="完成后不要自行启动服务或跑测试；请说明复查入口、关键操作路径、建议检查命令和预期结果。",
     )
 
 
@@ -652,6 +672,7 @@ def _store_prompt(
     extra: dict | None = None,
 ) -> str:
     prompt = _append_windows_command_note(prompt)
+    prompt = _append_trae_self_test_guard(prompt)
     round_.prompt = prompt
     round_.status = JobState.PROMPT_READY
     job.status = JobState.PROMPT_READY
@@ -1120,7 +1141,7 @@ def _build_direction_task(direction: str, stack: str) -> dict:
         "topic": topic,
         "project_slug": _project_slug_from_direction(direction_text),
         "direction": direction_text,
-        "base": f"{direction_text}。{suffix}技术选型优先 {stack}，依赖尽量少，保证能在本机直接安装、运行、构建或测试。",
+        "base": f"{direction_text}。{suffix}技术选型优先 {stack}，依赖尽量少，保留清楚的安装、启动和检查命令，方便后续统一验收。",
         "followups": _direction_followup_prompts(direction_text, topic),
     }
 
