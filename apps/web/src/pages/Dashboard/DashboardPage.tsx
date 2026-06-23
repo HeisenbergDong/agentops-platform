@@ -7,7 +7,7 @@ import {
   ReloadOutlined
 } from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
-import { Button, Card, Input, Modal, Space, Tag, Tooltip, Typography, message } from "antd";
+import { Button, Card, Input, Modal, Segmented, Space, Tag, Tooltip, Typography, message } from "antd";
 import { useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import { api } from "../../api/client";
@@ -85,12 +85,17 @@ type PreflightCheck = {
   details?: Record<string, any>;
 };
 
+type SettingsResponse = {
+  sections: Record<string, any>;
+};
+
 export function DashboardPage() {
   const navigate = useNavigate();
   const logPanelRef = useRef<HTMLDivElement | null>(null);
   const [directions, setDirections] = useState("AgentOps 自动作业平台");
   const [directionsTouched, setDirectionsTouched] = useState(false);
   const [busy, setBusy] = useState<"start" | "continue" | "stop" | "">("");
+  const [savingFeishuMode, setSavingFeishuMode] = useState(false);
   const current = useQuery({
     queryKey: ["current-job"],
     queryFn: async () => (await api.get<CurrentJobResponse>("/jobs/current")).data,
@@ -101,6 +106,10 @@ export function DashboardPage() {
     queryFn: async () => (await api.get<PreflightResponse>("/settings/preflight")).data,
     refetchInterval: 5000
   });
+  const settings = useQuery({
+    queryKey: ["dashboard-settings"],
+    queryFn: async () => (await api.get<SettingsResponse>("/settings")).data
+  });
 
   const job = current.data?.job || null;
   const round = current.data?.round || null;
@@ -109,6 +118,7 @@ export function DashboardPage() {
   const status = job?.status || current.data?.status || "idle";
   const currentJobScopeText = job?.scope_text || "";
   const preflightData = preflight.data;
+  const feishuWriteMode = String(settings.data?.sections?.feishu?.write_mode || "feishu");
   const directionsList = parseDirections(directions);
   const hasCurrentJob = Boolean(job);
   const hasActiveWorkerCommand = Boolean(
@@ -162,6 +172,21 @@ export function DashboardPage() {
       message.error(errorMessage(error));
     } finally {
       setBusy("");
+    }
+  }
+
+  async function changeFeishuWriteMode(value: string | number) {
+    const writeMode = String(value);
+    if (writeMode === feishuWriteMode || savingFeishuMode) return;
+    setSavingFeishuMode(true);
+    try {
+      await api.put("/settings", { feishu: { write_mode: writeMode } });
+      message.success(writeMode === "local_file" ? "已切到本地写入" : "已切到飞书写入");
+      await Promise.all([settings.refetch(), preflight.refetch()]);
+    } catch (error: any) {
+      message.error(errorMessage(error));
+    } finally {
+      setSavingFeishuMode(false);
     }
   }
 
@@ -247,6 +272,22 @@ export function DashboardPage() {
               </span>
             </Tooltip>
           </Space>
+          <div className="dashboard-mode-row">
+            <Typography.Text type="secondary">记录写入</Typography.Text>
+            <Segmented
+              size="small"
+              value={feishuWriteMode}
+              disabled={savingFeishuMode || settings.isLoading}
+              onChange={(value) => void changeFeishuWriteMode(value)}
+              options={[
+                { label: "飞书", value: "feishu" },
+                { label: "本地", value: "local_file" }
+              ]}
+            />
+            <Typography.Text type="secondary" className="dashboard-mode-hint">
+              {feishuWriteMode === "local_file" ? "JSONL" : "多维表"}
+            </Typography.Text>
+          </div>
           <PreflightMiniChecks
             loading={preflight.isLoading}
             data={preflightData}

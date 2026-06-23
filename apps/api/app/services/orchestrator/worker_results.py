@@ -9,6 +9,7 @@ from app.core.config import settings
 from app.db.models import Attachment, AutomationError, Job, Project, RuntimeLog, TaskRound, User, WorkerCommand
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import create_worker_command
+from app.services.feishu.local_writer import write_local_feishu_record
 from app.services.feishu.writer import FeishuWriteError, write_feishu_record
 from app.services.github.repository import ensure_github_repository
 from app.services.orchestrator.dissatisfaction import (
@@ -1715,16 +1716,22 @@ def _write_feishu_record(
     job.status = JobState.FEISHU_WRITING
     round_.status = JobState.FEISHU_WRITING
     round_.feishu_status = "writing"
+    write_mode = _feishu_write_mode(feishu_config)
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id,
         stage=JobState.FEISHU_WRITING,
-        message="Writing Feishu business record.",
-        extra={"app_token_configured": bool(feishu_config.get("app_token")), "table_id_configured": bool(feishu_config.get("table_id"))},
+        message="Writing Feishu business record." if write_mode == "feishu" else "Writing local Feishu-compatible business record.",
+        extra={
+            "write_mode": write_mode,
+            "app_token_configured": bool(feishu_config.get("app_token")),
+            "table_id_configured": bool(feishu_config.get("table_id")),
+            "local_file_path": feishu_config.get("local_file_path") or feishu_config.get("local_record_path") or "",
+        },
     )
     try:
-        write_result = write_feishu_record(feishu_config, fields)
+        write_result = _write_business_record(feishu_config, fields, write_mode, job, round_, command, git_result)
     except FeishuWriteError as exc:
         _persist_feishu_token_cache(db, job.user_id, feishu_config, getattr(exc, "token_cache", None))
         _mark_feishu_failed(db, job, round_, str(exc), _feishu_failure_extra(fields, exc))
@@ -1748,10 +1755,44 @@ def _write_feishu_record(
         job_id=job.id,
         round_id=round_.id,
         stage=JobState.FEISHU_WRITING,
-        message="Feishu business record written.",
+        message="Local Feishu-compatible business record written."
+        if round_.feishu_status == "local_written"
+        else "Feishu business record written.",
         extra=write_result,
     )
     _advance_after_feishu_success(db, job, round_, satisfied, decision)
+
+
+def _write_business_record(
+    feishu_config: dict,
+    fields: dict[str, object],
+    write_mode: str,
+    job: Job,
+    round_: TaskRound,
+    command: WorkerCommand,
+    git_result: WorkerResult,
+) -> dict:
+    if write_mode == "local_file":
+        return write_local_feishu_record(
+            feishu_config,
+            fields,
+            metadata={
+                "job_id": job.id,
+                "round_id": round_.id,
+                "project_id": round_.project_id,
+                "worker_id": command.worker_id,
+                "command_id": command.id,
+                "git_status": (git_result.data or {}).get("status"),
+            },
+        )
+    return write_feishu_record(feishu_config, fields)
+
+
+def _feishu_write_mode(feishu_config: dict) -> str:
+    raw = str(feishu_config.get("write_mode") or "").strip().lower()
+    if raw in {"local", "local_file", "file", "jsonl"} or feishu_config.get("local_file_enabled") is True:
+        return "local_file"
+    return "feishu"
 
 
 def _persist_feishu_token_cache(
@@ -1788,7 +1829,6 @@ def _mark_feishu_failed(
     message: str,
     extra: dict,
 ) -> None:
-    _record_dissatisfaction_from_context(db, job, round_, JobState.FEISHU_FAILED_ABORT, message, extra)
     job.status = JobState.FEISHU_FAILED_ABORT
     if round_:
         round_.status = JobState.FEISHU_FAILED_ABORT

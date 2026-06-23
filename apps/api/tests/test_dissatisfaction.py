@@ -4,7 +4,7 @@ from app.services.orchestrator.dissatisfaction import (
 )
 
 
-def test_dissatisfaction_reason_humanizes_feishu_403():
+def test_dissatisfaction_reason_skips_platform_feishu_failure():
     result = generate_dissatisfaction_reason(
         DissatisfactionEvidence(
             failure_stage="feishu_failed_abort",
@@ -17,13 +17,12 @@ def test_dissatisfaction_reason_humanizes_feishu_403():
         )
     )
 
-    reason = result["reason"]
-    assert reason.startswith("产物不满意：")
-    assert "\n过程不满意：" in reason
-    assert "飞书接口返回 403" in reason
-    assert "developer.mozilla.org" not in reason
-    assert "关键证据" not in reason
-    assert "判定依据" not in reason
+    assert result["status"] == "skipped_platform_record_write_failure"
+    assert result["reason"] == ""
+    assert result["product_reason"] == ""
+    assert result["process_reason"] == ""
+    assert "飞书接口返回 403" in result["platform_failure"]
+    assert "developer.mozilla.org" not in result["platform_failure"]
 
 
 def test_dissatisfaction_reason_uses_domain_hint_without_inventing_clicks():

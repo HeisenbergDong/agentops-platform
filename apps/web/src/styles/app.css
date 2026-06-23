@@ -356,6 +356,18 @@ body,
   padding-bottom: 18px;
 }
 
+.dashboard-mode-row {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+  min-height: 28px;
+}
+
+.dashboard-mode-hint {
+  min-width: 42px;
+}
+
 .preflight-mini {
   display: flex;
   align-items: center;

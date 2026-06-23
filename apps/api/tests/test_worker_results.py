@@ -1,4 +1,5 @@
 from pathlib import Path
+import json
 import tempfile
 
 import pytest
@@ -1666,7 +1667,7 @@ def test_git_submit_success_advances_to_feishu_preparing():
     assert round_.status == JobState.FEISHU_FAILED_ABORT
     assert round_.github_status == "pushed"
     assert job.submitted_count == 1
-    assert _latest_dissatisfaction_reason(db) is not None
+    assert _latest_dissatisfaction_reason(db) is None
 
 
 def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
@@ -1707,6 +1708,43 @@ def test_git_submit_success_writes_feishu_and_completes(monkeypatch, tmp_path):
     assert written["fields"]["Trae Session ID"] == VALID_TRAE_SESSION_ID
     assert written["fields"]["日志轨迹"] == "full trae trace"
     assert written["fields"]["github地址"] == "https://github.com/acme/repo.git"
+
+
+def test_git_submit_local_file_mode_writes_jsonl_and_completes(tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    job.daily_target = 1
+    config = _create_feishu_config(db, job.user_id)
+    local_file = tmp_path / "records.jsonl"
+    config.data = {
+        "write_mode": "local_file",
+        "local_file_path": str(local_file),
+    }
+    db.commit()
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    rows = [json.loads(line) for line in local_file.read_text(encoding="utf-8").splitlines() if line.strip()]
+    assert job.status == JobState.PROJECT_COMPLETED
+    assert round_.status == JobState.ROUND_COMPLETED
+    assert round_.feishu_status == "local_written"
+    assert len(rows) == 1
+    assert rows[0]["fields"]["Trae Session ID"] == VALID_TRAE_SESSION_ID
+    assert rows[0]["fields"]["github地址"] == "https://github.com/acme/repo.git"
+    assert rows[0]["metadata"]["job_id"] == job.id
+    assert rows[0]["metadata"]["round_id"] == round_.id
 
 
 def test_git_submit_feishu_failure_persists_refreshed_token_cache(monkeypatch, tmp_path):
@@ -1754,6 +1792,7 @@ def test_git_submit_feishu_failure_persists_refreshed_token_cache(monkeypatch, t
     assert log.extra["feishu_code"] == 91403
     assert log.extra["operation"] == "list_fields"
     assert log.extra["token_cache_refreshed_before_failure"] is True
+    assert _latest_dissatisfaction_reason(db) is None
 
 
 def test_git_submit_unsatisfied_feishu_success_prepares_next_round(monkeypatch, tmp_path):

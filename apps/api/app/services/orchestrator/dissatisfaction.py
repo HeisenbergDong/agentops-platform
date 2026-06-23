@@ -75,6 +75,17 @@ def generate_dissatisfaction_reason(
     user: User | None = None,
     previous_reason: str = "",
 ) -> dict[str, Any]:
+    if _is_platform_record_write_failure(evidence):
+        return {
+            "status": "skipped_platform_record_write_failure",
+            "reason": "",
+            "product_reason": "",
+            "process_reason": "",
+            "task_done": TASK_DONE_INCOMPLETE,
+            "satisfaction": "满意",
+            "failure_stage": evidence.failure_stage,
+            "platform_failure": sanitize_reason_phrase(evidence.failure_message),
+        }
     forced = _forced_test_unsatisfied(evidence)
     if forced:
         return _finalize_reason(forced, evidence, previous_reason=previous_reason)
@@ -118,6 +129,10 @@ def _forced_test_unsatisfied(evidence: DissatisfactionEvidence) -> dict[str, Any
         "orchestrator_intent": intent,
         "test_mode": True,
     }
+
+
+def _is_platform_record_write_failure(evidence: DissatisfactionEvidence) -> bool:
+    return str(evidence.failure_stage or "") in {"feishu_writing", "feishu_failed_abort"}
 
 
 def _reviewer_reason(

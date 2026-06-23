@@ -116,6 +116,7 @@ export function SettingsPage() {
   }
 
   const feishuResources = settings.data?.sections?.feishu?.discovered_resources;
+  const feishuWriteMode = String(Form.useWatch(["feishu", "write_mode"], form) || "feishu");
   const configuredWorkerId = String(Form.useWatch(["worker", "worker_id"], form) || "").trim();
   const selectedWorker = useMemo(
     () => (workers.data || []).find((worker: any) => worker.worker_id === configuredWorkerId),
@@ -231,12 +232,32 @@ export function SettingsPage() {
           className="settings-card settings-anchor"
           title="飞书授权"
           extra={
-            <Button icon={<CloudSyncOutlined />} loading={discovering} onClick={() => void discoverFeishu()}>
+            <Button
+              icon={<CloudSyncOutlined />}
+              loading={discovering}
+              onClick={() => void discoverFeishu()}
+            >
               获取飞书资源
             </Button>
           }
         >
           <Row gutter={16}>
+            <Col span={12}>
+              <Form.Item name={["feishu", "write_mode"]} label="写入模式" initialValue="feishu">
+                <Select
+                  options={[
+                    { value: "feishu", label: "写入飞书多维表格" },
+                    { value: "local_file", label: "写入本地 JSONL 文件" }
+                  ]}
+                  {...selectPopupProps}
+                />
+              </Form.Item>
+            </Col>
+            <Col span={12}>
+              <Form.Item name={["feishu", "local_file_path"]} label="本地写入文件">
+                <Input placeholder="local-feishu-records/records.jsonl" />
+              </Form.Item>
+            </Col>
             <Col span={12}>
               <Form.Item name={["feishu", "app_id"]} label="飞书 App ID">
                 <Input placeholder="cli_xxx" />
@@ -277,7 +298,11 @@ export function SettingsPage() {
               <Alert
                 showIcon
                 type={feishuResources ? "success" : "warning"}
-                message={feishuResources?.message || "填写 App ID / Secret 和写入地址后点击获取，系统会打开飞书授权页，授权成功后缓存可自动刷新的用户访问 token。"}
+                message={
+                  feishuWriteMode === "local_file"
+                    ? "当前为本地 JSONL 写入模式；未填写本地写入文件时，后端会写入 storage/local-feishu-records/records.jsonl。"
+                    : feishuResources?.message || "填写 App ID / Secret 和写入地址后点击获取，系统会打开飞书授权页，授权成功后缓存可自动刷新的用户访问 token。"
+                }
               />
             </Col>
           </Row>
