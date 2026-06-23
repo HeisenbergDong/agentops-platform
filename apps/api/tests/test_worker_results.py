@@ -1961,6 +1961,98 @@ def test_completed_project_advances_to_next_direction(monkeypatch, tmp_path):
     assert next_round.project_id is None
 
 
+def test_range_target_restarts_same_project_group_when_modules_remain(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    direction = "招聘平台工作台：职位、候选人、面试、统计和招聘负责人协作。"
+    job.directions = [direction, "中介服务平台：服务商、需求撮合、订单和结算。"]
+    job.intent = {
+        "range_plan": {
+            "ranges": [
+                {
+                    "range_id": "range_1",
+                    "title": "招聘平台工作台",
+                    "source_text": direction,
+                    "target_rounds": 5,
+                    "module_map": ["系统骨架", "职位管理", "候选人管理", "简历筛选", "面试安排", "统计看板", "角色权限"],
+                },
+                {
+                    "range_id": "range_2",
+                    "title": "中介服务平台",
+                    "source_text": "中介服务平台：服务商、需求撮合、订单和结算。",
+                    "target_rounds": 5,
+                    "module_map": ["系统骨架", "服务商入驻"],
+                },
+            ]
+        }
+    }
+    round_.round_index = 5
+    job.submitted_count = 4
+    job.satisfied_count = 0
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="recruitment-platform",
+        direction=direction,
+        workspace_path="D:/work/recruitment-platform",
+        status="active",
+    )
+    round_.project_id = project.id
+    previous_rounds = [
+        TaskRound(
+            id=f"round-prev-{index}",
+            job_id=job.id,
+            project_id=project.id,
+            round_index=index,
+            status=JobState.ROUND_COMPLETED,
+        )
+        for index in range(1, 5)
+    ]
+    db.add(project)
+    db.add_all(previous_rounds)
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage="dissatisfaction_reason",
+            message="Dissatisfaction reason generated.",
+            level="warning",
+            extra={"reason": "产物不满意：面试安排还没有完成。\n过程不满意：交付说明没有覆盖操作路径。"},
+        )
+    )
+    db.commit()
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id, TaskRound.status == JobState.GENERATING_PROMPT)
+        .order_by(TaskRound.created_at.desc())
+        .limit(1)
+    )
+    db.refresh(job)
+    db.refresh(round_)
+    db.refresh(project)
+    assert job.status == JobState.GENERATING_PROMPT
+    assert job.directions == [direction, "中介服务平台：服务商、需求撮合、订单和结算。"]
+    assert project.status == "active"
+    assert next_round is not None
+    assert next_round.project_id == project.id
+    assert next_round.round_index == 1
+
+
 def test_completed_project_can_append_synthetic_direction_when_policy_allows(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_git_submit_rows(db)

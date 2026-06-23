@@ -65,16 +65,20 @@ def build_range_plan(directions: list[str], daily_target: int = DEFAULT_DAILY_TA
         }
     total = max(1, int(daily_target or DEFAULT_DAILY_TARGET))
     explicit_total = min(total, MAX_ROUNDS_PER_DIRECTION * len(clean))
+    min_rounds_per_direction = 2 if explicit_total >= len(clean) * 2 else 1
     weights = [_direction_complexity_weight(item) for item in clean]
     weight_total = sum(weights) or len(clean)
-    raw_targets = [min(MAX_ROUNDS_PER_DIRECTION, max(1, int(round(explicit_total * weight / weight_total)))) for weight in weights]
+    raw_targets = [
+        min(MAX_ROUNDS_PER_DIRECTION, max(min_rounds_per_direction, int(round(explicit_total * weight / weight_total))))
+        for weight in weights
+    ]
     diff = explicit_total - sum(raw_targets)
     index = 0
     while diff != 0 and raw_targets:
         offset = 1 if diff > 0 else -1
         target_index = index % len(raw_targets)
         next_value = raw_targets[target_index] + offset
-        if 1 <= next_value <= MAX_ROUNDS_PER_DIRECTION:
+        if min_rounds_per_direction <= next_value <= MAX_ROUNDS_PER_DIRECTION:
             raw_targets[target_index] = next_value
             diff -= offset
         index += 1

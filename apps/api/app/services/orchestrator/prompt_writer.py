@@ -62,7 +62,7 @@ PROMPT_WRITER_RETRY_LIMIT = 1
 PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。你不能直接写飞书，不能决定作业完成，只负责给编码助手的本轮或下一轮用户提示词提案。
 要求：
 1. 你是长期任务设计角色，不是简单改写器。调度会告诉你当前范围、轮次、模式和范围计划，你只为当前范围生成当前轮 Trae prompt。
-2. 用户给多个范围时，每个范围是独立项目；你只能写 current_direction/current_range，不能合并其他 queued directions，也不能提前写下一个范围。
+2. 用户给多个范围时，每个范围是独立项目；你只能写 current_direction/current_range，不能合并其他 queued directions，也不能提前写下一个范围。同一范围可以分多组 1-5 轮在同一个项目里续作，新组第一轮是新 Trae 会话但不是重搭项目。
 3. 任务粒度必须中等：一个明确业务模块、两到四个相关区域、三到六个可验证交互、本地模拟数据或简单接口、多文件结构，并能运行或构建。
 4. 任务不能太小：不能只是改标题、颜色、按钮文案、单字段、README，不能小到单文件静态页。
 5. 任务不能太大：不能一次要求完整商业平台、前后台移动端全套、过多模块，避免 Trae 迟迟做不完。
@@ -311,7 +311,7 @@ def _prompt_candidate_from_result(
 ) -> tuple[dict, str, str, str]:
     proposal = _parse_prompt_writer_result(result.text)
     prompt = _naturalize_prompt(str(proposal.get("prompt") or result.text or ""))
-    prompt_kind = str(proposal.get("prompt_kind") or ("feature" if round_.round_index <= 1 else "bugfix")).strip().lower()
+    prompt_kind = str(proposal.get("prompt_kind") or ("feature" if _is_new_project_first_round(round_) else "bugfix")).strip().lower()
     if prompt_kind not in {"bugfix", "feature", "workflow", "edge_case", "engineering", "closure"}:
         prompt_kind = "feature"
     if not prompt:
@@ -373,7 +373,7 @@ def build_fallback_prompt(
     fallback_reason: str = "",
 ) -> str:
     directions = _visible_directions_for_prompt(job)
-    if round_.round_index > 1:
+    if round_.round_index > 1 or _is_existing_project_new_interaction(round_):
         return build_followup_fallback_prompt(job, round_, fallback_reason)
     intent = job.intent if isinstance(job.intent, dict) else {}
     prompt_brief = str(intent.get("prompt_brief") or "").strip()
@@ -512,7 +512,7 @@ def _module_map_followup_prompt(job: Job, round_: TaskRound, topic: str) -> str:
         return ""
     index = max(0, int(round_.round_index or 1) - 1) % len(modules)
     module = modules[index]
-    if module in {"系统骨架"} and round_.round_index > 1:
+    if module in {"系统骨架"} and (round_.round_index > 1 or _is_existing_project_new_interaction(round_)):
         index = (index + 1) % len(modules)
         module = modules[index]
     return _structured_prompt(
@@ -572,7 +572,7 @@ def prompt_quality_error(db: Session | None, job: Job, round_: TaskRound, prompt
             return f"prompt_contains_internal_process:{pattern.pattern}"
     if other_direction := _queued_other_direction_mention(job, text):
         return f"prompt_mentions_other_direction:{other_direction}"
-    if round_.round_index == 1:
+    if _is_new_project_first_round(round_):
         stripped = text.lstrip()
         for prefix in FIRST_ROUND_TEMPLATE_PREFIXES:
             if stripped.startswith(prefix):
@@ -611,7 +611,7 @@ def prompt_quality_error(db: Session | None, job: Job, round_: TaskRound, prompt
         previous_prompts = db.scalars(
             select(TaskRound.prompt)
             .where(TaskRound.job_id == job.id, TaskRound.id != round_.id, TaskRound.prompt != "")
-            .order_by(TaskRound.round_index.desc())
+            .order_by(TaskRound.created_at.desc())
             .limit(12)
         ).all()
         for previous in previous_prompts:
@@ -756,6 +756,8 @@ def _range_plan_meta(job: Job) -> dict:
             "prompt_writer_does_not_switch_ranges": True,
             "prompt_writer_may_suggest_switch": True,
             "satisfied_round_should_expand_next_module_or_switch_by_scheduler": True,
+            "max_rounds_per_interaction_group": 5,
+            "same_project_new_interaction_preferred_before_switch_when_modules_remain": True,
         },
     }
 
@@ -862,7 +864,7 @@ def _prompt_terms(value: str) -> list[str]:
 
 
 def _previous_dissatisfaction(db: Session, job: Job, round_: TaskRound) -> str:
-    if round_.round_index <= 1:
+    if round_.round_index <= 1 and not _is_existing_project_new_interaction(round_):
         return ""
     item = db.scalar(
         select(RuntimeLog)
@@ -932,7 +934,7 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
         db.scalars(
             select(TaskRound)
             .where(TaskRound.job_id == job.id, TaskRound.id != round_.id)
-            .order_by(TaskRound.round_index.desc())
+            .order_by(TaskRound.created_at.desc())
             .limit(8)
         ).all()
     )
@@ -980,6 +982,7 @@ def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
         "direction": direction,
         "project_slug": _project_slug_from_direction(direction),
         "round_index": round_.round_index,
+        "existing_project_new_interaction": _is_existing_project_new_interaction(round_),
         "last_dissatisfaction": previous_reason,
         "used_prompts": previous_prompts,
         "followups": _direction_followup_prompts(direction, _direction_topic(direction)),
@@ -988,15 +991,27 @@ def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
 
 def _prompt_meta(job: Job, round_: TaskRound) -> dict:
     intent = job.intent if isinstance(job.intent, dict) else {}
+    existing_project_new_interaction = _is_existing_project_new_interaction(round_)
+    is_new_project = _is_new_project_first_round(round_)
     return {
-        "kind": "new" if round_.round_index <= 1 else "followup",
+        "kind": "new" if is_new_project else "followup",
         "round": "第一轮" if round_.round_index <= 1 else f"第{round_.round_index}轮",
         "topic": _direction_topic(_current_direction(job) or _directions_text(job.directions)),
         "project_slug": _project_slug_from_direction(_current_direction(job) or _directions_text(job.directions)),
-        "first_round_gate": round_.round_index <= 1,
+        "first_round_gate": is_new_project,
+        "existing_project_new_interaction": existing_project_new_interaction,
+        "open_new_trae_task_but_keep_project": existing_project_new_interaction,
         "run_mode": intent.get("run_mode") or "normal",
         "intent_summary": intent.get("intent_summary") or "",
     }
+
+
+def _is_new_project_first_round(round_: TaskRound) -> bool:
+    return int(round_.round_index or 1) <= 1 and not bool(round_.project_id)
+
+
+def _is_existing_project_new_interaction(round_: TaskRound) -> bool:
+    return int(round_.round_index or 1) <= 1 and bool(round_.project_id)
 
 
 def _previous_dissatisfaction_from_round(round_: TaskRound) -> str:
@@ -1038,7 +1053,7 @@ def _soften_prompt_repetition(db: Session, job: Job, round_: TaskRound, prompt: 
         db.scalars(
             select(TaskRound.prompt)
             .where(TaskRound.job_id == job.id, TaskRound.id != round_.id, TaskRound.prompt != "")
-            .order_by(TaskRound.round_index.desc())
+            .order_by(TaskRound.created_at.desc())
             .limit(12)
         ).all()
     )

@@ -111,6 +111,38 @@ def test_dissatisfaction_reason_tmc_does_not_cross_domain_to_community_or_logist
     assert "装车失败" not in reason
 
 
+def test_dissatisfaction_reason_prioritizes_static_code_review_findings():
+    result = generate_dissatisfaction_reason(
+        DissatisfactionEvidence(
+            failure_stage="product_reviewing",
+            failure_message="Product review found blocking code issues.",
+            prompt="招聘方工作台要支持职位、候选人、面试和统计联动",
+            data={
+                "product_review": {
+                    "issues": [
+                        "frontend/src/api/job.js:12 接口请求失败后直接吞掉错误，职位列表不能显示失败反馈。",
+                        "frontend/src/components/JobForm.jsx:20 事件绑定为空：<button onClick={}>保存</button>",
+                    ],
+                    "warnings": ["frontend/src/App.jsx 仍包含 TODO 标记。"],
+                    "changed_files": ["frontend/src/api/job.js", "frontend/src/components/JobForm.jsx"],
+                    "evidence": ["审查了 18 个项目文件，其中主要代码文件 9 个。"],
+                    "stack": ["React", "Go"],
+                    "file_count": 18,
+                }
+            },
+        )
+    )
+
+    reason = result["reason"]
+    assert "代码审查发现" in reason
+    assert "frontend/src/api/job.js" in reason
+    assert "frontend/src/components/JobForm.jsx" in reason
+    assert "事件绑定为空" in reason
+    assert "未确认" not in reason
+    assert "不能确认" not in reason
+    assert "无法确认" not in reason
+
+
 def test_dissatisfaction_reason_can_force_labeled_test_unsatisfied():
     result = generate_dissatisfaction_reason(
         DissatisfactionEvidence(

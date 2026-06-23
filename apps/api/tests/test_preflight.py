@@ -14,7 +14,7 @@ from app.db.models.base import now_utc
 from app.db.session import Base
 from app.services.llm.client import LLMError
 from app.services.orchestrator.states import JobState
-from app.services.orchestrator.directions import normalize_job_directions, split_direction_text
+from app.services.orchestrator.directions import build_range_plan, normalize_job_directions, split_direction_text
 from app.services.orchestrator.intent import force_test_mode_intent, infer_job_intent
 from app.services.orchestrator import prompt_writer
 from app.services.orchestrator.worker_dispatch import dispatch_prompt_to_worker
@@ -568,6 +568,18 @@ def test_start_job_prompt_writer_receives_only_current_direction(monkeypatch):
     assert payload["direction_queue"]["remaining_count"] == 1
     assert payload["range_plan"]["current_range"]["title"] == "招聘平台"
     assert payload["range_plan"]["current_range"]["target_rounds"] > 0
+
+
+def test_range_plan_uses_at_least_two_rounds_when_target_allows():
+    plan = build_range_plan(
+        [
+            "招聘平台：投简历、发布招聘信息、招聘方和应聘方沟通。",
+            "中介平台：实名认证、需求匹配、在线下单。",
+        ],
+        daily_target=10,
+    )
+
+    assert [item["target_rounds"] for item in plan["ranges"]] == [5, 5]
 
 
 def test_start_job_fallback_prompt_when_llm_prompt_contains_meta_phrase(monkeypatch):
@@ -1443,6 +1455,39 @@ def test_worker_dispatch_continues_same_trae_task_after_first_round():
 
     assert command.payload["round_index"] == 2
     assert command.payload["open_new_task"] is False
+    assert command.payload["trae_workspace_path"] == "D:/mr-d/demo-project"
+
+
+def test_worker_dispatch_opens_new_trae_task_for_same_project_new_group():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.PROMPT_READY, directions=["demo"])
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="demo-project",
+        direction="demo",
+        workspace_path="D:/mr-d/demo-project",
+        status="active",
+    )
+    round_ = TaskRound(
+        id="round-new-group",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.PROMPT_READY,
+        prompt="继续在原项目里做下一块业务能力。",
+    )
+    db.add_all([job, project, round_])
+    db.commit()
+
+    command = dispatch_prompt_to_worker(db, user, job, round_)
+
+    assert command.payload["round_index"] == 1
+    assert command.payload["open_new_task"] is True
+    assert command.payload["project_name"] == "demo-project"
     assert command.payload["trae_workspace_path"] == "D:/mr-d/demo-project"
 
 

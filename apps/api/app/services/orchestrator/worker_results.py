@@ -2,7 +2,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 import re
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -35,6 +35,7 @@ FEISHU_ATTACHMENT_FIELD = "截图（userprompt附件/产物/运行结果/对话�
 LOG_TRACE_FIELD_SOFT_LIMIT = 45000
 LOG_TRACE_OVERFLOW_TEXT = "因日志超长已经保存txt文档，放在截图列。"
 MAX_ROUNDS_PER_PROJECT = 5
+MAX_ROUNDS_PER_INTERACTION_GROUP = 5
 MAX_SATISFIED_RATIO = 0.20
 TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
 TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
@@ -1519,7 +1520,7 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
                 level="warning",
             )
             return
-        if round_ and round_.round_index == 1 and not _has_dissatisfaction_reason(db, job.id, round_.id):
+        if round_ and _should_discard_satisfied_first_round(db, job, round_):
             _discard_first_round_satisfied(db, job, round_, extra)
             return
         add_log(
@@ -1739,7 +1740,7 @@ def _write_feishu_record(
     satisfied = bool(satisfaction["satisfied"])
     round_.feishu_status = str(write_result.get("status") or "written")
     round_.status = JobState.ROUND_COMPLETED
-    decision = _next_round_decision(job, round_, satisfied)
+    decision = _next_round_decision(db, job, round_, satisfied)
     if satisfied and decision.get("accepted_satisfied"):
         job.satisfied_count += 1
     add_log(
@@ -1811,7 +1812,7 @@ def _advance_after_feishu_success(
     satisfied: bool,
     decision: dict[str, object] | None = None,
 ) -> None:
-    decision = decision or _next_round_decision(job, round_, satisfied)
+    decision = decision or _next_round_decision(db, job, round_, satisfied)
     if decision["action"] == "continue_project":
         next_round = TaskRound(
             job_id=job.id,
@@ -1841,6 +1842,40 @@ def _advance_after_feishu_success(
         _auto_dispatch_next_round(db, job, next_round)
         return
 
+    if decision["action"] == "restart_project_group":
+        next_round = TaskRound(
+            job_id=job.id,
+            project_id=round_.project_id,
+            round_index=1,
+            status=JobState.GENERATING_PROMPT,
+        )
+        db.add(next_round)
+        db.flush()
+        job.status = JobState.GENERATING_PROMPT
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id,
+            stage=JobState.ROUND_COMPLETED,
+            message=_restart_project_group_message(decision),
+            extra={**decision, "next_round_id": next_round.id, "next_round_index": next_round.round_index},
+        )
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=next_round.id,
+            stage=JobState.GENERATING_PROMPT,
+            message="Next interaction group is ready for prompt generation in the same project.",
+            extra={
+                "previous_round_id": round_.id,
+                "project_id": round_.project_id,
+                "round_index": next_round.round_index,
+                "open_new_trae_task_expected": True,
+            },
+        )
+        _auto_dispatch_next_round(db, job, next_round)
+        return
+
     if not str(decision.get("reason") or "").startswith("daily_target_reached") and _advance_to_next_direction(db, job, round_, decision):
         return
 
@@ -1861,7 +1896,7 @@ def _advance_after_feishu_success(
     )
 
 
-def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[str, object]:
+def _next_round_decision(db: Session, job: Job, round_: TaskRound, satisfied: bool) -> dict[str, object]:
     daily_target_reached = bool(job.daily_target and job.submitted_count >= job.daily_target)
     range_target = _current_range_target_rounds(job)
     if satisfied:
@@ -1876,6 +1911,14 @@ def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[s
                     "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
                 }
             if round_.round_index >= range_target:
+                if _should_restart_project_group(db, job, round_, satisfied=False):
+                    return {
+                        "action": "restart_project_group",
+                        "reason": "range_target_reached_after_satisfied_ratio_cap",
+                        "accepted_satisfied": False,
+                        "satisfied_ratio_cap": MAX_SATISFIED_RATIO,
+                        "range_target_rounds": range_target,
+                    }
                 return {
                     "action": "complete_project",
                     "reason": "max_round_reached_after_satisfied_ratio_cap",
@@ -1901,6 +1944,8 @@ def _next_round_decision(job: Job, round_: TaskRound, satisfied: bool) -> dict[s
     if daily_target_reached:
         return {"action": "complete_project", "reason": "daily_target_reached"}
     if round_.round_index >= range_target:
+        if _should_restart_project_group(db, job, round_, satisfied=False):
+            return {"action": "restart_project_group", "reason": "range_target_reached_but_dissatisfied", "range_target_rounds": range_target}
         return {"action": "complete_project", "reason": "range_target_reached", "range_target_rounds": range_target}
     return {"action": "continue_project", "reason": "dissatisfied_followup", "range_target_rounds": range_target}
 
@@ -1923,15 +1968,62 @@ def _current_range_target_rounds(job: Job) -> int:
             continue
         if str(item.get("source_text") or "").strip() == current_direction:
             try:
-                return min(MAX_ROUNDS_PER_PROJECT, max(1, int(item.get("target_rounds") or MAX_ROUNDS_PER_PROJECT)))
+                return min(MAX_ROUNDS_PER_INTERACTION_GROUP, max(1, int(item.get("target_rounds") or MAX_ROUNDS_PER_INTERACTION_GROUP)))
             except (TypeError, ValueError):
-                return MAX_ROUNDS_PER_PROJECT
+                return MAX_ROUNDS_PER_INTERACTION_GROUP
     if ranges:
         try:
-            return min(MAX_ROUNDS_PER_PROJECT, max(1, int(ranges[0].get("target_rounds") or MAX_ROUNDS_PER_PROJECT)))
+            return min(MAX_ROUNDS_PER_INTERACTION_GROUP, max(1, int(ranges[0].get("target_rounds") or MAX_ROUNDS_PER_INTERACTION_GROUP)))
         except (AttributeError, TypeError, ValueError):
-            return MAX_ROUNDS_PER_PROJECT
-    return MAX_ROUNDS_PER_PROJECT
+            return MAX_ROUNDS_PER_INTERACTION_GROUP
+    return MAX_ROUNDS_PER_INTERACTION_GROUP
+
+
+def _should_restart_project_group(db: Session, job: Job, round_: TaskRound, satisfied: bool) -> bool:
+    if satisfied:
+        return False
+    if not round_.project_id:
+        return False
+    if job.daily_target and int(job.submitted_count or 0) >= int(job.daily_target or 0):
+        return False
+    if _current_range_has_remaining_modules(db, job, round_):
+        return True
+    return False
+
+
+def _current_range_has_remaining_modules(db: Session, job: Job, round_: TaskRound) -> bool:
+    modules = _current_range_modules(job)
+    if not modules or not round_.project_id:
+        return False
+    completed = _completed_project_round_count(db, job.id, round_.project_id)
+    return completed < len(modules)
+
+
+def _current_range_modules(job: Job) -> list[str]:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    plan = intent.get("range_plan") if isinstance(intent.get("range_plan"), dict) else {}
+    ranges = plan.get("ranges") if isinstance(plan.get("ranges"), list) else []
+    current_direction = _direction_queue(job)[0] if _direction_queue(job) else ""
+    for item in ranges:
+        if not isinstance(item, dict):
+            continue
+        if str(item.get("source_text") or "").strip() != current_direction:
+            continue
+        return [str(module).strip() for module in item.get("module_map") or [] if str(module).strip()]
+    return []
+
+
+def _completed_project_round_count(db: Session, job_id: str, project_id: str) -> int:
+    return int(
+        db.scalar(
+            select(func.count(TaskRound.id)).where(
+                TaskRound.job_id == job_id,
+                TaskRound.project_id == project_id,
+                TaskRound.status == JobState.ROUND_COMPLETED,
+            )
+        )
+        or 0
+    )
 
 
 def _should_continue_after_satisfied(job: Job, round_: TaskRound) -> bool:
@@ -1952,6 +2044,12 @@ def _continue_project_message(decision: dict[str, object]) -> str:
     if decision.get("reason") == "satisfied_expand_next_module":
         return "Round completed satisfactorily; next range module round prepared by scheduler."
     return "Round completed; next project round prepared because the result is still dissatisfied."
+
+
+def _restart_project_group_message(decision: dict[str, object]) -> str:
+    if decision.get("reason") == "range_target_reached_after_satisfied_ratio_cap":
+        return "Round group completed; the same project will continue in a new Trae interaction because the satisfied ratio cap would be exceeded."
+    return "Round group completed; the same project will continue in a new Trae interaction before switching ranges."
 
 
 def _advance_to_next_direction(db: Session, job: Job, round_: TaskRound, decision: dict[str, object]) -> bool:
@@ -2094,6 +2192,25 @@ def _has_dissatisfaction_reason(db: Session, job_id: str, round_id: str) -> bool
             .limit(1)
         )
     )
+
+
+def _should_discard_satisfied_first_round(db: Session, job: Job, round_: TaskRound) -> bool:
+    if round_.round_index != 1:
+        return False
+    if _has_dissatisfaction_reason(db, job.id, round_.id):
+        return False
+    if not round_.project_id:
+        return True
+    prior_round = db.scalar(
+        select(TaskRound.id)
+        .where(
+            TaskRound.job_id == job.id,
+            TaskRound.project_id == round_.project_id,
+            TaskRound.id != round_.id,
+        )
+        .limit(1)
+    )
+    return prior_round is None
 
 
 def _auto_dispatch_next_round(db: Session, job: Job, round_: TaskRound) -> None:
