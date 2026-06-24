@@ -72,6 +72,7 @@ def wait_completion(
     latest_text = ""
     last_change_at = time.monotonic()
     interventions: list[dict] = []
+    diagnostics: list[dict] = []
     last_progress_at: dict[str, float] = {}
     last_decision: dict = {}
 
@@ -179,6 +180,7 @@ def wait_completion(
                 latest_text=latest_text,
                 stable_seconds=stable_seconds,
                 interventions=interventions,
+                diagnostics=diagnostics,
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
@@ -248,8 +250,12 @@ def wait_completion(
             turn_probe=timeout_decision.get("turn_probe") or {},
             gate=timeout_decision.get("completion_gate") or {},
             interventions=interventions,
-            supervisor_decision={**timeout_decision, "reason": timeout_decision.get("reason") or "timeout_completion_detected"},
+            supervisor_decision=_with_latest_diagnosis(
+                {**timeout_decision, "reason": timeout_decision.get("reason") or "timeout_completion_detected"},
+                diagnostics,
+            ),
         )
+    timeout_decision = _with_latest_diagnosis(timeout_decision, diagnostics)
     raise TraeAutomationError(
         "Trae output did not become stable before wait_completion timeout",
         {
@@ -262,6 +268,7 @@ def wait_completion(
             "text_chars": len(latest_text),
             "text_sample": latest_text[-1000:],
             "interventions": interventions,
+            "diagnostics": diagnostics[-3:],
         },
     )
 
@@ -271,6 +278,7 @@ def _try_visual_completion(
     latest_text: str,
     stable_seconds: float,
     interventions: list[dict],
+    diagnostics: list[dict],
     timeout_seconds: float,
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None,
@@ -286,6 +294,7 @@ def _try_visual_completion(
         suppress_continue_text=suppress_continue_text,
     )
     if intervention.get("status") != "completed":
+        _remember_diagnostic(diagnostics, intervention)
         return None
     decision = {
         "action": "collect_trace",
@@ -333,6 +342,35 @@ def _final_timeout_decision(
         )
     except Exception:
         return fallback_decision or {"action": "wait", "reason": "timeout_without_supervisor_decision"}
+
+
+def _remember_diagnostic(diagnostics: list[dict], intervention: dict) -> None:
+    diagnosis = intervention.get("diagnosis") if isinstance(intervention.get("diagnosis"), dict) else {}
+    if not diagnosis:
+        return
+    diagnostics.append(
+        {
+            "status": str(intervention.get("status") or ""),
+            "reason": str(intervention.get("reason") or ""),
+            "diagnosis_state": str(intervention.get("diagnosis_state") or diagnosis.get("state") or ""),
+            "diagnosis": diagnosis,
+        }
+    )
+    del diagnostics[:-3]
+
+
+def _with_latest_diagnosis(decision: dict, diagnostics: list[dict]) -> dict:
+    if not diagnostics:
+        return decision
+    latest = diagnostics[-1]
+    diagnosis = latest.get("diagnosis") if isinstance(latest.get("diagnosis"), dict) else {}
+    if not diagnosis:
+        return decision
+    updated = dict(decision or {})
+    updated.setdefault("diagnosis", diagnosis)
+    updated.setdefault("diagnosis_state", latest.get("diagnosis_state") or diagnosis.get("state") or "")
+    updated.setdefault("diagnosis_reason", latest.get("reason") or diagnosis.get("reason") or "")
+    return updated
 
 
 def _emit_progress(
