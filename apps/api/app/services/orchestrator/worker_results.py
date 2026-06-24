@@ -348,6 +348,15 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         return
 
     if _should_observe_wait_failure_without_recovery(extra):
+        if _wait_failure_needs_visual_diagnosis(extra) and _queue_wait_recovery_diagnosis(
+            db,
+            command,
+            job,
+            round_,
+            "Worker could not read Trae content safely; scheduler will request a visual diagnosis before another observation loop.",
+            extra,
+        ):
+            return
         if _queue_wait_observation_retry(
             db,
             command,
@@ -490,6 +499,31 @@ def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: Work
             {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_trace_probe_ok"}},
             message="Continue diagnosis found a complete-looking Trae reply; collecting trace before more recovery.",
         )
+        return
+    if previous_command_type == WorkerCommandType.WAIT_COMPLETION.value and _wait_diagnosis_should_probe_trace(
+        command, result.data, diagnostic_extra
+    ):
+        _queue_trace_collection_after_wait(
+            db,
+            command,
+            job,
+            round_,
+            diagnostic_extra,
+            {"supervisor_decision": {"action": "collect_trace", "reason": "wait_diagnosis_trace_probe"}},
+            message=(
+                "Visual diagnosis still could not prove Trae is generating or waiting for a safe action; "
+                "scheduler will probe the latest assistant trace before waiting again."
+            ),
+        )
+        return
+    if previous_command_type == WorkerCommandType.COPY_LATEST_REPLY.value and _handle_trace_recovery_diagnosis_fallback(
+        db,
+        command,
+        job,
+        round_,
+        result.data,
+        diagnostic_extra,
+    ):
         return
     _queue_wait_observation_retry(
         db,
@@ -687,6 +721,115 @@ def _diagnose_output_probe_can_collect_trace(output_probe: dict) -> bool:
     if output_probe.get("complete_like") is True:
         return True
     return str(output_probe.get("reason") or "") == "ok"
+
+
+def _handle_trace_recovery_diagnosis_fallback(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    data: dict,
+    diagnostic_extra: dict,
+) -> bool:
+    if not _trace_diagnosis_should_retry_copy(data):
+        return False
+
+    retry_reason = _trace_copy_retry_reason(diagnostic_extra)
+    trace_extra = {
+        **diagnostic_extra,
+        "validation": {"valid": False, "reason": retry_reason},
+        "trace_recovery_decision": "retry_copy_after_visual_diagnosis",
+    }
+    if _queue_trace_copy_retry(
+        db,
+        command,
+        job,
+        round_,
+        "Visual diagnosis did not find an active Trae generation or a safe action; retrying trace copy before any wait recovery.",
+        trace_extra,
+    ):
+        return True
+    if _handle_completed_trace_unavailable(db, command, job, round_, trace_extra):
+        return True
+    _mark_trace_missing_abort(
+        db,
+        job,
+        round_,
+        "Worker could not copy a complete Trae assistant trace after visual diagnosis and retry limits were exhausted.",
+        trace_extra,
+    )
+    return True
+
+
+def _trace_diagnosis_should_retry_copy(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return True
+    suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    if suggested:
+        return False
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    state = str(data.get("state") or ai_analysis.get("screen_state") or "").strip()
+    recommended = str(ai_analysis.get("recommended_action") or "").strip()
+    if state in {"completed", "awaiting_keep_changes", "awaiting_save"}:
+        return True
+    if recommended == "collect_trace_candidate":
+        return True
+    if state in {
+        "still_generating",
+        "generating",
+        "prompt_submitted",
+        "awaiting_action",
+        "awaiting_continuation",
+        "awaiting_terminal_input",
+        "needs_scroll_inner_panel",
+        "manual_required",
+        "service_interrupted",
+    }:
+        return False
+    output_probe = data.get("output_probe") if isinstance(data.get("output_probe"), dict) else {}
+    if _diagnose_output_probe_can_collect_trace(output_probe):
+        return True
+    return state in {"", "unknown", "idle_or_running"}
+
+
+def _wait_diagnosis_should_probe_trace(command: WorkerCommand, data: dict, extra: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    if suggested:
+        return False
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    state = str(data.get("state") or ai_analysis.get("screen_state") or "").strip()
+    recommended = str(ai_analysis.get("recommended_action") or "").strip()
+    if state == "completed" or recommended == "collect_trace_candidate":
+        return True
+    if state in {
+        "still_generating",
+        "generating",
+        "prompt_submitted",
+        "awaiting_action",
+        "awaiting_continuation",
+        "awaiting_terminal_input",
+        "needs_scroll_inner_panel",
+        "manual_required",
+        "service_interrupted",
+    }:
+        return False
+    attempts = int(command.payload.get("wait_recovery_diagnosis_attempts") or 0)
+    max_attempts = int(
+        command.payload.get("max_wait_recovery_diagnosis_attempts") or DEFAULT_MAX_WAIT_RECOVERY_DIAGNOSIS_ATTEMPTS
+    )
+    if attempts >= max_attempts:
+        return True
+    recovery_reason = str(command.payload.get("recovery_reason") or extra.get("recovery_reason") or "").strip()
+    return recovery_reason in {
+        "wait_completion_timeout",
+        "window_chrome_only",
+        "completion_gate:window_chrome_only",
+        "worker_command_error",
+    } or state in {"", "unknown", "idle_or_running"}
 
 
 def _diagnose_keep_changes_can_collect_trace(data: dict) -> bool:
@@ -2705,6 +2848,11 @@ def _queue_wait_recovery_diagnosis(
             "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
             "resume_previous_payload": resume_payload,
             "retry_of_command_id": source_command.id,
+            "wait_observation_attempts": source_command.payload.get("wait_observation_attempts", 0),
+            "max_wait_observation_attempts": source_command.payload.get(
+                "max_wait_observation_attempts",
+                DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS,
+            ),
             "wait_recovery_diagnosis_attempts": attempts,
             "max_wait_recovery_diagnosis_attempts": max_attempts,
             "recovery_reason": recovery_reason,
@@ -2967,6 +3115,31 @@ def _should_observe_wait_failure_without_recovery(extra: dict) -> bool:
     return False
 
 
+def _wait_failure_needs_visual_diagnosis(extra: dict) -> bool:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    supervisor_reason = str(supervisor.get("reason") or "").strip()
+    error = str(extra.get("error") or "").strip()
+    if supervisor_reason == "window_chrome_only":
+        return True
+    if "only window chrome text was detected" in error:
+        return True
+    if "No explicit Trae intervention target was found" in error:
+        return True
+    if "No safe Trae intervention target was found" in error:
+        return True
+    text_sample = str(data.get("text_sample") or "").strip()
+    return bool(text_sample and _looks_like_chrome_text_sample(text_sample))
+
+
+def _looks_like_chrome_text_sample(text: str) -> bool:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return False
+    chrome = {"最小化", "最大化", "恢复", "还原", "关闭", "Minimize", "Maximize", "Restore", "Close"}
+    return len("\n".join(lines)) < 80 and all(line in chrome for line in lines)
+
+
 def _wait_failure_can_collect_trace(extra: dict) -> bool:
     if _recovery_reason(extra) != "wait_completion_timeout":
         return False
@@ -3115,6 +3288,8 @@ def _trace_copy_retry_reason(extra: dict) -> str:
         data.get("validation"),
         extra.get("trace_probe"),
         data.get("trace_probe"),
+        extra.get("output_probe"),
+        data.get("output_probe"),
     ):
         if isinstance(source, dict) and str(source.get("reason") or "").strip():
             return str(source.get("reason")).strip()

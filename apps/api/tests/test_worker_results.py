@@ -433,7 +433,7 @@ def test_wait_completion_success_queues_trace_copy():
     assert collect_log.display_message == "Supervisor 已确认 Trae CN 当前回合完成，Worker 开始获取回复内容和执行轨迹。"
 
 
-def test_wait_completion_chrome_only_requeues_observation_without_click_continue():
+def test_wait_completion_chrome_only_queues_visual_diagnosis_without_click_continue():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
     command.payload = {"prompt": "demo", "workspace_path": "project-a"}
@@ -456,25 +456,24 @@ def test_wait_completion_chrome_only_requeues_observation_without_click_continue
 
     db.refresh(job)
     db.refresh(round_)
-    wait_commands = list(
-        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)).all()
-    )
+    diagnose = _latest_command(db, WorkerCommandType.DIAGNOSE_UI)
     click_commands = list(
         db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value)).all()
     )
-    retry = [item for item in wait_commands if item.id != command.id][0]
     last_log = list(db.scalars(select(RuntimeLog).order_by(RuntimeLog.created_at)).all())[-1]
 
-    assert job.status == JobState.WAITING_TRAE
-    assert round_.status == JobState.WAITING_TRAE
-    assert retry.payload["wait_observation_attempts"] == 1
-    assert retry.payload["intervention_idle_seconds"] == 30
-    assert retry.payload["workspace_path"] == "project-a"
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert diagnose is not None
+    assert diagnose.payload["task"] == "wait_completion_state"
+    assert diagnose.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
+    assert diagnose.payload["wait_recovery_diagnosis_attempts"] == 1
+    assert diagnose.payload["workspace_path"] == "project-a"
     assert click_commands == []
-    assert "不会点击恢复按钮" in last_log.display_message
+    assert "截图诊断" in last_log.display_message
 
 
-def test_wait_completion_worker_command_error_requeues_observation_without_click_continue():
+def test_wait_completion_worker_command_error_queues_visual_diagnosis_without_click_continue():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
 
@@ -491,16 +490,13 @@ def test_wait_completion_worker_command_error_requeues_observation_without_click
     )
 
     click_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
-    retry = db.scalar(
-        select(WorkerCommand)
-        .where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)
-        .where(WorkerCommand.id != command.id)
-    )
+    diagnose = _latest_command(db, WorkerCommandType.DIAGNOSE_UI)
 
-    assert job.status == JobState.WAITING_TRAE
-    assert round_.status == JobState.WAITING_TRAE
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
     assert click_command is None
-    assert retry is not None
+    assert diagnose is not None
+    assert diagnose.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
 
 
 def test_wait_completion_observation_limit_queues_visual_diagnosis_before_manual_required():
@@ -587,6 +583,61 @@ def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete(
         == "resume_diagnosis_keep_changes_complete"
     )
     assert manual_error is None
+
+
+def test_wait_completion_diagnosis_uncertain_probes_trace_before_waiting_again():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+        "resume_previous_payload": {"prompt": "demo"},
+        "recovery_reason": "wait_completion_timeout",
+        "wait_recovery_diagnosis_attempts": 1,
+        "max_wait_recovery_diagnosis_attempts": 2,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "idle_or_running",
+                "reason": "ai_visual_no_action",
+                "output_probe": {"complete_like": False, "reason": "missing_tool_trace_markers"},
+                "suggested_intervention": {},
+                "visual": {
+                    "ai_analysis": {
+                        "screen_state": "idle_or_running",
+                        "recommended_action": "wait",
+                        "risk": "safe",
+                    }
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = _latest_command(db, WorkerCommandType.COPY_LATEST_REPLY)
+    wait_retry = (
+        db.scalars(
+            select(WorkerCommand)
+            .where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)
+            .where(WorkerCommand.id != command.id)
+        )
+        .first()
+    )
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_command is not None
+    assert wait_retry is None
+    assert copy_command.payload["completion_observation"]["supervisor_decision"]["reason"] == "wait_diagnosis_trace_probe"
 
 
 def test_wait_completion_after_continue_reobserves_without_second_continue_command():
@@ -2403,6 +2454,97 @@ def test_copy_latest_reply_incomplete_trace_queues_visual_diagnosis_before_retry
     assert recovery_log.extra["trace_recovery_diagnosis_attempts"] == 1
     assert "截图给视觉诊断" in recovery_log.display_message
     assert "人工处理" not in recovery_log.display_message
+
+
+def test_trace_recovery_diagnosis_uncertain_retries_copy_without_waiting():
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.COPY_LATEST_REPLY.value,
+        "resume_previous_payload": {"prompt": "demo"},
+        "trace_copy_attempts": 0,
+        "max_trace_copy_attempts": 5,
+        "trace_recovery_diagnosis_attempts": 1,
+        "max_trace_recovery_diagnosis_attempts": 2,
+        "recovery_reason": "trace_too_short",
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "idle_or_running",
+                "reason": "ai_visual_no_action",
+                "output_probe": {"complete_like": False, "reason": "missing_tool_trace_markers"},
+                "suggested_intervention": {},
+                "visual": {"ai_analysis": {"screen_state": "idle_or_running", "recommended_action": "wait"}},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_retry = _latest_command(db, WorkerCommandType.COPY_LATEST_REPLY)
+    wait_retry = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)
+        .where(WorkerCommand.id != command.id)
+    )
+    click_retry = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_retry.payload["trace_copy_attempts"] == 1
+    assert wait_retry is None
+    assert click_retry is None
+
+
+def test_completed_trace_recovery_diagnosis_uncertain_aborts_after_copy_limit():
+    db = _test_session()
+    job, round_, command = _create_copy_latest_reply_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.COPY_LATEST_REPLY.value,
+        "trace_copy_attempts": 5,
+        "max_trace_copy_attempts": 5,
+        "trace_recovery_diagnosis_attempts": 2,
+        "max_trace_recovery_diagnosis_attempts": 2,
+        "recovery_reason": "trace_too_short",
+        "completion_observation": {
+            "supervisor_decision": {"action": "collect_trace", "reason": "visual_completion_detected"}
+        },
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"state": "idle_or_running", "suggested_intervention": {}, "output_probe": {"reason": "trace_too_short"}},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    wait_retry = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value))
+    click_retry = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.TRACE_MISSING_ABORT))
+
+    assert job.status == JobState.TRACE_MISSING_ABORT
+    assert round_.status == JobState.TRACE_MISSING_ABORT
+    assert round_.trace_status == "trace_unavailable_after_completed:trace_too_short"
+    assert wait_retry is None
+    assert click_retry is None
+    assert log is not None
 
 
 def test_click_continue_success_queues_wait_completion_again():
