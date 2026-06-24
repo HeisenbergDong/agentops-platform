@@ -2,7 +2,7 @@ from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import text
 
-from app.api import admin, attachments, auth, errors, jobs, roles, rules, settings, workers
+from app.api import admin, attachments, auth, errors, jobs, local_feishu_records, roles, rules, settings, workers
 from app.core.config import settings as app_settings
 from app.db.bootstrap import bootstrap_database
 from app.db.session import SessionLocal
@@ -27,6 +27,7 @@ def create_app() -> FastAPI:
     app.include_router(workers.router, prefix="/api/workers", tags=["workers"])
     app.include_router(attachments.router, prefix="/api/attachments", tags=["attachments"])
     app.include_router(errors.router, prefix="/api/errors", tags=["errors"])
+    app.include_router(local_feishu_records.router, prefix="/api/local-feishu-records", tags=["local-feishu-records"])
 
     @app.on_event("startup")
     def startup() -> None:

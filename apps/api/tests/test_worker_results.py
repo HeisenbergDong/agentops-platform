@@ -541,6 +541,54 @@ def test_wait_completion_observation_limit_queues_visual_diagnosis_before_manual
     assert manual_error is None
 
 
+def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+        "resume_previous_payload": {"prompt": "demo"},
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "awaiting_keep_changes",
+                "reason": "ai_visual_target_rejected:action_mismatch",
+                "output_probe": {"complete_like": False, "reason": "missing_tool_trace_markers"},
+                "suggested_intervention": {},
+                "visual": {
+                    "ai_analysis": {
+                        "screen_state": "awaiting_keep_changes",
+                        "recommended_action": "click_keep_button",
+                        "risk": "safe",
+                        "confidence": 0.96,
+                    }
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = _latest_command(db, WorkerCommandType.COPY_LATEST_REPLY)
+    manual_error = db.scalar(select(AutomationError).where(AutomationError.kind == "manual_required"))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert (
+        copy_command.payload["completion_observation"]["supervisor_decision"]["reason"]
+        == "resume_diagnosis_keep_changes_complete"
+    )
+    assert manual_error is None
+
+
 def test_wait_completion_after_continue_reobserves_without_second_continue_command():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)

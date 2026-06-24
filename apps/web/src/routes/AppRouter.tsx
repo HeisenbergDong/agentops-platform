@@ -3,6 +3,7 @@ import {
   ApartmentOutlined,
   ControlOutlined,
   DashboardOutlined,
+  FileTextOutlined,
   LogoutOutlined,
   RobotOutlined,
   SettingOutlined,
@@ -16,6 +17,7 @@ import { AdminUsersPage } from "../pages/Admin/AdminUsersPage";
 import { DashboardPage } from "../pages/Dashboard/DashboardPage";
 import { ErrorsPage } from "../pages/Errors/ErrorsPage";
 import { JobsPage } from "../pages/Jobs/JobsPage";
+import { LocalFeishuRecordsPage } from "../pages/LocalFeishuRecords/LocalFeishuRecordsPage";
 import { LoginPage } from "../pages/Login/LoginPage";
 import { RolesPage } from "../pages/Roles/RolesPage";
 import { RulesPage } from "../pages/Rules/RulesPage";
@@ -48,6 +50,7 @@ function Shell() {
     { key: "/rules", icon: <ControlOutlined />, label: <Link to="/rules">规则中心</Link> },
     { key: "/workers", icon: <RobotOutlined />, label: <Link to="/workers">Worker</Link> },
     { key: "/errors", icon: <AlertOutlined />, label: <Link to="/errors">异常中心</Link> },
+    { key: "/local-feishu-records", icon: <FileTextOutlined />, label: <Link to="/local-feishu-records">本地记录</Link> },
     { key: "/settings", icon: <SettingOutlined />, label: <Link to="/settings">用户配置</Link> },
     ...(user.role === "admin"
       ? [{ key: "/admin/users", icon: <UserAddOutlined />, label: <Link to="/admin/users">用户管理</Link> }]
@@ -78,6 +81,7 @@ function Shell() {
             <Route path="/rules" element={<RulesPage />} />
             <Route path="/workers" element={<WorkersPage />} />
             <Route path="/errors" element={<ErrorsPage />} />
+            <Route path="/local-feishu-records" element={<LocalFeishuRecordsPage />} />
             <Route path="/settings" element={<SettingsPage />} />
             <Route
               path="/admin/users"

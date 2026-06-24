@@ -515,6 +515,25 @@ body,
   max-height: 260px;
 }
 
+.local-record-search {
+  width: 260px;
+}
+
+.local-record-paths {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  margin-bottom: 12px;
+  overflow-wrap: anywhere;
+}
+
+.local-record-cell {
+  display: inline-block;
+  max-width: 100%;
+  white-space: normal;
+  overflow-wrap: anywhere;
+}
+
 .mini-log-panel {
   margin-top: 6px;
   max-height: 280px;

@@ -449,6 +449,17 @@ def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: Work
             message="Continue diagnosis says Trae is complete; collecting the full assistant trace.",
         )
         return
+    if _diagnose_keep_changes_can_collect_trace(result.data):
+        _queue_trace_collection_after_wait(
+            db,
+            command,
+            job,
+            round_,
+            diagnostic_extra,
+            {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_keep_changes_complete"}},
+            message="Continue diagnosis found completed Trae changes waiting to be kept; collecting the full assistant trace.",
+        )
+        return
     if suggested and not _diagnosis_suggests_continue_recovery(suggested):
         _queue_wait_observation_retry(
             db,
@@ -676,6 +687,21 @@ def _diagnose_output_probe_can_collect_trace(output_probe: dict) -> bool:
     if output_probe.get("complete_like") is True:
         return True
     return str(output_probe.get("reason") or "") == "ok"
+
+
+def _diagnose_keep_changes_can_collect_trace(data: dict) -> bool:
+    if not isinstance(data, dict):
+        return False
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    state = str(data.get("state") or ai_analysis.get("screen_state") or "").strip()
+    recommended = str(ai_analysis.get("recommended_action") or "").strip()
+    risk = str(ai_analysis.get("risk") or "safe").strip()
+    if state not in {"awaiting_keep_changes", "awaiting_save"}:
+        return False
+    if recommended not in {"click_keep_button", "click_save_button"}:
+        return False
+    return risk in {"", "safe"}
 
 
 def _send_prompt_recovery_reason(extra: dict) -> str:
