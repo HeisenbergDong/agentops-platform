@@ -808,6 +808,8 @@ def _send_prompt_wait_context_from_diagnosis(command: WorkerCommand) -> dict:
 def _diagnose_resume_display_message(state: str, data: dict) -> str:
     if state == "completed":
         return "Worker 已截图并诊断 Trae 当前状态：看起来已经完成，调度会先获取回复轨迹。"
+    if _diagnose_keep_changes_can_collect_trace(data):
+        return "Worker 已截图并诊断 Trae 当前状态：任务已完成并等待保留/采纳改动，调度会先获取回复轨迹。"
     suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
     if str(suggested.get("mode") or "") == "manual-required" or str(suggested.get("risk") or "") == "blocked":
         return "Worker 已截图并诊断 Trae 当前状态：界面需要人工确认，调度已停止自动点击。"
