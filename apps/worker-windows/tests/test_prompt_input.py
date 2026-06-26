@@ -348,6 +348,93 @@ def test_send_prompt_does_not_click_send_again_after_unverified_click(monkeypatc
     assert probe_calls["count"] == 1
 
 
+def test_send_prompt_retries_when_visual_confirms_prompt_still_in_composer(monkeypatch, tmp_path):
+    fake_window = FakeWindow([])
+    clicks: list[tuple[int, int]] = []
+    screenshot = tmp_path / "screen.png"
+    screenshot.write_bytes(b"png")
+    visual_calls = {"count": 0}
+
+    monkeypatch.setattr(prompt_module.ui_cache, "default_cache_path", lambda: tmp_path / "cache.json")
+    monkeypatch.setattr(prompt_module, "focus_trae", lambda **kwargs: {"status": "focused", "window_title": "Trae CN"})
+    monkeypatch.setattr(prompt_module, "wait_for_workspace_window_or_any", lambda **kwargs: fake_window)
+    monkeypatch.setattr(prompt_module, "_window_rect", lambda hwnd: (0, 0, 1200, 800))
+    monkeypatch.setattr(prompt_module, "_mouse_click", lambda x, y: clicks.append((x, y)))
+    monkeypatch.setattr(prompt_module, "set_clipboard_text", lambda text: None)
+    monkeypatch.setattr(prompt_module, "_send_keys", lambda keys_: None)
+    monkeypatch.setattr(prompt_module.time, "sleep", lambda seconds: None)
+    monkeypatch.setattr(prompt_module, "_verify_send_button_visual", lambda *args, **kwargs: {"status": "passed"})
+    monkeypatch.setattr(
+        prompt_module,
+        "_capture_ui_analysis_screenshot",
+        lambda **kwargs: {
+            "status": "captured",
+            "path": str(screenshot),
+            "capture": {"bounds": {"left": 0, "top": 0, "right": 1200, "bottom": 800}},
+        },
+    )
+    monkeypatch.setattr(
+        prompt_module,
+        "locate_prompt_targets",
+        lambda path, rect: {
+            "status": "found",
+            "targets": [
+                {
+                    "action": "prompt_input",
+                    "center": {"x": 240, "y": 700},
+                    "ratio": {"x": 0.2, "y": 0.875},
+                    "confidence": 0.92,
+                    "risk": "safe",
+                },
+                {
+                    "action": "send_button",
+                    "center": {"x": 500, "y": 760},
+                    "ratio": {"x": 0.417, "y": 0.95},
+                    "confidence": 0.94,
+                    "risk": "safe",
+                },
+            ],
+        },
+    )
+    monkeypatch.setattr(
+        prompt_module,
+        "_verify_prompt_submission",
+        lambda **kwargs: (_ for _ in ()).throw(prompt_module.PromptSendError("no new Trae user turn was detected")),
+    )
+
+    def fake_visual_verify(**kwargs):
+        visual_calls["count"] += 1
+        if visual_calls["count"] == 1:
+            raise prompt_module.PromptSendError(
+                "Prompt still appears to be in the Trae composer after clicking send.",
+                {
+                    "stage": "visual_submission_failed",
+                    "reason": "composer_still_has_active_send_button",
+                    "local_analysis": {
+                        "targets": [
+                            {"action": "prompt_input", "center": {"x": 240, "y": 700}, "confidence": 0.9, "risk": "safe"},
+                            {"action": "send_button", "center": {"x": 500, "y": 760}, "confidence": 0.9, "risk": "safe"},
+                        ]
+                    },
+                },
+            )
+        return {"status": "visually_confirmed", "source": "local_vision", "reason": "active_send_button_disappeared"}
+
+    monkeypatch.setattr(prompt_module, "_verify_prompt_submission_visually", fake_visual_verify)
+
+    result = prompt_module.send_prompt(
+        "build it",
+        verify_submission=True,
+        verify_visual_submission=True,
+        strict_submission_verification=True,
+        submission_timeout_seconds=0.5,
+    )
+
+    assert clicks == [(312, 704), (436, 756), (240, 700), (500, 760)]
+    assert visual_calls["count"] == 2
+    assert result["automation"]["strategy"] == "local_vision"
+
+
 def test_send_prompt_uses_ai_vision_when_default_target_fails_before_click(monkeypatch, tmp_path):
     fake_window = FakeWindow([])
     clicks: list[tuple[int, int]] = []
@@ -496,6 +583,24 @@ def test_local_vision_finds_muted_green_send_button(tmp_path):
     assert "prompt_input" in actions
     assert "send_button" in actions
     assert 660 <= actions["send_button"]["center"]["x"] <= 730
+    assert 940 <= actions["send_button"]["center"]["y"] <= 990
+
+
+def test_local_vision_finds_send_button_in_wider_composer(tmp_path):
+    path = tmp_path / "trae-wide-composer.png"
+    image = Image.new("RGB", (1800, 1033), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((250, 820, 1300, 1015), fill=(42, 43, 48), outline=(65, 66, 72))
+    draw.rectangle((1180, 950, 1220, 984), fill=(36, 74, 57))
+    image.save(path)
+
+    result = locate_prompt_targets(path, (0, 0, 1800, 1033))
+
+    actions = {item["action"]: item for item in result["targets"]}
+    assert result["status"] == "found"
+    assert "prompt_input" in actions
+    assert "send_button" in actions
+    assert 1160 <= actions["send_button"]["center"]["x"] <= 1240
     assert 940 <= actions["send_button"]["center"]["y"] <= 990
 
 

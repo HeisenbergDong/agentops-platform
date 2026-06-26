@@ -59,11 +59,7 @@ FIRST_ROUND_TEMPLATE_PREFIXES = (
     "基于这个项目方向做一个能继续迭代的系统雏形",
 )
 PROMPT_WRITER_RETRY_LIMIT = 1
-TRAE_SELF_TEST_GUARD = (
-    "执行边界：你只负责完成代码改动和说明复查路径，不要自行启动开发服务器、"
-    "不要运行浏览器验收，也不要运行耗时测试或构建；需要验证时只写出建议命令和预期结果，"
-    "我后续统一执行。"
-)
+CONCISE_FAST_SCOPE_NOTE = "这轮保持小范围，把改动和建议复查方式说清楚即可。"
 PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。你不能直接写飞书，不能决定作业完成，只负责给编码助手的本轮或下一轮用户提示词提案。
 要求：
 1. 你是长期任务设计角色，不是简单改写器。调度会告诉你当前范围、轮次、模式和范围计划，你只为当前范围生成当前轮 Trae prompt。
@@ -76,9 +72,10 @@ PROMPT_WRITER_SYSTEM = """你是自动化作业里的“提示词策略员”。
 8. 上一轮满意时，不硬找问题，选择当前范围 module_map 里未覆盖或覆盖不足的下一个自然模块继续扩展。
 9. 上一轮不满意时，把用户可见问题转换成自然开发要求，不复述原文，不写内部工具问题。
 10. 不能在提示词里出现“产物不满意”“过程不满意”“结果不满意”“不满意原因”“证据：”“日志”“轨迹”“扫描”“工具调用”“watcher”“trace”“session”“LLM”“AI”。
-11. 提示词要像真实用户给开发助手的需求：明确现象、期望结果、复查路径。
+11. 提示词要像真实用户给开发助手的需求：明确现象、期望结果和必要复查路径，但不要套固定交付模板。
 12. 如果上一轮问题是内部证据不足、轨迹缺失、GitHub/飞书链路失败，除非当前产品本身就是 AgentOps，否则不要让编码助手修这些内部链路，而要回到当前业务系统的可验证交互或工程交付。
-13. 不要让 Trae 自行启动开发服务器、运行浏览器验收或跑耗时测试/构建；提示词里只要求说明建议命令、预期结果和页面复查路径，平台后续会统一验收。
+13. 调度会提供 prompt_delivery_policy。只有当 policy 明确要求 fast_scope 或 command_note 时，才用一句自然话轻轻收住范围；不要默认写“执行边界”、不要默认禁止测试/构建/打开页面。
+14. 避免统一话术。不要每轮固定要求“入口文件、主要目录结构、建议运行命令、默认访问路径”等长清单；只写当前任务真正相关的交付说明。
 只输出 JSON：{"prompt": "...", "prompt_kind": "bugfix|feature|workflow|edge_case|engineering|closure", "focus": "...", "acceptance_checks": ["..."], "difference_from_previous": "...", "used_module": "...", "should_scheduler_consider_switch": false, "reason": "..."}"""
 
 PROMPT_WRITER_SYSTEM += """
@@ -88,8 +85,8 @@ AgentOps 流程上下文：
 - 发给 Trae 的提示词必须像普通用户的开发需求，不要写成内部调度指令。
 - 如果本轮是暂停后的继续，请让 Trae 从中断点继续，保留已有文件和结构，避免从零重做。
 - 不要提到内部轨迹门禁、Worker 停止报告、调度状态或证据提交，除非正在开发的产品本身就是 AgentOps 且这些是真实产品功能。
-- Trae 不要自己跑测试、构建、浏览器验收或启动长时间服务；让它写清建议命令和复查路径即可。
-- 编码环境是 Windows PowerShell；如果提示词提到 Node.js 验证命令，请要求先把 npm 缓存设到当前项目的 .npm-cache，再使用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd 或 cmd /c，避免被 npm.ps1 执行策略拦截和全局缓存沙箱限制。
+- 不要把一次性的运行/测试限制当成每轮模板。普通任务优先写需求本身；需要收范围时，只用自然短句。
+- Windows PowerShell 的 Node.js 命令提示只在 policy 要求且 prompt 里确实涉及 npm/npx/pnpm/yarn/vite 等命令时出现。
 """.strip()
 
 
@@ -135,6 +132,7 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
     current_direction = _current_direction(job)
     visible_directions = _visible_directions_for_prompt(job)
     prompt_intent = _prompt_writer_intent(job, current_direction)
+    delivery_policy = _prompt_delivery_policy(job, round_)
     state = _compact_prompt_state(db, job, round_, previous_reason)
     current = _current_task(job, round_, previous_reason)
     meta = _prompt_meta(job, round_)
@@ -164,8 +162,8 @@ def generate_round_prompt(db: Session, user: User, job: Job, round_: TaskRound) 
                         "must_generate_medium_sized_tasks": True,
                         "must_not_repeat_same_bug_loop": True,
                         "satisfied_round_should_expand_next_module": True,
-                        "must_not_run_self_tests": True,
                     },
+                    "prompt_delivery_policy": delivery_policy,
                     "state": state,
                     "current": current,
                     "meta": meta,
@@ -339,8 +337,10 @@ def _prompt_quality_feedback_payload(job: Job, round_: TaskRound, rejected_promp
             "请根据 quality_reason 重新生成一个完全合格的 JSON。只输出 JSON，不要解释。"
             "新 prompt 必须只围绕 current_direction，避开 queued directions、内部调度词、质量门禁止词，"
             "保持中等任务粒度，并像普通用户给开发助手的需求。"
+            "不要把执行边界、测试限制、命令提示或页面路径写成固定模板；只有 prompt_delivery_policy 明确要求时才自然带一句。"
         ),
         "current_direction": _current_direction(job),
+        "prompt_delivery_policy": _prompt_delivery_policy(job, round_),
         "direction_queue": _direction_queue_meta(job),
         "round_index": round_.round_index,
     }
@@ -358,6 +358,9 @@ def _quality_error_explanation(quality_error: str) -> str:
     if quality_error.startswith("prompt_reuses_template_phrase:"):
         target = quality_error.split(":", 1)[1]
         return f"提示词复用了不适合直接发给开发助手的模板句：{target}。需要换成自然业务需求。"
+    if quality_error.startswith("prompt_contains_operational_boilerplate:"):
+        target = quality_error.split(":", 1)[1]
+        return f"提示词出现了模板化执行边界或通用验收话术：{target}。请只保留当前任务相关要求，用自然用户口吻重写。"
     explanations = {
         "first_round_template_prefix": "第一轮提示词不能套用过泛模板，要直接给出当前业务范围的可操作系统骨架。",
         "first_round_too_small": "第一轮任务太小，不能只是单页、小 demo 或极简改动。",
@@ -412,7 +415,7 @@ def build_fallback_prompt(
             "统计区或概览区要跟当前数据变化联动，不要只是写死装饰数字",
         ],
         data="先用本地模拟数据或轻量接口组织业务对象，字段要能支撑列表、详情、状态、负责人、时间和操作记录。",
-        verification="完成后不要自行启动服务或跑测试；请说明建议检查命令、预期结果和还能人工复查的页面路径。",
+        verification="完成后简要说明建议检查命令、预期结果和还能人工复查的页面路径。",
     )
 
 
@@ -427,17 +430,15 @@ def _test_smoke_prompt(direction: str, intent: dict) -> str:
     base = text or "AgentOps E2E smoke: create a tiny README or static page that says AgentOps E2E smoke OK."
     return _naturalize_prompt(
         f"{base}\n\n"
-        "测试约束：只做最小可复查改动，不要运行耗时测试、构建或浏览器验收；"
+        "测试说明：只做最小可复查改动，方便平台快速跑通后续链路；"
         "完成后用一两句中文列出改动文件。"
-        f"{_windows_node_command_note()}"
     )
 
 
 def _windows_node_command_note() -> str:
     return (
-        "Windows 命令提示：如果在 PowerShell 里运行 Node.js 工具，先执行 "
-        "`$env:npm_config_cache = \"$PWD\\.npm-cache\"`，再使用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd "
-        "或 cmd /c 命令；不要直接使用 npm/npx/pnpm/yarn，也不要使用全局或用户级 npm 缓存。"
+        "如果需要给 Node.js 命令，按 Windows PowerShell 写法给：先设置 "
+        "`$env:npm_config_cache = \"$PWD\\.npm-cache\"`，再用 npm.cmd/npx.cmd/pnpm.cmd/yarn.cmd 或 cmd /c。"
     )
 
 
@@ -455,14 +456,9 @@ def _append_windows_command_note(prompt: str) -> str:
 
 def _append_trae_self_test_guard(prompt: str) -> str:
     text = str(prompt or "").strip()
-    has_guard = (
-        ("不要自行启动开发服务器" in text and "不要运行浏览器验收" in text)
-        or ("不要运行耗时测试" in text and "浏览器验收" in text)
-        or ("不要自行启动服务" in text and "跑测试" in text)
-    )
-    if has_guard:
+    if CONCISE_FAST_SCOPE_NOTE in text:
         return text
-    return _naturalize_prompt(f"{text}\n\n{TRAE_SELF_TEST_GUARD}")
+    return _naturalize_prompt(f"{text}\n\n{CONCISE_FAST_SCOPE_NOTE}")
 
 
 def append_windows_command_note(prompt: str) -> str:
@@ -478,6 +474,89 @@ def _strip_foreign_windows_command_note(prompt: str) -> str:
     for pattern in patterns:
         text = re.sub(pattern, "", text, flags=re.IGNORECASE | re.DOTALL)
     return text.replace("Windows command note:", "").strip()
+
+
+def _prompt_delivery_policy(job: Job, round_: TaskRound) -> dict:
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    flags = {str(item).strip() for item in intent.get("flags") or [] if str(item).strip()}
+    run_mode = str(intent.get("run_mode") or "normal").strip().lower()
+    fast_scope = bool(
+        run_mode == "test"
+        or flags
+        & {
+            "quick_prompt",
+            "single_page_quick",
+            "chain_validation_only",
+            "skip_trae_self_tests",
+            "test_run",
+            "test_start_button",
+        }
+    )
+    direction_text = " ".join([_current_direction(job), _directions_text(job.directions), str(intent.get("prompt_brief") or "")])
+    node_context = bool(re.search(r"\b(node|npm|npx|pnpm|yarn|vite|react|vue|next\.?js)\b", direction_text, flags=re.IGNORECASE))
+    return {
+        "style": "natural_brief",
+        "focus": "write task-specific instructions first; avoid boilerplate",
+        "fast_scope": fast_scope,
+        "command_note": "node_powershell_only_when_prompt_mentions_node_commands" if node_context or fast_scope else "omit",
+        "avoid": [
+            "repeated execution boundaries",
+            "default test/build/browser prohibitions",
+            "irrelevant route checklist",
+            "fixed delivery checklist",
+        ],
+        "review": "scheduler should reject prompts that read like a policy template instead of a user request",
+    }
+
+
+def _apply_prompt_delivery_policy(prompt: str, job: Job, round_: TaskRound) -> tuple[str, dict]:
+    policy = _prompt_delivery_policy(job, round_)
+    text = _strip_legacy_operational_boilerplate(_strip_foreign_windows_command_note(str(prompt or "").strip()))
+    applied: list[str] = []
+    if policy.get("fast_scope") and CONCISE_FAST_SCOPE_NOTE not in text:
+        text = _append_trae_self_test_guard(text)
+        applied.append("fast_scope_note")
+    if policy.get("command_note") != "omit" and _prompt_mentions_node_tooling(text):
+        text = _append_windows_command_note(text)
+        applied.append("node_powershell_note")
+    return _naturalize_prompt(text), {**policy, "applied": applied}
+
+
+def _prompt_mentions_node_tooling(prompt: str) -> bool:
+    return bool(re.search(r"\b(npm|npx|pnpm|yarn|vite|node)\b", str(prompt or ""), flags=re.IGNORECASE))
+
+
+def _strip_legacy_operational_boilerplate(prompt: str) -> str:
+    text = str(prompt or "")
+    patterns = (
+        r"执行边界[:：][^。！？]*(?:我后续统一执行|统一执行)[。！？]?",
+        r"不要自行启动开发服务器、?不要运行浏览器验收[^。！？]*[。！？]?",
+        r"不要自行启动服务或跑测试[；;，,]?",
+        r"不要运行耗时测试或构建[；;，,]?",
+        r"需要验证时只写出建议命令和预期结果[，,]?",
+    )
+    for pattern in patterns:
+        text = re.sub(pattern, "", text)
+    return re.sub(r"\s+", " ", text).strip(" ；;，,。")
+
+
+def _contains_legacy_operational_boilerplate(prompt: str) -> str:
+    text = str(prompt or "")
+    phrases = (
+        "执行边界",
+        "我后续统一执行",
+        "不要自行启动开发服务器",
+        "不要运行浏览器验收",
+        "不要运行耗时测试或构建",
+        "完成后请写清：实际入口文件",
+        "默认访问路径、/jobs、/candidates、/interviews",
+    )
+    for phrase in phrases:
+        if phrase in text:
+            return phrase
+    if text.count("完成后") >= 3:
+        return "完成后"
+    return ""
 
 
 def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason: str = "") -> str:
@@ -499,7 +578,7 @@ def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason:
                 "补上失败提示、空数据反馈或边界状态，保证用户能看懂当前结果",
             ],
             data="沿用当前项目已有的数据结构；如果字段不足，可以补少量必要字段，但不要把业务重做成另一个系统。",
-            verification="完成后不要自行启动服务或跑测试；请说明从哪个页面入口复查、怎么操作、操作后应该看到什么变化，以及建议检查命令。",
+            verification="完成后说明从哪个页面入口复查、怎么操作、操作后应该看到什么变化，以及建议检查命令。",
         )
     module_prompt = _module_map_followup_prompt(job, round_, topic)
     if module_prompt:
@@ -520,7 +599,7 @@ def build_followup_fallback_prompt(job: Job, round_: TaskRound, previous_reason:
             "保留已有结构和页面风格，避免从零重建",
         ],
         data="继续使用当前项目的数据模型，必要时补模拟数据、状态枚举和操作记录。",
-        verification="完成后不要自行启动服务或跑测试；请在最终回复里写清楚复查路径、建议检查命令和预期结果。",
+        verification="完成后写清楚复查路径、建议检查命令和预期结果。",
     )
 
 
@@ -547,7 +626,7 @@ def _module_map_followup_prompt(job: Job, round_: TaskRound, topic: str) -> str:
             "补空状态、校验失败和成功反馈，保证复查时能看出真实流程",
         ],
         data="沿用当前项目已有模拟数据或接口组织方式，补足这个模块需要的字段、状态和关联记录。",
-        verification="完成后不要自行启动服务或跑测试；请说明复查入口、关键操作路径、建议检查命令和预期结果。",
+        verification="完成后说明复查入口、关键操作路径、建议检查命令和预期结果。",
     )
 
 
@@ -569,7 +648,7 @@ def _structured_prompt(
         f"交互要求：\n{items}\n\n"
         f"数据和结构：{data} 代码要拆成合理的组件、页面、数据或接口文件，方便后续继续迭代。\n\n"
         f"验收方式：{verification}\n\n"
-        "完成后用中文简要说明改了哪些关键文件、怎么运行、从哪个页面复查。"
+        "收尾时用中文简单说一下主要改动，以及后面从哪里复查比较合适。"
     )
     return _naturalize_prompt(prompt)
 
@@ -590,6 +669,9 @@ def prompt_quality_error(db: Session | None, job: Job, round_: TaskRound, prompt
             continue
         if pattern.search(text):
             return f"prompt_contains_internal_process:{pattern.pattern}"
+    legacy_boilerplate = _contains_legacy_operational_boilerplate(text)
+    if legacy_boilerplate:
+        return f"prompt_contains_operational_boilerplate:{legacy_boilerplate}"
     if other_direction := _queued_other_direction_mention(job, text):
         return f"prompt_mentions_other_direction:{other_direction}"
     if _is_new_project_first_round(round_):
@@ -671,8 +753,7 @@ def _store_prompt(
     wire_api: str,
     extra: dict | None = None,
 ) -> str:
-    prompt = _append_windows_command_note(prompt)
-    prompt = _append_trae_self_test_guard(prompt)
+    prompt, delivery_policy = _apply_prompt_delivery_policy(prompt, job, round_)
     round_.prompt = prompt
     round_.status = JobState.PROMPT_READY
     job.status = JobState.PROMPT_READY
@@ -681,6 +762,7 @@ def _store_prompt(
         "wire_api": wire_api,
         "prompt_chars": len(prompt),
         "prompt_preview": _prompt_preview(prompt),
+        "prompt_delivery_policy": delivery_policy,
     }
     if extra:
         log_extra.update(extra)

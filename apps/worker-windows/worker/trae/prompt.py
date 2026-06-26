@@ -484,7 +484,7 @@ def _send_prompt_with_adaptive_targets(
             ready_result.setdefault("automation", {})["attempts"] = attempts
             ready_result["automation"]["new_task"] = new_task_result
             return ready_result
-        if _attempt_clicked_send_then_failed_verification(ready_result):
+        if _should_stop_after_send_verification_failure(ready_result):
             ready_result.setdefault("automation", {})["attempts"] = attempts
             ready_result["automation"]["new_task"] = new_task_result
             ready_result["reason"] = "send_clicked_but_unverified_no_retry"
@@ -512,7 +512,7 @@ def _send_prompt_with_adaptive_targets(
             result.setdefault("automation", {})["attempts"] = attempts
             result["automation"]["new_task"] = new_task_result
             return result
-        if _attempt_clicked_send_then_failed_verification(result):
+        if _should_stop_after_send_verification_failure(result):
             result.setdefault("automation", {})["attempts"] = attempts
             result["automation"]["new_task"] = new_task_result
             result["reason"] = "send_clicked_but_unverified_no_retry"
@@ -547,7 +547,7 @@ def _send_prompt_with_adaptive_targets(
             local_result["automation"]["local_analysis"] = local_analysis
             local_result["automation"]["new_task"] = new_task_result
             return local_result
-        if _attempt_clicked_send_then_failed_verification(local_result):
+        if _should_stop_after_send_verification_failure(local_result):
             local_result.setdefault("automation", {})["attempts"] = attempts
             local_result["automation"]["screenshot"] = screenshot_info
             local_result["automation"]["local_analysis"] = local_analysis
@@ -597,7 +597,7 @@ def _send_prompt_with_adaptive_targets(
                 ai_result["automation"]["ai_analysis"] = ai_analysis
                 ai_result["automation"]["new_task"] = new_task_result
                 return ai_result
-            if _attempt_clicked_send_then_failed_verification(ai_result):
+            if _should_stop_after_send_verification_failure(ai_result):
                 ai_result.setdefault("automation", {})["attempts"] = attempts
                 ai_result["automation"]["screenshot"] = screenshot_info
                 ai_result["automation"]["local_analysis"] = local_analysis
@@ -1560,6 +1560,29 @@ def _attempt_clicked_send_then_failed_verification(result: dict[str, Any]) -> bo
         return False
     submit = result.get("submit") if isinstance(result.get("submit"), dict) else {}
     return submit.get("click_x") is not None and submit.get("click_y") is not None
+
+
+def _should_stop_after_send_verification_failure(result: dict[str, Any]) -> bool:
+    if not _attempt_clicked_send_then_failed_verification(result):
+        return False
+    return not _verification_failure_confirms_prompt_still_in_composer(result)
+
+
+def _verification_failure_confirms_prompt_still_in_composer(result: dict[str, Any]) -> bool:
+    details = result.get("details") if isinstance(result.get("details"), dict) else {}
+    reason = str(details.get("reason") or "")
+    screen_state = str(details.get("screen_state") or "")
+    if reason in {"composer_still_has_active_send_button", "ai_detected_prompt_input_and_send_button"}:
+        return True
+    if screen_state == "prompt_still_in_composer":
+        return True
+    local_analysis = details.get("local_analysis") if isinstance(details.get("local_analysis"), dict) else {}
+    if _local_visual_submission_state(local_analysis).get("status") == "failed":
+        return True
+    ai_analysis = details.get("ai_analysis") if isinstance(details.get("ai_analysis"), dict) else {}
+    if _ai_visual_submission_state(ai_analysis).get("status") == "failed" and str(ai_analysis.get("screen_state") or "") == "prompt_still_in_composer":
+        return True
+    return False
 
 
 def _last_attempt_error(attempts: list[dict[str, Any]]) -> str:

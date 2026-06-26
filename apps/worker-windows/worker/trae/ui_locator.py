@@ -97,7 +97,7 @@ def locate_prompt_targets(
     input_target = _find_prompt_input_area(image, window_rect)
     if input_target:
         targets.append(input_target)
-    send_target = _find_green_send_button(image, window_rect)
+    send_target = _find_green_send_button(image, window_rect, input_target=input_target)
     if send_target:
         targets.append(send_target)
     status = "found" if _has_actions(targets, {"prompt_input", "send_button"}) else "partial" if targets else "not_found"
@@ -169,9 +169,9 @@ def validate_target(
         height = max(1, bottom - top)
         rx = (x - left) / width
         ry = (y - top) / height
-        if action == "prompt_input" and not (0.0 <= rx <= 0.45 and 0.65 <= ry <= 0.98):
+        if action == "prompt_input" and not (0.0 <= rx <= 0.72 and 0.65 <= ry <= 0.98):
             return False, "prompt_input_outside_expected_region"
-        if action == "send_button" and not (0.20 <= rx <= 0.55 and 0.75 <= ry <= 0.99):
+        if action == "send_button" and not (0.08 <= rx <= 0.86 and 0.72 <= ry <= 0.99):
             return False, "send_button_outside_expected_region"
         if action == "copy_trace_button" and not (0.0 <= rx <= 0.42 and 0.16 <= ry <= 0.96):
             return False, "copy_trace_button_outside_assistant_region"
@@ -268,38 +268,54 @@ def _looks_like_prompt_input_panel(image: Image.Image, cx: int, cy: int) -> bool
                 green_pixels += 1
     panel_ratio = panel_pixels / max(1, samples)
     border_ratio = border_pixels / max(1, samples)
-    return panel_ratio >= 0.18 and (border_pixels >= 8 or border_ratio >= 0.02 or green_pixels >= 10)
+    return panel_ratio >= 0.55 or (
+        panel_ratio >= 0.18 and (border_pixels >= 8 or border_ratio >= 0.02 or green_pixels >= 10)
+    )
 
 
-def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int, int]) -> dict[str, Any] | None:
+def _find_green_send_button(
+    image: Image.Image,
+    window_rect: tuple[int, int, int, int],
+    *,
+    input_target: dict[str, Any] | None = None,
+) -> dict[str, Any] | None:
     left, top, right, bottom = window_rect
     width = max(1, right - left)
     height = max(1, bottom - top)
-    scan_left = int(width * 0.25)
-    scan_right = int(width * 0.45)
-    scan_top = int(height * 0.86)
-    scan_bottom = int(height * 0.97)
+    input_center = input_target.get("center") if isinstance(input_target, dict) and isinstance(input_target.get("center"), dict) else {}
+    input_ratio = input_target.get("ratio") if isinstance(input_target, dict) and isinstance(input_target.get("ratio"), dict) else {}
+    try:
+        input_rx = float(input_ratio.get("x"))
+    except (TypeError, ValueError):
+        input_rx = PROMPT_INPUT_X_RATIO
+    try:
+        input_ry = float(input_ratio.get("y"))
+    except (TypeError, ValueError):
+        input_ry = PROMPT_INPUT_Y_RATIO
+    try:
+        input_x = int(float(input_center.get("x"))) - left
+    except (TypeError, ValueError):
+        input_x = int(width * input_rx)
+
+    scan_left = max(0, int(min(width * 0.08, input_x - width * 0.18)))
+    scan_right = min(image.width, int(max(width * 0.86, input_x + width * 0.34)))
+    scan_top = max(0, int(max(height * 0.72, height * (input_ry - 0.08))))
+    scan_bottom = min(image.height, int(height * 0.985))
     pixels = image.load()
-    clusters: list[tuple[int, int, int]] = []
+    green_points: list[tuple[int, int, int]] = []
     step = 2
     for y in range(scan_top, min(scan_bottom, image.height), step):
         for x in range(scan_left, min(scan_right, image.width), step):
             red, green, blue = pixels[x, y]
-            if green >= 60 and green > red * 1.2 and green > blue * 1.05:
-                clusters.append((x, y, green - max(red, blue)))
-    if len(clusters) < 20:
+            if _looks_like_send_green_pixel(red, green, blue):
+                green_points.append((x, y, green - max(red, blue)))
+    candidates = _green_send_button_candidates(green_points, image, window_rect)
+    if not candidates:
         return None
-    total_weight = sum(max(1, item[2]) for item in clusters)
-    cx = int(sum(item[0] * max(1, item[2]) for item in clusters) / total_weight)
-    cy = int(sum(item[1] * max(1, item[2]) for item in clusters) / total_weight)
-    spread_x = max(item[0] for item in clusters) - min(item[0] for item in clusters)
-    spread_y = max(item[1] for item in clusters) - min(item[1] for item in clusters)
-    if spread_x > width * 0.10 or spread_y > height * 0.08:
-        confidence = 0.68
-    else:
-        confidence = 0.86
-    if _looks_like_stop_generation_icon(image, cx, cy):
-        return None
+    best = max(candidates, key=lambda item: item["score"])
+    cx = int(best["cx"])
+    cy = int(best["cy"])
+    confidence = min(0.92, max(0.62, best["score"]))
     return _target(
         "send_button",
         left + cx,
@@ -307,8 +323,97 @@ def _find_green_send_button(image: Image.Image, window_rect: tuple[int, int, int
         window_rect,
         confidence,
         "local_vision",
-        "green send button cluster in composer area",
+        f"green send button cluster in composer area; bbox={best['bbox']}; scan=adaptive",
     )
+
+
+def _looks_like_send_green_pixel(red: int, green: int, blue: int) -> bool:
+    return green >= 54 and green > red * 1.18 and green > blue * 1.04 and green - min(red, blue) >= 10
+
+
+def _green_send_button_candidates(
+    points: list[tuple[int, int, int]],
+    image: Image.Image,
+    window_rect: tuple[int, int, int, int],
+) -> list[dict[str, Any]]:
+    if len(points) < 18:
+        return []
+    left, top, right, bottom = window_rect
+    width = max(1, right - left)
+    height = max(1, bottom - top)
+    clusters = _green_pixel_clusters(points, min_points=14)
+    candidates: list[dict[str, Any]] = []
+    for cluster in clusters:
+        cx = int(cluster["cx"])
+        cy = int(cluster["cy"])
+        cluster_width = int(cluster["max_x"] - cluster["min_x"])
+        cluster_height = int(cluster["max_y"] - cluster["min_y"])
+        rx = cx / width
+        ry = cy / height
+        if not (0.08 <= rx <= 0.86 and 0.72 <= ry <= 0.99):
+            continue
+        if cluster_width < 12 or cluster_height < 10 or cluster_width > width * 0.10 or cluster_height > height * 0.10:
+            continue
+        if _looks_like_stop_generation_icon(image, cx, cy):
+            continue
+        size_score = 0.18 if 20 <= cluster_width <= 58 and 18 <= cluster_height <= 58 else 0.08
+        bottom_score = max(0.0, min(0.22, (ry - 0.72) * 0.7))
+        point_score = min(0.18, float(cluster["points"]) / 220)
+        shape_score = 0.10 if 0.55 <= cluster_width / max(1, cluster_height) <= 1.9 else 0.0
+        confidence = 0.56 + size_score + bottom_score + point_score + shape_score
+        candidates.append(
+            {
+                **cluster,
+                "bbox": [cluster["min_x"], cluster["min_y"], cluster["max_x"], cluster["max_y"]],
+                "score": confidence,
+            }
+        )
+    return candidates
+
+
+def _green_pixel_clusters(points: list[tuple[int, int, int]], min_points: int) -> list[dict[str, Any]]:
+    clusters: list[dict[str, Any]] = []
+    for x, y, weight in sorted(points, key=lambda item: (item[0], item[1])):
+        match: dict[str, Any] | None = None
+        for cluster in clusters:
+            if x < cluster["min_x"] - 24 or x > cluster["max_x"] + 24:
+                continue
+            if y < cluster["min_y"] - 24 or y > cluster["max_y"] + 24:
+                continue
+            match = cluster
+            break
+        if match is None:
+            clusters.append(
+                {
+                    "min_x": x,
+                    "max_x": x,
+                    "min_y": y,
+                    "max_y": y,
+                    "weighted_x": x * max(1, weight),
+                    "weighted_y": y * max(1, weight),
+                    "weight": max(1, weight),
+                    "points": 1,
+                }
+            )
+            continue
+        point_weight = max(1, weight)
+        match["min_x"] = min(match["min_x"], x)
+        match["max_x"] = max(match["max_x"], x)
+        match["min_y"] = min(match["min_y"], y)
+        match["max_y"] = max(match["max_y"], y)
+        match["weighted_x"] += x * point_weight
+        match["weighted_y"] += y * point_weight
+        match["weight"] += point_weight
+        match["points"] += 1
+    result: list[dict[str, Any]] = []
+    for cluster in clusters:
+        if int(cluster["points"]) < min_points:
+            continue
+        weight = max(1, int(cluster["weight"]))
+        cluster["cx"] = cluster["weighted_x"] / weight
+        cluster["cy"] = cluster["weighted_y"] / weight
+        result.append(cluster)
+    return result
 
 
 def _looks_like_stop_generation_icon(image: Image.Image, cx: int, cy: int) -> bool:

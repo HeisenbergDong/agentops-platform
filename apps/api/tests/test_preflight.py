@@ -323,8 +323,9 @@ def test_start_job_test_mode_forces_test_intent_and_short_prompt_policy(monkeypa
     assert job.intent["trace_gate_policy"] == "test_exception"
     assert "skip_trae_self_tests" in job.intent["flags"]
     assert command is not None
-    assert "不要运行耗时测试" in command.payload["prompt"]
-    assert "npm.cmd" in command.payload["prompt"]
+    assert "测试说明" in command.payload["prompt"]
+    assert "不要运行耗时测试" not in command.payload["prompt"]
+    assert "npm.cmd" not in command.payload["prompt"]
     assert "Test constraint:" not in command.payload["prompt"]
     assert "Windows command note:" not in command.payload["prompt"]
 
@@ -381,8 +382,9 @@ def test_test_mode_smoke_fallback_keeps_prompt_tiny():
     prompt = prompt_writer.build_fallback_prompt(job, round_)
 
     assert "AgentOps E2E smoke OK" in prompt
-    assert "不要运行耗时测试" in prompt
-    assert "npm.cmd" in prompt
+    assert "测试说明" in prompt
+    assert "不要运行耗时测试" not in prompt
+    assert "npm.cmd" not in prompt
     assert "Test constraint:" not in prompt
     assert "Windows command note:" not in prompt
     assert "涓氬姟妯″潡" not in prompt
@@ -408,7 +410,7 @@ def test_test_mode_prompt_does_not_duplicate_user_scope():
     prompt = prompt_writer.build_fallback_prompt(job, round_)
 
     assert prompt.count("AgentOps E2E Smoke Test") == 1
-    assert prompt.count("测试约束：") == 1
+    assert prompt.count("测试说明：") == 1
     assert len(prompt) < 520
 
 
@@ -610,7 +612,7 @@ def test_start_job_fallback_prompt_when_llm_prompt_contains_meta_phrase(monkeypa
     assert fallback_log.extra["quality_error"] == "prompt_contains_meta_phrase:产物不满意"
 
 
-def test_start_job_prompt_adds_trae_self_test_guard(monkeypatch):
+def test_start_job_prompt_keeps_normal_prompt_free_of_runtime_boilerplate(monkeypatch):
     db = _test_session()
     user = _create_user(db, "user1")
     _create_worker(db, user.id)
@@ -646,10 +648,74 @@ def test_start_job_prompt_adds_trae_self_test_guard(monkeypatch):
 
     command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
     assert command is not None
-    assert "不要自行启动开发服务器" in command.payload["prompt"]
-    assert "不要运行浏览器验收" in command.payload["prompt"]
-    assert "不要运行耗时测试或构建" in command.payload["prompt"]
-    assert "我后续统一执行" in command.payload["prompt"]
+    assert "执行边界" not in command.payload["prompt"]
+    assert "不要自行启动开发服务器" not in command.payload["prompt"]
+    assert "不要运行浏览器验收" not in command.payload["prompt"]
+    assert "不要运行耗时测试或构建" not in command.payload["prompt"]
+    assert "我后续统一执行" not in command.payload["prompt"]
+
+
+def test_prompt_writer_retries_operational_boilerplate(monkeypatch):
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _save_required_settings(db, user.id)
+    job = Job(id="job1", user_id=user.id, status=JobState.GENERATING_PROMPT, directions=["订单看板：筛选、详情和状态流转"])
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.GENERATING_PROMPT)
+    db.add_all([job, round_])
+    db.commit()
+    calls: list[str] = []
+
+    class Result:
+        def __init__(self, prompt: str, model: str):
+            self.text = json.dumps({"prompt": prompt, "prompt_kind": "feature"}, ensure_ascii=False)
+            self.raw = {}
+            self.model = model
+            self.wire_api = "responses"
+
+    class BoilerplateLLMClient:
+        def complete(self, _config, _messages, purpose=""):
+            calls.append(purpose)
+            if len(calls) == 1:
+                return Result(
+                    "请做订单看板，包含列表、详情和状态流转。执行边界：你只负责完成代码改动，不要自行启动开发服务器，我后续统一执行。",
+                    "gpt-first",
+                )
+            return Result(
+                "订单看板先把列表筛选、详情联动和状态流转做顺，操作后要能看到统计和当前记录同步变化。",
+                "gpt-retry",
+            )
+
+    monkeypatch.setattr(prompt_writer, "LLMClient", BoilerplateLLMClient)
+
+    prompt = prompt_writer.generate_round_prompt(db, user, job, round_)
+
+    retry_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "prompt_generation_retry"))
+    assert calls == ["prompt_generation", "prompt_generation_retry"]
+    assert retry_log is not None
+    assert retry_log.extra["quality_error"] == "prompt_contains_operational_boilerplate:执行边界"
+    assert "执行边界" not in prompt
+    assert "不要自行启动开发服务器" not in prompt
+    assert "我后续统一执行" not in prompt
+
+
+def test_prompt_delivery_policy_only_adds_node_note_when_prompt_has_node_command():
+    job = Job(
+        id="job1",
+        user_id="user1",
+        status=JobState.GENERATING_PROMPT,
+        directions=["前端快速修一下 Vue 页面"],
+        intent={"run_mode": "test", "flags": ["test_run", "quick_prompt"]},
+    )
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.GENERATING_PROMPT)
+
+    plain, plain_policy = prompt_writer._apply_prompt_delivery_policy("改一下页面样式，说明改动文件。", job, round_)
+    with_command, command_policy = prompt_writer._apply_prompt_delivery_policy("改完建议运行 npm install 和 npm run build。", job, round_)
+
+    assert "npm.cmd" not in plain
+    assert plain_policy["applied"] == ["fast_scope_note"]
+    assert "npm.cmd" in with_command
+    assert ".npm-cache" in with_command
+    assert command_policy["applied"] == ["fast_scope_note", "node_powershell_note"]
 
 
 def test_first_round_prompt_ignores_combined_intent_brief_for_direction_queue():
