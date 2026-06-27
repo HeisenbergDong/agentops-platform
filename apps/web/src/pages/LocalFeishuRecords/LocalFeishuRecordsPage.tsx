@@ -1,7 +1,7 @@
-import { ReloadOutlined } from "@ant-design/icons";
+import { DownloadOutlined, ReloadOutlined } from "@ant-design/icons";
 import { useQuery } from "@tanstack/react-query";
 import { useMemo, useState } from "react";
-import { Button, Card, Empty, Input, Space, Table, Tag, Typography } from "antd";
+import { Button, Card, Empty, Input, Space, Table, Tag, Typography, message } from "antd";
 import type { ColumnsType } from "antd/es/table";
 import { api } from "../../api/client";
 
@@ -41,6 +41,7 @@ const columnWidths: Record<string, number> = {
 
 export function LocalFeishuRecordsPage() {
   const [keyword, setKeyword] = useState("");
+  const [exporting, setExporting] = useState(false);
   const records = useQuery<LocalFeishuResponse>({
     queryKey: ["local-feishu-records"],
     queryFn: async () => (await api.get<LocalFeishuResponse>("/local-feishu-records")).data,
@@ -74,6 +75,21 @@ export function LocalFeishuRecordsPage() {
     render: (_value, record) => renderFieldValue(field, record.fields?.[field])
   }));
 
+  async function exportExcel() {
+    setExporting(true);
+    try {
+      const response = await api.get<Blob>("/local-feishu-records/export.xlsx", {
+        params: { keyword: keyword.trim(), limit: 1000 },
+        responseType: "blob"
+      });
+      downloadBlob(response.data, `agentops-local-records-${timestampForFilename()}.xlsx`);
+    } catch (error: any) {
+      message.error(errorMessage(error));
+    } finally {
+      setExporting(false);
+    }
+  }
+
   return (
     <Space direction="vertical" size={16} className="page">
       <Space className="toolbar" align="start">
@@ -93,6 +109,9 @@ export function LocalFeishuRecordsPage() {
           />
           <Button icon={<ReloadOutlined />} onClick={() => void records.refetch()}>
             刷新
+          </Button>
+          <Button icon={<DownloadOutlined />} loading={exporting} onClick={() => void exportExcel()}>
+            导出 Excel
           </Button>
         </Space>
       </Space>
@@ -172,4 +191,35 @@ function shortText(value: string, max: number) {
 
 function formatDateTime(value?: string) {
   return value ? new Date(value).toLocaleString("zh-CN", { hour12: false }) : "-";
+}
+
+function timestampForFilename() {
+  const now = new Date();
+  const pad = (value: number) => String(value).padStart(2, "0");
+  return [
+    now.getFullYear(),
+    pad(now.getMonth() + 1),
+    pad(now.getDate()),
+    "-",
+    pad(now.getHours()),
+    pad(now.getMinutes()),
+    pad(now.getSeconds())
+  ].join("");
+}
+
+function downloadBlob(blob: Blob, filename: string) {
+  const url = URL.createObjectURL(blob);
+  const link = document.createElement("a");
+  link.href = url;
+  link.download = filename;
+  document.body.appendChild(link);
+  link.click();
+  link.remove();
+  window.setTimeout(() => URL.revokeObjectURL(url), 0);
+}
+
+function errorMessage(error: any): string {
+  const detail = error?.response?.data?.detail;
+  if (typeof detail === "string") return detail;
+  return "导出 Excel 失败";
 }

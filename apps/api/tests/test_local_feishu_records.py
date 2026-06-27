@@ -1,12 +1,13 @@
 import json
 from pathlib import Path
+import zipfile
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
 from app.db.models import Job, User, UserConfig
 from app.db.session import Base
-from app.services.feishu.local_records import list_local_feishu_records
+from app.services.feishu.local_records import export_local_feishu_records_xlsx, list_local_feishu_records
 from app.services.orchestrator.states import JobState
 
 
@@ -57,15 +58,61 @@ def test_admin_can_read_all_local_feishu_records(tmp_path: Path):
     assert result["records"][0]["user_id"] == user.id
 
 
-def _write_record(path: Path, record_id: str, job_id: str, round_label: str) -> None:
+def test_export_local_feishu_records_xlsx_contains_full_long_fields(tmp_path: Path):
+    db = _test_session()
+    user = User(id="user1", email="user1@example.com", display_name="User 1", role="user", is_active=True)
+    path = tmp_path / "records.jsonl"
+    db.add_all(
+        [
+            user,
+            UserConfig(user_id=user.id, category="feishu", data={"write_mode": "local_file", "local_file_path": str(path)}),
+            Job(id="job1", user_id=user.id, status=JobState.ROUND_COMPLETED, directions=["demo"]),
+        ]
+    )
+    db.commit()
+    long_prompt = "请实现一个订单管理后台。" * 120
+    long_reason = "产物不满意：筛选条件缺失。\n过程不满意：没有说明验证。" * 80
+    _write_record(
+        path,
+        "record1",
+        "job1",
+        "第一轮",
+        extra_fields={
+            "User Prompt": long_prompt,
+            "不满意原因": long_reason,
+        },
+    )
+
+    workbook = export_local_feishu_records_xlsx(list_local_feishu_records(db, user))
+
+    assert workbook.startswith(b"PK")
+    output = tmp_path / "records.xlsx"
+    output.write_bytes(workbook)
+    with zipfile.ZipFile(output) as archive:
+        sheet_xml = archive.read("xl/worksheets/sheet1.xml").decode("utf-8")
+    assert "User Prompt" in sheet_xml
+    assert "不满意原因" in sheet_xml
+    assert "请实现一个订单管理后台。" in sheet_xml
+    assert "过程不满意：没有说明验证。" in sheet_xml
+
+
+def _write_record(
+    path: Path,
+    record_id: str,
+    job_id: str,
+    round_label: str,
+    extra_fields: dict | None = None,
+) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
+    fields = {"Trae Session ID": record_id, "轮次": round_label}
+    fields.update(extra_fields or {})
     with path.open("a", encoding="utf-8") as handle:
         handle.write(
             json.dumps(
                 {
                     "created_at": f"2026-06-24T00:00:0{len(record_id)}+00:00",
                     "record_id": record_id,
-                    "fields": {"Trae Session ID": record_id, "轮次": round_label},
+                    "fields": fields,
                     "metadata": {"job_id": job_id, "round_id": f"{job_id}-round"},
                 },
                 ensure_ascii=False,
