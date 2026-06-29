@@ -832,6 +832,11 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
     monkeypatch.setattr(command_runner.settings, "workspace_root", Path("D:/work"))
+    monkeypatch.setattr(
+        CommandRunner,
+        "_ensure_trae_ready_for_payload",
+        lambda self, payload, workspace_path: {"status": "focused"},
+    )
 
     result = CommandRunner(worker_id="worker-test").run(
         {
@@ -904,6 +909,11 @@ def test_wait_completion_progress_posts_worker_log(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
     monkeypatch.setattr(command_runner.settings, "workspace_root", Path("D:/work"))
+    monkeypatch.setattr(
+        CommandRunner,
+        "_ensure_trae_ready_for_payload",
+        lambda self, payload, workspace_path: {"status": "focused"},
+    )
 
     result = CommandRunner(worker_id="worker-test", worker_client=client).run(
         {
@@ -1375,8 +1385,16 @@ def test_copy_latest_reply_prefers_complete_raw_trace(monkeypatch: pytest.Monkey
         ]
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton("summary")), ("trace copy", FakeButton("trace"))])
     monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
@@ -1401,8 +1419,16 @@ def test_copy_latest_reply_uses_visual_copy_button_when_uia_has_no_copy(monkeypa
         + ("trace detail line\n" * 80)
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: (_ for _ in ()).throw(TraeAutomationError("No Trae assistant reply copy button was found")))
     monkeypatch.setattr(
@@ -1460,8 +1486,16 @@ def test_copy_latest_reply_opens_more_menu_when_copy_is_hidden(monkeypatch: pyte
         + ("trace detail line\n" * 80)
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(
         trace_copy,
@@ -1541,8 +1575,16 @@ def test_copy_latest_reply_does_not_use_local_trace_by_default(monkeypatch: pyte
         + ("trace detail line\n" * 80)
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton())])
     monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
@@ -1581,8 +1623,16 @@ def test_copy_latest_reply_uses_local_trace_only_when_explicitly_allowed(monkeyp
         + ("trace detail line\n" * 80)
     )
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [("summary copy", FakeButton())])
     monkeypatch.setattr(trace_copy, "_set_clipboard_text", lambda value: True)
@@ -1624,8 +1674,16 @@ def test_copy_latest_reply_uses_low_confidence_turn_candidate_for_local_trace(mo
     )
     seen_turns: list[dict] = []
 
-    monkeypatch.setattr(trace_copy, "focus_trae", lambda **_kwargs: {"status": "focused"})
-    monkeypatch.setattr(trace_copy, "find_trae_window", lambda **_kwargs: FakeWindow())
+    monkeypatch.setattr(
+        trace_copy,
+        "focus_trae_workspace_or_any",
+        lambda **_kwargs: {"status": "focused"},
+    )
+    monkeypatch.setattr(
+        trace_copy,
+        "wait_for_workspace_window_or_any",
+        lambda **_kwargs: FakeWindow(),
+    )
     monkeypatch.setattr(trace_copy, "scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
     monkeypatch.setattr(trace_copy, "_copy_buttons", lambda window: [])
 
