@@ -215,13 +215,6 @@ export function WorkersPage() {
             <Button icon={<SettingOutlined />}>
               <Link to="/settings#settings-worker">打开 Worker 配置</Link>
             </Button>
-            <Button
-              icon={<DownloadOutlined />}
-              loading={downloadingWorkerPackage}
-              onClick={() => void downloadWorkerPackage()}
-            >
-              下载 Windows Worker 安装包
-            </Button>
           </Space>
         </Space>
       </Card>
