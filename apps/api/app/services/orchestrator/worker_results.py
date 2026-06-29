@@ -16,6 +16,7 @@ from app.services.orchestrator.dissatisfaction import (
     DissatisfactionEvidence,
     generate_dissatisfaction_reason,
 )
+from app.services.orchestrator.github_review import review_github_snapshot
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
     generate_round_prompt,
@@ -1281,9 +1282,10 @@ def _handle_capture_screenshot_result(db: Session, command: WorkerCommand, resul
         return
 
     attachment = _record_screenshot_attachment(db, command, result)
-    job.status = JobState.PRODUCT_REVIEWING
+    job.status = JobState.GITHUB_SUBMITTING
     if round_:
-        round_.status = JobState.PRODUCT_REVIEWING
+        round_.status = JobState.GITHUB_SUBMITTING
+        round_.github_status = "review_snapshot_submitting"
     add_log(
         db,
         job_id=job.id,
@@ -1297,24 +1299,16 @@ def _handle_capture_screenshot_result(db: Session, command: WorkerCommand, resul
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.PRODUCT_REVIEWING,
-        message="Screenshot gate passed; product review is the next scheduler step.",
+        message="Screenshot gate passed; GitHub review snapshot is the next scheduler step.",
         extra={"attachment_id": attachment.id, "worker_id": command.worker_id, "command_id": command.id},
     )
-    scan_command = _enqueue_worker_command(
+    _advance_to_github_review_snapshot(
         db,
         command,
-        WorkerCommandType.SCAN_PROJECT,
-        {
-            "prompt": round_.prompt if round_ else "",
-        },
-    )
-    add_log(
-        db,
-        job_id=job.id,
-        round_id=round_.id if round_ else None,
-        stage=JobState.PRODUCT_REVIEWING,
-        message="scan_project worker command queued for product review evidence.",
-        extra={"worker_id": scan_command.worker_id, "command_id": scan_command.id},
+        job,
+        round_,
+        "GitHub review snapshot will be submitted before product review.",
+        {"attachment_id": attachment.id},
     )
 
 
@@ -1467,7 +1461,7 @@ def _handle_scan_project_result(db: Session, command: WorkerCommand, result: Wor
         extra=extra,
     )
 
-    product_review = _product_review_from_data(result.data)
+    product_review = _merge_product_reviews(command.payload.get("llm_product_review"), _product_review_from_data(result.data))
     if product_review:
         add_log(
             db,
@@ -1735,6 +1729,9 @@ def _handle_git_submit_result(db: Session, command: WorkerCommand, result: Worke
 
     extra = _result_extra(command, result)
     data_status = str(result.data.get("status") or "")
+    if command.payload.get("purpose") == "review_snapshot":
+        _handle_github_review_snapshot_result(db, command, result, job, round_, extra, data_status)
+        return
     if result.status in {"ok", "success", "completed"} and data_status in {"committed", "pushed", "nothing_to_commit"}:
         job.status = JobState.FEISHU_PREPARING
         if round_:
@@ -1788,6 +1785,57 @@ def _handle_git_submit_result(db: Session, command: WorkerCommand, result: Worke
     )
 
 
+def _handle_github_review_snapshot_result(
+    db: Session,
+    command: WorkerCommand,
+    result: WorkerResult,
+    job: Job,
+    round_: TaskRound | None,
+    extra: dict,
+    data_status: str,
+) -> None:
+    if result.status in {"ok", "success", "completed"} and data_status in {"committed", "pushed", "nothing_to_commit"}:
+        if round_:
+            round_.github_status = f"review_snapshot_{data_status}"
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.GITHUB_SUBMITTING,
+            message="GitHub review snapshot submitted.",
+            extra=extra,
+        )
+        _record_github_review_snapshot(db, job, round_, command, result)
+        _advance_to_product_review_after_snapshot(db, command, job, round_, result)
+        return
+
+    command.status = "manual_required"
+    command.error = "GitHub review snapshot failed; stopping before product review."
+    _record_dissatisfaction(
+        db,
+        job,
+        round_,
+        command,
+        result,
+        JobState.GITHUB_SUBMITTING,
+        "GitHub review snapshot failed; stopping before product review.",
+        extra,
+    )
+    job.status = JobState.GITHUB_FAILED_ABORT
+    if round_:
+        round_.status = JobState.GITHUB_FAILED_ABORT
+        round_.github_status = data_status or result.status or "review_snapshot_failed"
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_FAILED_ABORT,
+        message="GitHub review snapshot failed; stopping before product review.",
+        level="error",
+        extra=extra,
+    )
+
+
 def _ensure_github_repo_for_job(db: Session, job: Job, command: WorkerCommand) -> dict:
     configs = load_user_settings(db, job.user_id)
     github_config = dict(configs.get("github", {}))
@@ -1795,6 +1843,65 @@ def _ensure_github_repo_for_job(db: Session, job: Job, command: WorkerCommand) -
         github_config["remote_url"] = command.payload["github_remote_url"]
     project_name = str(command.payload.get("project_name") or command.payload.get("github_repo_name") or "")
     return ensure_github_repository(github_config, project_name=project_name)
+
+
+def _advance_to_github_review_snapshot(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+    level: str = "info",
+) -> None:
+    job.status = JobState.GITHUB_SUBMITTING
+    if round_:
+        round_.status = JobState.GITHUB_SUBMITTING
+        round_.github_status = "review_snapshot_submitting"
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message=message,
+        level=level,
+        extra={"worker_id": command.worker_id, "command_id": command.id, **extra},
+    )
+    github_push = command.payload.get("github_push", True)
+    github_repo = _ensure_github_repo_for_job(db, job, command) if github_push else {"ok": True, "skipped": True}
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message="GitHub repository preflight completed before review snapshot.",
+        level="info" if github_repo.get("ok") else "warning",
+        extra=github_repo,
+    )
+    git_command = _enqueue_worker_command(
+        db,
+        command,
+        WorkerCommandType.GIT_SUBMIT,
+        {
+            "purpose": "review_snapshot",
+            "commit_message": _review_snapshot_commit_message(job, round_),
+            "push": github_push,
+            "remote": command.payload.get("github_remote", "origin"),
+            "remote_url": github_repo.get("remote_url") or command.payload.get("github_remote_url", ""),
+            "branch": command.payload.get("github_branch", ""),
+            "timeout": command.payload.get("github_timeout_seconds", 120),
+            "github_repo": github_repo,
+            "project_name": command.payload.get("project_name") or command.payload.get("github_repo_name") or "",
+        },
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id if round_ else None,
+        stage=JobState.GITHUB_SUBMITTING,
+        message="git_submit worker command queued for GitHub review snapshot.",
+        extra={"worker_id": git_command.worker_id, "command_id": git_command.id, "purpose": "review_snapshot"},
+    )
 
 
 def _advance_to_github_submitting(
@@ -1806,6 +1913,42 @@ def _advance_to_github_submitting(
     extra: dict,
     level: str = "info",
 ) -> None:
+    snapshot = _latest_github_review_snapshot(db, job.id, round_.id if round_ else None)
+    if snapshot and isinstance(snapshot.extra, dict):
+        snapshot_data = snapshot.extra.get("git_data") if isinstance(snapshot.extra.get("git_data"), dict) else {}
+        snapshot_result = WorkerResult(
+            command_id=str(snapshot.extra.get("command_id") or command.id),
+            worker_id=command.worker_id,
+            status="success",
+            data={**snapshot_data, "status": snapshot_data.get("status") or "pushed"},
+        )
+        job.status = JobState.FEISHU_PREPARING
+        if round_:
+            round_.status = JobState.FEISHU_PREPARING
+            round_.github_status = str(snapshot_data.get("status") or "review_snapshot")
+        if snapshot_data.get("status") in {"committed", "pushed"} and not bool(snapshot.extra.get("submitted_counted")):
+            job.submitted_count += 1
+            snapshot.extra = {**snapshot.extra, "submitted_counted": True}
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.GITHUB_SUBMITTING,
+            message="Using GitHub review snapshot for the final business record.",
+            level=level,
+            extra={"review_snapshot_log_id": snapshot.id, **extra},
+        )
+        add_log(
+            db,
+            job_id=job.id,
+            round_id=round_.id if round_ else None,
+            stage=JobState.FEISHU_PREPARING,
+            message="GitHub review snapshot gate passed; Feishu preparation is the next scheduler step.",
+            extra={"worker_id": command.worker_id, "command_id": command.id, "git_status": snapshot_result.data.get("status")},
+        )
+        _write_feishu_record(db, job, round_, command, snapshot_result)
+        return
+
     job.status = JobState.GITHUB_SUBMITTING
     if round_:
         round_.status = JobState.GITHUB_SUBMITTING
@@ -2023,6 +2166,7 @@ def _advance_after_feishu_success(
     satisfied: bool,
     decision: dict[str, object] | None = None,
 ) -> None:
+    _update_project_progress(job, round_)
     decision = decision or _next_round_decision(db, job, round_, satisfied)
     if decision["action"] == "continue_project":
         next_round = TaskRound(
@@ -2159,6 +2303,26 @@ def _next_round_decision(db: Session, job: Job, round_: TaskRound, satisfied: bo
             return {"action": "restart_project_group", "reason": "range_target_reached_but_dissatisfied", "range_target_rounds": range_target}
         return {"action": "complete_project", "reason": "range_target_reached", "range_target_rounds": range_target}
     return {"action": "continue_project", "reason": "dissatisfied_followup", "range_target_rounds": range_target}
+
+
+def _update_project_progress(job: Job, round_: TaskRound) -> None:
+    if not round_.project_id:
+        return
+    intent = dict(job.intent) if isinstance(job.intent, dict) else {}
+    progress = dict(intent.get("project_progress")) if isinstance(intent.get("project_progress"), dict) else {}
+    project_id = str(round_.project_id)
+    current = dict(progress.get(project_id)) if isinstance(progress.get(project_id), dict) else {}
+    completed_rounds = int(current.get("completed_rounds") or 0) + 1
+    current.update(
+        {
+            "project_id": project_id,
+            "completed_rounds": completed_rounds,
+            "last_round_id": round_.id,
+            "last_round_index": round_.round_index,
+        }
+    )
+    progress[project_id] = current
+    job.intent = {**intent, "project_progress": progress}
 
 
 def _would_exceed_satisfied_ratio(job: Job) -> bool:
@@ -4397,6 +4561,37 @@ def _product_review_from_data(data: dict) -> dict:
     return review if isinstance(review, dict) else {}
 
 
+def _merge_product_reviews(primary: object, secondary: object) -> dict:
+    left = primary if isinstance(primary, dict) else {}
+    right = secondary if isinstance(secondary, dict) else {}
+    if not left:
+        return dict(right)
+    if not right:
+        return dict(left)
+    result = dict(right)
+    for key in ("issues", "warnings", "evidence", "file_findings", "stack", "changed_files", "llm_process_observations"):
+        result[key] = _merged_list(left.get(key), right.get(key))
+    for key, value in left.items():
+        if key not in result or key in {"summary", "github_review"}:
+            result[key] = value
+    result["blocking_issue_count"] = len(result.get("issues") or [])
+    result["warning_count"] = len(result.get("warnings") or [])
+    if left.get("summary") and right.get("summary"):
+        result["summary"] = f"{left.get('summary')}；{right.get('summary')}"
+    return result
+
+
+def _merged_list(first: object, second: object) -> list:
+    result: list = []
+    for value in (first, second):
+        if not isinstance(value, list):
+            continue
+        for item in value:
+            if item not in result:
+                result.append(item)
+    return result
+
+
 def _product_review_has_blocking(product_review: dict | None) -> bool:
     if not isinstance(product_review, dict):
         return False
@@ -4438,6 +4633,115 @@ def _record_product_review_evidence(
     )
 
 
+def _record_github_review_snapshot(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    command: WorkerCommand,
+    result: WorkerResult,
+) -> None:
+    if not round_:
+        return
+    git_data = {**dict(result.data or {}), "review_snapshot": True, "use_commit_url": True}
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="github_review_snapshot",
+        message="GitHub review snapshot recorded for LLM product review.",
+        extra={
+            "command_id": command.id,
+            "worker_id": command.worker_id,
+            "git_data": git_data,
+            "github_url": _github_url(git_data),
+            "commit_sha": git_data.get("commit_sha") or "",
+            "submitted_counted": False,
+        },
+    )
+
+
+def _advance_to_product_review_after_snapshot(
+    db: Session,
+    command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    git_result: WorkerResult,
+) -> None:
+    if not round_:
+        return
+    product_review = _github_llm_product_review(db, job, round_, git_result)
+    job.status = JobState.PRODUCT_REVIEWING
+    round_.status = JobState.PRODUCT_REVIEWING
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.PRODUCT_REVIEWING,
+        message="GitHub review snapshot gate passed; product review is the next scheduler step.",
+        extra={
+            "github_review_snapshot": {
+                "status": git_result.data.get("status"),
+                "commit_sha": git_result.data.get("commit_sha") or "",
+                "github_url": _github_url(git_result.data or {}),
+            },
+            "llm_product_review_available": bool(product_review),
+        },
+    )
+    scan_payload = {
+        "prompt": round_.prompt or "",
+        "github_review_snapshot": {
+            "status": git_result.data.get("status"),
+            "commit_sha": git_result.data.get("commit_sha") or "",
+            "github_url": _github_url(git_result.data or {}),
+        },
+    }
+    if product_review:
+        scan_payload["llm_product_review"] = product_review
+    scan_command = _enqueue_worker_command(
+        db,
+        command,
+        WorkerCommandType.SCAN_PROJECT,
+        scan_payload,
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.PRODUCT_REVIEWING,
+        message="scan_project worker command queued for product review evidence.",
+        extra={"worker_id": scan_command.worker_id, "command_id": scan_command.id},
+    )
+
+
+def _github_llm_product_review(db: Session, job: Job, round_: TaskRound, git_result: WorkerResult) -> dict:
+    user = db.get(User, job.user_id)
+    if not user:
+        return {}
+    configs = load_user_settings(db, job.user_id)
+    github_config = dict(configs.get("github", {}))
+    if git_result.data.get("remote_url") and not github_config.get("remote_url"):
+        github_config["remote_url"] = git_result.data["remote_url"]
+    review = review_github_snapshot(
+        db,
+        user,
+        github_config=github_config,
+        git_data=git_result.data or {},
+        prompt=round_.prompt or "",
+        trace_text=_latest_trace_text(db, job.id, round_.id),
+        runtime_log_text=_runtime_log_text(db, job.id, round_.id),
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="github_llm_product_review",
+        message="GitHub LLM product review completed." if review.get("product_review") else "GitHub LLM product review did not produce blocking facts.",
+        level="warning" if (review.get("product_review") or {}).get("issues") else "info",
+        extra=review,
+    )
+    return review.get("product_review") if isinstance(review.get("product_review"), dict) else {}
+
+
 def _has_pending_product_review_evidence(db: Session, job_id: str, round_id: str | None) -> bool:
     if not round_id:
         return False
@@ -4451,6 +4755,21 @@ def _has_pending_product_review_evidence(db: Session, job_id: str, round_id: str
             )
             .limit(1)
         )
+    )
+
+
+def _latest_github_review_snapshot(db: Session, job_id: str, round_id: str | None) -> RuntimeLog | None:
+    if not round_id:
+        return None
+    return db.scalar(
+        select(RuntimeLog)
+        .where(
+            RuntimeLog.job_id == job_id,
+            RuntimeLog.round_id == round_id,
+            RuntimeLog.stage == "github_review_snapshot",
+        )
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
     )
 
 
@@ -4720,11 +5039,17 @@ def _runtime_log_text(db: Session, job_id: str, round_id: str) -> str:
 
 
 def _github_url(git_data: dict) -> str:
+    commit_sha = str(git_data.get("commit_sha") or "").strip()
+    if git_data.get("review_snapshot") or git_data.get("use_commit_url"):
+        for key in ("remote_url", "github_url", "repository_url"):
+            normalized = _normalize_github_clone_url(str(git_data.get(key) or ""))
+            if normalized and commit_sha:
+                return normalized.removesuffix(".git") + f"/commit/{commit_sha}"
     for key in ("remote_url", "github_url", "repository_url"):
         normalized = _normalize_github_clone_url(str(git_data.get(key) or ""))
         if normalized:
             return normalized
-    return str(git_data.get("commit_sha") or "")
+    return commit_sha
 
 
 def _normalize_github_clone_url(value: str) -> str:
@@ -4870,6 +5195,16 @@ def _feishu_satisfaction(db: Session, job_id: str, round_id: str) -> dict[str, s
             or ""
         )
     return {"satisfied": False, "reason": (extra_reason or text).strip()}
+
+
+def _review_snapshot_commit_message(job: Job, round_: TaskRound | None) -> str:
+    direction = ""
+    if isinstance(job.directions, list) and job.directions:
+        direction = str(job.directions[0]).strip()
+    round_label = f"round {round_.round_index}" if round_ else "round"
+    if direction:
+        return f"AgentOps review snapshot: {direction[:72]} ({round_label})"
+    return f"AgentOps review snapshot ({round_label})"
 
 
 def _commit_message(job: Job, round_: TaskRound | None) -> str:

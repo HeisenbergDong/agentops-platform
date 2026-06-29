@@ -241,6 +241,7 @@ def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tm
     _create_feishu_config(db, job.user_id)
     monkeypatch.setattr(worker_results.settings, "attachment_root", tmp_path / "storage")
     monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: {"status": "written", "record_id": "rec1"})
+    monkeypatch.setattr(worker_results, "_github_llm_product_review", lambda *args, **kwargs: {})
 
     _finish(
         db,
@@ -278,6 +279,18 @@ def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tm
             },
         ),
     )
+    review_git = _latest_command(db, WorkerCommandType.GIT_SUBMIT)
+    assert review_git.payload["purpose"] == "review_snapshot"
+    _finish(
+        db,
+        review_git,
+        WorkerResult(
+            command_id=review_git.id,
+            worker_id=review_git.worker_id,
+            status="success",
+            data={"status": "committed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
     scan = _latest_command(db, WorkerCommandType.SCAN_PROJECT)
     _finish(
         db,
@@ -302,18 +315,6 @@ def test_full_worker_result_happy_path_reaches_project_completed(monkeypatch, tm
             data={"status": "passed", "url": "http://localhost:5173", "http_status": 200},
         ),
     )
-    git = _latest_command(db, WorkerCommandType.GIT_SUBMIT)
-    _finish(
-        db,
-        git,
-        WorkerResult(
-            command_id=git.id,
-            worker_id=git.worker_id,
-            status="success",
-            data={"status": "committed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
-        ),
-    )
-
     db.refresh(job)
     db.refresh(round_)
     assert job.status == JobState.PROJECT_COMPLETED
@@ -1148,14 +1149,15 @@ def test_capture_screenshot_records_attachment_and_advances_to_product_reviewing
     db.refresh(job)
     db.refresh(round_)
     attachment = db.scalar(select(Attachment).where(Attachment.kind == "screenshot"))
-    assert job.status == JobState.PRODUCT_REVIEWING
-    assert round_.status == JobState.PRODUCT_REVIEWING
+    assert job.status == JobState.GITHUB_SUBMITTING
+    assert round_.status == JobState.GITHUB_SUBMITTING
     assert attachment is not None
     assert attachment.path == "screenshots/worker-screen.png"
     assert attachment.size_bytes == 1234
-    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SCAN_PROJECT.value))
+    next_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value))
     assert next_command is not None
     assert next_command.status == "queued"
+    assert next_command.payload["purpose"] == "review_snapshot"
 
 
 def test_capture_screenshot_uses_uploaded_server_attachment():
@@ -1197,6 +1199,44 @@ def test_capture_screenshot_uses_uploaded_server_attachment():
     assert len(attachments) == 1
     assert attachments[0].id == uploaded.id
     assert attachments[0].path == "storage/workers/worker1/screenshot/server-screen.png"
+
+
+def test_review_snapshot_success_queues_scan_without_feishu(monkeypatch):
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    command.payload = {**command.payload, "purpose": "review_snapshot"}
+    monkeypatch.setattr(
+        worker_results,
+        "_github_llm_product_review",
+        lambda *args, **kwargs: {
+            "issues": ["src/App.tsx:12 保存按钮没有更新状态"],
+            "warnings": [],
+            "evidence": ["GitHub 审查快照：https://github.com/acme/repo/commit/abc123"],
+        },
+    )
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "pushed", "commit_sha": "abc123", "remote_url": "https://github.com/acme/repo.git"},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    scan = _latest_command(db, WorkerCommandType.SCAN_PROJECT)
+    snapshot_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "github_review_snapshot"))
+    assert job.status == JobState.PRODUCT_REVIEWING
+    assert round_.status == JobState.PRODUCT_REVIEWING
+    assert round_.github_status == "review_snapshot_pushed"
+    assert snapshot_log is not None
+    assert scan.payload["llm_product_review"]["issues"] == ["src/App.tsx:12 保存按钮没有更新状态"]
+    assert db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.FEISHU_PREPARING)) is None
 
 
 def test_capture_screenshot_rejects_failed_quality_gate():
@@ -1467,6 +1507,54 @@ def test_browser_acceptance_success_advances_to_github_submitting_after_first_ro
     assert next_command is not None
     assert next_command.status == "queued"
     assert next_command.payload["commit_message"].startswith("AgentOps: demo")
+
+
+def test_browser_acceptance_success_reuses_review_snapshot_for_feishu(monkeypatch, tmp_path):
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    round_.round_index = 2
+    job.daily_target = 5
+    _create_feishu_config(db, job.user_id)
+    _create_trace_attachment(db, job.id, round_.id, tmp_path, "full trae trace")
+    written = {}
+    monkeypatch.setattr(worker_results, "write_feishu_record", lambda feishu_config, fields: written.setdefault("fields", fields) or {"status": "written", "record_id": "rec1"})
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage="github_review_snapshot",
+            message="GitHub review snapshot recorded.",
+            extra={
+                "git_data": {
+                    "status": "pushed",
+                    "commit_sha": "abc123",
+                    "remote_url": "https://github.com/acme/repo.git",
+                    "review_snapshot": True,
+                    "use_commit_url": True,
+                },
+                "submitted_counted": False,
+            },
+        )
+    )
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "passed", "url": "http://localhost:5173", "http_status": 200},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.submitted_count == 1
+    assert round_.feishu_status == "written"
+    assert written["fields"]["github地址"] == "https://github.com/acme/repo/commit/abc123"
+    assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value)) is None
 
 
 def test_browser_acceptance_pass_after_product_review_issue_generates_single_final_reason():

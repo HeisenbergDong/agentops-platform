@@ -609,7 +609,8 @@ def _module_map_followup_prompt(job: Job, round_: TaskRound, topic: str) -> str:
     modules = [str(item).strip() for item in module_map or [] if str(item).strip()]
     if not modules:
         return ""
-    index = max(0, int(round_.round_index or 1) - 1) % len(modules)
+    interaction_meta = _same_project_interaction_meta(job, round_)
+    index = max(0, int(interaction_meta.get("cumulative_round_index") or int(round_.round_index or 1)) - 1) % len(modules)
     module = modules[index]
     if module in {"系统骨架"} and (round_.round_index > 1 or _is_existing_project_new_interaction(round_)):
         index = (index + 1) % len(modules)
@@ -865,6 +866,39 @@ def _range_plan_meta(job: Job) -> dict:
     }
 
 
+def _same_project_interaction_meta(job: Job, round_: TaskRound) -> dict:
+    range_meta = _range_plan_meta(job).get("current_range") or {}
+    modules = [str(item).strip() for item in (range_meta.get("module_map") or []) if str(item).strip()] if isinstance(range_meta, dict) else []
+    intent = job.intent if isinstance(job.intent, dict) else {}
+    project_progress = intent.get("project_progress") if isinstance(intent.get("project_progress"), dict) else {}
+    project_id = str(round_.project_id or "")
+    stored = project_progress.get(project_id) if project_id and isinstance(project_progress.get(project_id), dict) else {}
+    try:
+        completed_rounds = int(stored.get("completed_rounds") or 0)
+    except (TypeError, ValueError):
+        completed_rounds = 0
+    cumulative = completed_rounds + max(1, int(round_.round_index or 1))
+    current_module = ""
+    completed_modules: list[str] = []
+    if modules:
+        current_module = modules[(cumulative - 1) % len(modules)]
+        completed_modules = modules[: min(len(modules), max(0, cumulative - 1))]
+    return {
+        "existing_project_new_interaction": _is_existing_project_new_interaction(round_),
+        "project_id": project_id,
+        "completed_rounds_before_current": completed_rounds,
+        "cumulative_round_index": cumulative,
+        "current_group_round_index": int(round_.round_index or 1),
+        "current_module": current_module,
+        "completed_modules": completed_modules,
+        "instruction": (
+            "这是同一个项目的新 Trae 交互，不是新项目；继续现有代码和业务上下文。"
+            if _is_existing_project_new_interaction(round_)
+            else "继续当前项目交互。"
+        ),
+    }
+
+
 def _prompt_writer_intent(job: Job, current_direction: str) -> dict:
     intent = dict(job.intent) if isinstance(job.intent, dict) else {}
     if current_direction:
@@ -1080,12 +1114,16 @@ def _current_task(job: Job, round_: TaskRound, previous_reason: str) -> dict:
     if round_.job_id:
         # The caller's DB session is not available here, so generate_round_prompt passes detailed state separately.
         previous_prompts = []
+    same_project = _same_project_interaction_meta(job, round_)
     return {
         "topic": _direction_topic(direction),
         "direction": direction,
         "project_slug": _project_slug_from_direction(direction),
         "round_index": round_.round_index,
         "existing_project_new_interaction": _is_existing_project_new_interaction(round_),
+        "same_project_interaction": same_project,
+        "current_module": same_project.get("current_module") or "",
+        "completed_modules": same_project.get("completed_modules") or [],
         "last_dissatisfaction": previous_reason,
         "used_prompts": previous_prompts,
         "followups": _direction_followup_prompts(direction, _direction_topic(direction)),
