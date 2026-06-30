@@ -241,11 +241,14 @@ def _is_forbidden_generation_stop_point(
     except (TypeError, ValueError):
         return False
     try:
-        window = wait_for_workspace_window_or_any(
-            timeout_seconds=min(2.0, max(0.5, timeout_seconds)),
-            workspace_path=workspace_path,
-            prefer_workspace_match=bool(workspace_path),
-        )
+        if workspace_path:
+            window = wait_for_workspace_window_or_any(
+                timeout_seconds=min(2.0, max(0.5, timeout_seconds)),
+                workspace_path=workspace_path,
+                prefer_workspace_match=True,
+            )
+        else:
+            window = find_trae_window(timeout_seconds=min(2.0, max(0.5, timeout_seconds)))
         rect = _window_rect(int(getattr(window, "hwnd", 0) or 0))
     except Exception:
         rect = None

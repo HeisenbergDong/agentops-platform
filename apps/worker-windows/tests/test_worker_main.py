@@ -174,10 +174,13 @@ def test_run_once_renews_running_command_lease(monkeypatch, tmp_path: Path):
     }
     client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
     monkeypatch.setattr(worker_main, "LEASE_RENEW_INTERVAL_SECONDS", 0.01)
+    monkeypatch.setattr(worker_main, "COMMAND_HEARTBEAT_INTERVAL_SECONDS", 0.01)
 
     class SlowRunner(FakeRunner):
         def run(self, command):
             self.ran = True
+            self.state.busy = True
+            self.state.stage = "wait_completion"
             time.sleep(0.05)
             return {
                 "command_id": command["command_id"],
@@ -199,6 +202,12 @@ def test_run_once_renews_running_command_lease(monkeypatch, tmp_path: Path):
     assert processed == 1
     assert client.command_reads
     assert client.command_reads[0]["lease_id"] == "run-1"
+    active_heartbeats = [
+        item for item in client.heartbeats if item.get("runtime_status", {}).get("active_command", {}).get("command_id") == "cmd1"
+    ]
+    assert active_heartbeats
+    assert active_heartbeats[-1]["busy"] is True
+    assert active_heartbeats[-1]["runtime_status"]["active_command"]["type"] == "wait_completion"
     assert client.results[0]["status"] == "success"
 
 

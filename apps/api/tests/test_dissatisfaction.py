@@ -66,6 +66,47 @@ def test_dissatisfaction_reason_states_specific_browser_failure_not_uncertainty(
     assert "未确认" not in reason
     assert "不能确认" not in reason
     assert "无法确认" not in reason
+    assert "本轮" not in reason
+
+
+def test_dissatisfaction_reason_browser_failure_includes_candidate_urls_without_forbidden_terms():
+    result = generate_dissatisfaction_reason(
+        DissatisfactionEvidence(
+            failure_stage="browser_accepting",
+            failure_message="Browser acceptance URL did not become usable after starting the local dev server.",
+            prompt="招聘平台首页要直达工作台，并支持职位列表、职位详情、投递简历、候选人筛选、沟通区发消息和统计变化",
+            data={
+                "status": "failed",
+                "url": "http://localhost:5174/",
+                "candidate_urls_tried": [
+                    "http://localhost:5174/",
+                    "http://localhost:5174/jobs",
+                    "http://localhost:5174/candidates",
+                    "http://localhost:5174/interviews",
+                    "http://localhost:5174/login",
+                ],
+                "inspection": {
+                    "issues": ["页面包含运行错误信号：Cannot read properties of undefined"],
+                    "interaction": {"total": 0, "button_labels": []},
+                },
+                "auto_start": {
+                    "status": "started",
+                    "cwd": "D:/workspace/recruit-platform/frontend",
+                    "command": ["npm", "run", "dev", "--", "--port", "5174"],
+                },
+            },
+        )
+    )
+
+    reason = result["reason"]
+    assert "http://localhost:5174/jobs" in reason
+    assert "页面包含运行错误信号" in reason
+    assert "页面没有检测到可操作入口" in reason
+    assert "入口" in result["product_reason"]
+    assert "导致业务侧不能按" in result["process_reason"]
+    body = reason.replace("产物不满意：", "").replace("过程不满意：", "")
+    for forbidden in ("本轮", "这轮", "不满意原因", "日志轨迹", "日志", "轨迹", "edit_file_search_replace"):
+        assert forbidden not in body
 
 
 def test_dissatisfaction_reason_agentops_uses_agentops_acceptance_without_monitor_leak():
@@ -86,6 +127,7 @@ def test_dissatisfaction_reason_agentops_uses_agentops_acceptance_without_monito
     body = reason.replace("产物不满意：", "").replace("过程不满意：", "")
     assert "日志" not in body
     assert "轨迹" not in body
+    assert "本轮" not in body
     assert "全过程链路看板" not in reason
     assert "告警规则" not in reason
     assert result["task_done"] == "未完成任务"

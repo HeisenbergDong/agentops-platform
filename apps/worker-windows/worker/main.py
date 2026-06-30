@@ -26,6 +26,7 @@ ACTIVE_COMMAND_STATUSES = {"queued", "claimed", "running"}
 STALE_LEASE_STATUSES = {"stale_lease", "expired_lease"}
 MAX_COMMAND_STATUS_FAILURES = 3
 LEASE_RENEW_INTERVAL_SECONDS = 2.0
+COMMAND_HEARTBEAT_INTERVAL_SECONDS = 15.0
 
 
 def run_once(
@@ -38,21 +39,7 @@ def run_once(
     runner = runner or create_command_runner(worker_settings)
     if getattr(runner, "cancellation_checker", None) is None:
         attach_cancellation_checker(runner, client, worker_settings)
-    heartbeat = {
-        "worker_id": worker_settings.worker_id,
-        "machine_name": socket.gethostname(),
-        "display_name": worker_settings.display_name,
-        "worker_type": worker_settings.worker_type,
-        "machine_fingerprint": machine_fingerprint(),
-        "version": WORKER_RUNTIME_VERSION,
-        "config_version": worker_settings.version,
-        "supported_apps": SUPPORTED_APPS,
-        "capabilities": CAPABILITIES,
-        "current_stage": runner.state.stage,
-        "current_window_title": runner.state.current_window_title,
-        "runtime_status": worker_runtime_status(worker_settings),
-        "busy": runner.state.busy,
-    }
+    heartbeat = build_heartbeat_payload(worker_settings, runner)
     heartbeat_result = client.heartbeat(heartbeat)
     sync_runtime_config(worker_settings, runner, heartbeat_result)
     commands = client.poll_commands(worker_settings.worker_id)
@@ -78,7 +65,7 @@ def run_once(
             processed += 1
             continue
         command = {**command, "lease_id": str(acked.get("lease_id") or command.get("lease_id") or "")}
-        renewer = CommandLeaseRenewer(client, worker_settings.worker_id, command, runner)
+        renewer = CommandLeaseRenewer(client, worker_settings.worker_id, command, runner, worker_settings)
         renewer.start()
         try:
             post_worker_event(client, worker_settings.worker_id, command, "worker_command_started")
@@ -113,16 +100,61 @@ def run_once(
     return processed
 
 
+def build_heartbeat_payload(
+    worker_settings: WorkerSettings,
+    runner: Any,
+    *,
+    active_command: dict | None = None,
+) -> dict[str, Any]:
+    runtime_status = worker_runtime_status(worker_settings)
+    if active_command:
+        runtime_status["active_command"] = {
+            "command_id": str(active_command.get("command_id") or ""),
+            "lease_id": str(active_command.get("lease_id") or ""),
+            "type": str(active_command.get("type") or ""),
+            "status": str(active_command.get("status") or "running"),
+            "job_id": str(active_command.get("job_id") or ""),
+            "round_id": str(active_command.get("round_id") or ""),
+            "stage": str(getattr(getattr(runner, "state", None), "stage", "") or ""),
+        }
+    state = getattr(runner, "state", None)
+    return {
+        "worker_id": worker_settings.worker_id,
+        "machine_name": socket.gethostname(),
+        "display_name": worker_settings.display_name,
+        "worker_type": worker_settings.worker_type,
+        "machine_fingerprint": machine_fingerprint(),
+        "version": WORKER_RUNTIME_VERSION,
+        "config_version": worker_settings.version,
+        "supported_apps": SUPPORTED_APPS,
+        "capabilities": CAPABILITIES,
+        "current_stage": str(getattr(state, "stage", "idle") or "idle"),
+        "current_window_title": str(getattr(state, "current_window_title", "") or ""),
+        "runtime_status": runtime_status,
+        "busy": bool(getattr(state, "busy", False)),
+    }
+
+
 class CommandLeaseRenewer:
-    def __init__(self, client: WorkerClient, worker_id: str, command: dict, runner: Any) -> None:
+    def __init__(
+        self,
+        client: WorkerClient,
+        worker_id: str,
+        command: dict,
+        runner: Any,
+        worker_settings: WorkerSettings | None = None,
+    ) -> None:
         self.client = client
         self.worker_id = worker_id
+        self.command = dict(command or {})
         self.command_id = str(command.get("command_id") or "")
         self.lease_id = str(command.get("lease_id") or "")
         self.runner = runner
+        self.worker_settings = worker_settings
         self._stop = threading.Event()
         self._thread: threading.Thread | None = None
         self._failures = 0
+        self._last_heartbeat_at = 0.0
 
     def start(self) -> None:
         if not self.command_id or not self.lease_id:
@@ -162,6 +194,7 @@ class CommandLeaseRenewer:
                 log(f"Command was cancelled on server for {self.command_id}; stopping local execution.")
                 self._request_stop()
                 return
+            self._maybe_send_heartbeat(command)
 
     def _request_stop(self) -> None:
         state = getattr(self.runner, "state", None)
@@ -200,6 +233,26 @@ class CommandLeaseRenewer:
             return {}
         payload = command.get("payload") if isinstance(command, dict) else {}
         return payload if isinstance(payload, dict) else {}
+
+    def _maybe_send_heartbeat(self, command: dict | None = None) -> None:
+        if not self.worker_settings:
+            return
+        now = time.monotonic()
+        if self._last_heartbeat_at and now - self._last_heartbeat_at < COMMAND_HEARTBEAT_INTERVAL_SECONDS:
+            return
+        active_command = {**self.command, **(command if isinstance(command, dict) else {})}
+        active_command.setdefault("status", "running")
+        try:
+            self.client.heartbeat(
+                build_heartbeat_payload(
+                    self.worker_settings,
+                    self.runner,
+                    active_command=active_command,
+                )
+            )
+            self._last_heartbeat_at = now
+        except Exception as exc:
+            log(f"Could not send active command heartbeat for {self.command_id}: {exc}.")
 
 
 def run_forever(worker_settings: WorkerSettings | None = None) -> None:

@@ -8,7 +8,7 @@ from typing import Any, Callable
 from worker.trae.screenshot import capture_screenshot
 from worker.trae.trace_copy import probe_trace, scroll_assistant_to_bottom
 from worker.trae.supervisor import has_ui_completion_text
-from worker.trae.ui_locator import normalize_action, validate_target
+from worker.trae.ui_locator import locate_visible_action_targets, normalize_action, target_for_action, validate_target
 from worker.trae.window import (
     TraeAutomationError,
     find_trae_window,
@@ -173,6 +173,8 @@ def diagnose_ui(
             text_sample=text[-1600:],
             buttons=buttons[:40],
         )
+    elif window_rect:
+        visual = _diagnose_local_visual(window_rect)
     output_probe = probe_trace(text)
     terminal_prompt = detect_terminal_prompt(text)
 
@@ -181,6 +183,7 @@ def diagnose_ui(
     confidence = 0.0
     reason = ""
     visual_suggested = _visual_suggested_intervention(visual, window_rect)
+    local_visual_suggested = _local_visual_suggested_intervention(visual, window_rect)
     delete_confirmation = _delete_confirmation_intervention(text, matches)
     destructive_waiting = _destructive_waiting_intervention(text, buttons)
     safe_destructive_visual = _safe_destructive_visual_intervention(visual_suggested, text, visual, workspace_path)
@@ -199,6 +202,11 @@ def diagnose_ui(
         confidence = float(destructive_waiting.get("confidence") or 0.9)
         suggested = destructive_waiting["suggested_intervention"]
         reason = str(destructive_waiting.get("reason") or "local_waiting_destructive_confirmation")
+    elif local_visual_suggested:
+        state = str(local_visual_suggested.get("state") or "awaiting_local_visual_action")
+        confidence = float(local_visual_suggested.get("confidence") or 0.0)
+        suggested = local_visual_suggested["suggested_intervention"]
+        reason = str(local_visual_suggested.get("reason") or "local_visual_action_target")
     elif _visual_completion_detected(visual):
         state = "completed"
         confidence = _completion_confidence(text, visual)
@@ -274,6 +282,28 @@ def diagnose_ui(
         "scroll_bottom": scroll_result,
         "suggested_intervention": suggested,
         "reason": reason,
+    }
+
+
+def _diagnose_local_visual(window_rect: dict | None, screenshot: dict | None = None) -> dict[str, Any]:
+    if not window_rect:
+        return {"status": "not_found", "reason": "missing_window_rect"}
+    screenshot_result = screenshot if isinstance(screenshot, dict) else {}
+    if not screenshot_result.get("path"):
+        try:
+            screenshot_result = capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
+        except Exception as exc:
+            return {"status": "not_found", "reason": "screenshot_failed", "error": str(exc)}
+    analysis = {}
+    if screenshot_result.get("path"):
+        analysis = locate_visible_action_targets(str(screenshot_result["path"]), _tuple_window_rect(window_rect))
+    return {
+        "status": str(analysis.get("status") or "not_found") if isinstance(analysis, dict) else "not_found",
+        "reason": str(analysis.get("reason") or "local_visual_no_action") if isinstance(analysis, dict) else "local_visual_no_action",
+        "screenshot": screenshot_result,
+        "ai_analysis": {},
+        "ai_error": "",
+        "local_analysis": analysis if isinstance(analysis, dict) else {},
     }
 
 
@@ -552,6 +582,9 @@ def _diagnose_ai_visual(
         screenshot = capture_screenshot(target="trae_window", timeout_seconds=5.0, quality_required=False)
     except Exception as exc:
         return {"status": "not_found", "reason": "screenshot_failed", "error": str(exc)}
+    local_visual = {}
+    if screenshot.get("path"):
+        local_visual = locate_visible_action_targets(str(screenshot["path"]), tuple_rect)
     ai_analysis = {}
     ai_error = ""
     if ui_analyst and screenshot.get("path"):
@@ -578,6 +611,7 @@ def _diagnose_ai_visual(
             "screenshot": screenshot,
             "ai_analysis": ai_analysis,
             "ai_error": ai_error,
+            "local_analysis": local_visual,
         }
     if task == "find_prompt_input_and_send_button" and ai_analysis:
         screen_state = str(ai_analysis.get("screen_state") or "")
@@ -592,6 +626,7 @@ def _diagnose_ai_visual(
                 "screenshot": screenshot,
                 "ai_analysis": ai_analysis,
                 "ai_error": ai_error,
+                "local_analysis": local_visual,
             }
         if screen_state in {"prompt_still_in_composer", "prompt_not_submitted"} or str(ai_analysis.get("status") or "") in {
             "found",
@@ -603,6 +638,7 @@ def _diagnose_ai_visual(
                 "screenshot": screenshot,
                 "ai_analysis": ai_analysis,
                 "ai_error": ai_error,
+                "local_analysis": local_visual,
             }
     return {
         "status": str(ai_analysis.get("status") or "not_found") if ai_analysis else "not_found",
@@ -610,6 +646,7 @@ def _diagnose_ai_visual(
         "screenshot": screenshot,
         "ai_analysis": ai_analysis,
         "ai_error": ai_error,
+        "local_analysis": local_visual,
     }
 
 
@@ -789,6 +826,42 @@ def _visual_suggested_intervention(visual: dict[str, Any], window_rect: dict | N
             "source": "ai_vision",
             "risk": target.get("risk") or analysis.get("risk"),
             "recommended_action": recommended,
+        },
+    }
+
+
+def _local_visual_suggested_intervention(visual: dict[str, Any], window_rect: dict | None) -> dict[str, Any]:
+    if not isinstance(visual, dict):
+        return {}
+    analysis = visual.get("local_analysis") if isinstance(visual.get("local_analysis"), dict) else {}
+    if not analysis:
+        return {}
+    target = target_for_action(analysis, "run_button", min_confidence=0.72)
+    if not target:
+        return {}
+    ok, reason = validate_target(target, "run_button", _tuple_window_rect(window_rect), min_confidence=0.72)
+    if not ok:
+        return {
+            "state": "awaiting_local_visual_action",
+            "confidence": target.get("confidence") or 0.0,
+            "reason": f"local_visual_target_rejected:{reason}",
+            "suggested_intervention": {},
+        }
+    center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    return {
+        "state": "awaiting_run_confirmation",
+        "confidence": target.get("confidence") or 0.0,
+        "reason": str(target.get("reason") or analysis.get("reason") or "local_visual_run_button"),
+        "suggested_intervention": {
+            "mode": "click-point",
+            "action": "run_button",
+            "x": center.get("x"),
+            "y": center.get("y"),
+            "button": str(target.get("label") or target.get("name") or "执行"),
+            "confidence": target.get("confidence") or 0.0,
+            "source": "local_vision",
+            "risk": "safe",
+            "recommended_action": "click_run_button",
         },
     }
 

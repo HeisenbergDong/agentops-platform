@@ -124,6 +124,8 @@ def wait_completion(
                     workspace_path=workspace_path,
                     ui_analyst=ui_analyst,
                     suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
+                    progress_callback=progress_callback,
+                    last_progress_at=last_progress_at,
                 )
                 if outcome.get("status") == "completed":
                     return outcome
@@ -216,6 +218,8 @@ def wait_completion(
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
                 suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
+                progress_callback=progress_callback,
+                last_progress_at=last_progress_at,
             )
             if outcome.get("status") == "completed":
                 return outcome
@@ -427,6 +431,107 @@ def _emit_supervisor_progress(
     )
 
 
+def _emit_intervention_progress(
+    callback: Callable[[dict], None] | None,
+    intervention: dict,
+    decision: dict,
+    last_progress_at: dict[str, float],
+) -> None:
+    message = _intervention_progress_message(intervention)
+    if not message:
+        return
+    extra = _compact_intervention_progress(intervention)
+    extra.update(
+        {
+            "event": "trae_intervention_result",
+            "supervisor_action": str(decision.get("action") or ""),
+            "supervisor_reason": str(decision.get("reason") or ""),
+        }
+    )
+    _emit_progress(
+        callback,
+        f"intervention:{extra.get('intervention_status') or 'unknown'}:{extra.get('suggested_action') or ''}",
+        message,
+        extra,
+        last_progress_at,
+        force=True,
+    )
+
+
+def _intervention_progress_message(intervention: dict) -> str:
+    status = str(intervention.get("status") or "")
+    suggested = intervention.get("suggested_intervention") if isinstance(intervention.get("suggested_intervention"), dict) else {}
+    result = intervention.get("result") if isinstance(intervention.get("result"), dict) else {}
+    action = str(suggested.get("action") or result.get("action") or "")
+    button = str(suggested.get("button") or result.get("button") or "").strip()
+    if status == "completed":
+        return "Worker 通过视觉检查确认 Trae CN 已完成回复，准备采集结果。"
+    if status in {"applied", "clicked"}:
+        if action in {"run_button", "run", "execute", "confirm_button", "continue_button"}:
+            label = button or _display_action_name(action)
+            return f"Worker 已处理 Trae CN 待确认操作：点击「{label}」按钮，继续观察结果。"
+        if str(suggested.get("mode") or "") == "continue-text":
+            return "Worker 已向 Trae CN 发送继续指令，继续等待模型完成当前回复。"
+        if str(suggested.get("mode") or "") == "terminal-input":
+            return "Worker 已处理 Trae CN 终端确认输入，继续观察执行结果。"
+        if str(suggested.get("mode") or "") == "scroll-inner-panel":
+            return "Worker 已滚动 Trae CN 内层确认区域，继续查找安全操作按钮。"
+        return "Worker 已完成一次 Trae CN 自动介入操作，继续观察结果。"
+    if status == "skipped":
+        return "Worker 识别到 Trae CN 待处理状态，但没有找到符合安全策略的操作目标，继续观察。"
+    if status == "failed":
+        error = str(intervention.get("error") or result.get("error") or "").strip()
+        suffix = f"：{error[:120]}" if error else ""
+        return f"Worker 尝试处理 Trae CN 待确认操作失败{suffix}。"
+    if status:
+        return f"Worker 已尝试处理 Trae CN 待确认操作，返回状态 {status}，继续观察。"
+    return ""
+
+
+def _display_action_name(action: str) -> str:
+    mapping = {
+        "run_button": "执行",
+        "run": "执行",
+        "execute": "执行",
+        "confirm_button": "确认",
+        "continue_button": "继续",
+        "keep_button": "保留",
+        "save_button": "保存",
+        "delete_button": "删除",
+    }
+    return mapping.get(action, action or "确认")
+
+
+def _compact_intervention_progress(intervention: dict) -> dict:
+    suggested = intervention.get("suggested_intervention") if isinstance(intervention.get("suggested_intervention"), dict) else {}
+    result = intervention.get("result") if isinstance(intervention.get("result"), dict) else {}
+    diagnosis = intervention.get("diagnosis") if isinstance(intervention.get("diagnosis"), dict) else {}
+    visual = diagnosis.get("visual") if isinstance(diagnosis.get("visual"), dict) else {}
+    local_visual = visual.get("local_analysis") if isinstance(visual.get("local_analysis"), dict) else {}
+    payload = {
+        "intervention_status": str(intervention.get("status") or ""),
+        "intervention_reason": str(intervention.get("reason") or ""),
+        "diagnosis_state": str(intervention.get("diagnosis_state") or diagnosis.get("state") or ""),
+        "diagnosis_reason": str(diagnosis.get("reason") or ""),
+        "suggested_mode": str(suggested.get("mode") or ""),
+        "suggested_action": str(suggested.get("action") or ""),
+        "recommended_action": str(suggested.get("recommended_action") or ""),
+        "button": str(suggested.get("button") or result.get("button") or ""),
+        "source": str(suggested.get("source") or ""),
+        "risk": str(suggested.get("risk") or ""),
+        "click_result_status": str(result.get("status") or ""),
+        "click_mode": str(result.get("mode") or ""),
+        "local_visual_status": str(local_visual.get("status") or ""),
+        "local_visual_reason": str(local_visual.get("reason") or ""),
+    }
+    for key in ("x", "y"):
+        if suggested.get(key) not in ("", None):
+            payload[f"click_{key}"] = suggested.get(key)
+    if intervention.get("error"):
+        payload["error"] = str(intervention.get("error") or "")[:300]
+    return payload
+
+
 def _supervisor_progress_message(decision: dict) -> str:
     action = str(decision.get("action") or "")
     reason = str(decision.get("reason") or "")
@@ -509,6 +614,8 @@ def _handle_supervisor_decision(
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
     suppress_continue_text: bool = False,
+    progress_callback: Callable[[dict], None] | None = None,
+    last_progress_at: dict[str, float] | None = None,
 ) -> dict:
     action = str(decision.get("action") or "wait")
     if action == "collect_trace":
@@ -543,6 +650,7 @@ def _handle_supervisor_decision(
         )
         intervention["supervisor_action"] = action
         intervention["supervisor_reason"] = str(decision.get("reason") or "")
+        _emit_intervention_progress(progress_callback, intervention, decision, last_progress_at or {})
         if intervention.get("status") == "completed":
             completion_decision = {
                 **decision,

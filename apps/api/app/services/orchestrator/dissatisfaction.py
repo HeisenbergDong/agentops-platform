@@ -17,15 +17,27 @@ PROCESS_LABEL = "过程不满意："
 FORBIDDEN_VISIBLE_REASON_TERMS = (
     "结果不满意",
     "不满意原因",
+    "本轮",
+    "这轮",
+    "第x轮",
+    "0-1代码生成",
     "日志",
     "轨迹",
     "扫描",
     "工具调用",
+    "edit_file_search_replace",
+    "npm install undefined",
+    "3003模型失败",
     "LLM",
     "AI",
     "未确认",
     "不能确认",
     "无法确认",
+)
+FORBIDDEN_VISIBLE_REASON_PATTERNS = (
+    re.compile(r"第\s*\d+\s*轮"),
+    re.compile(r"\bWrite\b"),
+    re.compile(r"\bchanges\b", flags=re.IGNORECASE),
 )
 TASK_DONE_INCOMPLETE = "未完成任务"
 TASK_DONE_OPTIONS = {"完成了任务", TASK_DONE_INCOMPLETE}
@@ -117,8 +129,8 @@ def _forced_test_unsatisfied(evidence: DissatisfactionEvidence) -> dict[str, Any
     intent = evidence.orchestrator_intent if isinstance(evidence.orchestrator_intent, dict) else {}
     if intent.get("run_mode") != "test" or intent.get("dissatisfaction_policy") != "force_test_unsatisfied":
         return None
-    product = "本轮是链路验证测试，即使产物结果可接受，也按用户要求标记为不满意，用于验证后续 GitHub 和飞书记录链路，不能当作正式业务验收结论。"
-    process = "本轮重点不是评估真实业务产物质量，而是确认提示发送、执行观察、提交和写入等自动化流程是否能被完整记录。"
+    product = "链路验证测试功能按用户要求强制标记为不满意，即使产物结果可接受，也只能用于验证 GitHub 和飞书记录链路，不能当作正式业务验收结论。"
+    process = "在链路验证环节，用户明确要求把满意结果也按不满意写入；模型需要确认提示发送、执行观察、提交和写入流程是否完整，业务影响是这条记录只服务流程演练，不代表真实项目失败。"
     return {
         "status": "generated",
         "reason": f"{PRODUCT_LABEL}{product}\n{PROCESS_LABEL}{process}",
@@ -256,6 +268,25 @@ def _finalize_reason(result: dict[str, Any], evidence: DissatisfactionEvidence, 
         product_reason = product_line.replace(PRODUCT_LABEL, "", 1).strip()
         process_reason = process_line.replace(PROCESS_LABEL, "", 1).strip()
         reason = _compose_visible_reason(product_reason, process_reason, evidence)
+    quality_issues = _visible_reason_quality_issues(reason, evidence)
+    if quality_issues:
+        fallback = _normalize_dissatisfaction_prefix(_current_round_fallback_reason(evidence))
+        fallback_lines = [line.strip() for line in fallback.splitlines() if line.strip()]
+        product_line = next((line for line in fallback_lines if line.startswith(PRODUCT_LABEL)), PRODUCT_LABEL + _product_reason(evidence))
+        process_line = next((line for line in fallback_lines if line.startswith(PROCESS_LABEL)), PROCESS_LABEL + _process_reason(evidence))
+        product_reason = product_line.replace(PRODUCT_LABEL, "", 1).strip()
+        process_reason = process_line.replace(PROCESS_LABEL, "", 1).strip()
+        reason = _compose_visible_reason(product_reason, process_reason, evidence)
+        result["visible_reason_quality_gate"] = {"rewritten": True, "issues": quality_issues}
+    final_lines = [line.strip() for line in reason.splitlines() if line.strip()]
+    product_reason = next(
+        (line.replace(PRODUCT_LABEL, "", 1).strip() for line in final_lines if line.startswith(PRODUCT_LABEL)),
+        _clean_visible_reason(product_reason, evidence),
+    )
+    process_reason = next(
+        (line.replace(PROCESS_LABEL, "", 1).strip() for line in final_lines if line.startswith(PROCESS_LABEL)),
+        _clean_visible_reason(process_reason, evidence),
+    )
     return {
         "reason": reason,
         "product_reason": product_reason,
@@ -318,6 +349,13 @@ def _clean_visible_reason(value: str, evidence: DissatisfactionEvidence) -> str:
         "轨迹": "过程记录",
         "扫描": "检查",
         "工具调用": "执行记录",
+        "本轮": "当前任务",
+        "这轮": "当前任务",
+        "第x轮": "当前任务",
+        "0-1代码生成": "代码生成阶段",
+        "edit_file_search_replace": "文件替换编辑",
+        "npm install undefined": "依赖安装命令参数异常",
+        "3003模型失败": "模型服务请求失败",
         "LLM": "模型",
         "AI": "模型",
         "trace": "record",
@@ -332,6 +370,9 @@ def _clean_visible_reason(value: str, evidence: DissatisfactionEvidence) -> str:
     }
     for source, target in replacements.items():
         text = text.replace(source, target)
+    text = re.sub(r"第\s*\d+\s*轮", "当前任务", text)
+    text = re.sub(r"\bWrite\b", "写入动作", text)
+    text = re.sub(r"\bchanges\b", "变更", text, flags=re.IGNORECASE)
     if not _is_agentops_context(evidence.prompt):
         text = text.replace("Worker", "本地执行环境").replace("worker", "本地执行环境")
         text = text.replace("Trae CN", "模型").replace("Trae", "模型")
@@ -340,10 +381,84 @@ def _clean_visible_reason(value: str, evidence: DissatisfactionEvidence) -> str:
 
 
 def _visible_reason_has_forbidden_terms(reason: str) -> bool:
+    return bool(_visible_reason_forbidden_hits(reason, None))
+
+
+def _visible_reason_forbidden_hits(reason: str, evidence: DissatisfactionEvidence | None) -> list[str]:
     body = str(reason or "")
     for label in (PRODUCT_LABEL, PROCESS_LABEL):
         body = body.replace(label, "")
-    return any(term in body for term in FORBIDDEN_VISIBLE_REASON_TERMS)
+    hits = [term for term in FORBIDDEN_VISIBLE_REASON_TERMS if term and term in body]
+    hits.extend(pattern.pattern for pattern in FORBIDDEN_VISIBLE_REASON_PATTERNS if pattern.search(body))
+    if "3003" in body:
+        evidence_blob = _evidence_blob(evidence) if evidence else ""
+        if "3003" not in evidence_blob:
+            hits.append("unsupported_3003")
+    return hits
+
+
+def _visible_reason_quality_issues(reason: str, evidence: DissatisfactionEvidence) -> list[str]:
+    issues: list[str] = []
+    forbidden = _visible_reason_forbidden_hits(reason, evidence)
+    if forbidden:
+        issues.append("forbidden_terms:" + ",".join(forbidden[:5]))
+    lines = [line.strip() for line in str(reason or "").splitlines() if line.strip()]
+    product = next((line.replace(PRODUCT_LABEL, "", 1).strip() for line in lines if line.startswith(PRODUCT_LABEL)), "")
+    process = next((line.replace(PROCESS_LABEL, "", 1).strip() for line in lines if line.startswith(PROCESS_LABEL)), "")
+    if not product:
+        issues.append("missing_product_reason")
+    elif not _product_reason_is_specific(product, evidence):
+        issues.append("product_reason_not_specific")
+    if not process:
+        issues.append("missing_process_reason")
+    elif not _process_reason_has_chain(process):
+        issues.append("process_reason_missing_when_what_impact")
+    if product and process and _reason_key(product) == _reason_key(process):
+        issues.append("product_process_duplicated")
+    return issues
+
+
+def _product_reason_is_specific(product: str, evidence: DissatisfactionEvidence) -> bool:
+    text = str(product or "")
+    if len(text) < 35:
+        return False
+    if re.search(r"https?://|/[A-Za-z0-9_./-]+|[A-Za-z0-9_./\\-]+\.(?:vue|tsx|jsx|ts|js|go|py|java|css|html)", text):
+        location_ok = True
+    else:
+        location_ok = any(term in text for term in ("页面", "接口", "文件", "功能", "入口", "按钮", "表单", "路由", "HTTP", "状态码", "函数", "组件", "浏览器验收"))
+    unmet_ok = any(term in text for term in ("无法", "不能", "没有", "缺失", "失败", "未满足", "不满足", "达不到", "不完整", "不可用"))
+    if "历史" in text[:18] and not any(term in text[:40] for term in ("当前", "这次", "浏览器", "代码", "页面", "接口")):
+        return False
+    return location_ok and unmet_ok
+
+
+def _process_reason_has_chain(process: str) -> bool:
+    text = str(process or "")
+    if len(text) < 45:
+        return False
+    when_ok = any(term in text for term in ("在", "环节", "步骤", "阶段", "验收", "复查", "提交", "写入", "生成", "交付"))
+    what_ok = any(term in text for term in ("模型", "交付说明", "创建", "没有", "缺少", "跳过", "声称", "描述", "复查", "处理", "执行"))
+    impact_ok = any(term in text for term in ("导致", "影响", "无法", "不能", "使", "业务影响", "不能按", "不代表"))
+    return when_ok and what_ok and impact_ok
+
+
+def _evidence_blob(evidence: DissatisfactionEvidence | None) -> str:
+    if not evidence:
+        return ""
+    try:
+        return json.dumps(
+            {
+                "failure_stage": evidence.failure_stage,
+                "failure_message": evidence.failure_message,
+                "data": evidence.data,
+                "trace_text": evidence.trace_text,
+                "runtime_log_text": evidence.runtime_log_text,
+            },
+            ensure_ascii=False,
+            default=str,
+        )
+    except Exception:
+        return f"{evidence.failure_stage}\n{evidence.failure_message}\n{evidence.trace_text}\n{evidence.runtime_log_text}"
 
 
 def _product_reason(evidence: DissatisfactionEvidence) -> str:
@@ -354,7 +469,7 @@ def _product_reason(evidence: DissatisfactionEvidence) -> str:
 
     if stage == "product_reviewing":
         if not detail:
-            detail = f"这轮要验收的是{domain}，但构建、测试或静态检查没有留下能通过的结果"
+            detail = f"当前要验收的是{domain}，但构建、测试或静态检查没有留下能通过的结果"
         elif _is_tmc_context(evidence.prompt) and not all(term in detail for term in ["快递下单", "网点接单", "异常件处理"]):
             detail = f"{detail}；这次要验收的是{domain}"
         elif _is_agentops_context(evidence.prompt) and not all(term in detail for term in ["提示发送", "底部日志复制", "角色配置"]):
@@ -368,7 +483,7 @@ def _product_reason(evidence: DissatisfactionEvidence) -> str:
         detail = browser_problem or _product_review_problem(evidence) or detail
         if not detail:
             detail = "浏览器验收没有拿到可用页面或主流程反馈"
-        return f"{detail}，{domain}里的页面入口、状态变化或结果反馈没有达到本轮可验收状态。"
+        return f"{detail}，{domain}里的页面入口、状态变化或结果反馈没有达到当前可验收状态。"
     if stage == "github_submitting":
         if not detail:
             detail = "代码仓库同步没有成功"
@@ -391,7 +506,7 @@ def _process_reason(evidence: DissatisfactionEvidence) -> str:
         else "当前缺少足够完整的模型回复内容支撑继续提交。"
     )
     screenshot_note = "我这边也保留了当时截图，方便回看页面状态。" if evidence.screenshot_path else ""
-    return f"我按本轮需求复查到{stage}时没有收口，{detail}。{trace_note}{screenshot_note}".strip()
+    return f"在{stage}，模型交付说明没有把当前需求收口到可验收状态，实际结果是{detail}，导致业务侧不能按已完成项目处理。{trace_note}{screenshot_note}".strip()
 
 
 def _browser_acceptance_problem(evidence: DissatisfactionEvidence) -> str:
@@ -400,11 +515,14 @@ def _browser_acceptance_problem(evidence: DissatisfactionEvidence) -> str:
     source = browser_data or data
     url = str(source.get("url") or source.get("requested_url") or source.get("acceptance_url") or "").strip()
     status = source.get("http_status")
+    tried = _string_list(source.get("candidate_urls_tried"))
     parts: list[str] = []
     if url:
         parts.append(f"{url} 浏览器验收失败")
     else:
         parts.append("浏览器验收失败")
+    if tried:
+        parts.append("候选访问地址包括：" + "、".join(tried[:6]))
     if status not in ("", None):
         parts.append(f"HTTP 状态为 {status}")
     inspection = source.get("inspection") if isinstance(source.get("inspection"), dict) else {}
@@ -430,6 +548,17 @@ def _browser_acceptance_problem(evidence: DissatisfactionEvidence) -> str:
     message = sanitize_reason_phrase(str(source.get("message") or evidence.failure_message or ""))
     if message and message not in "；".join(parts):
         parts.append(message)
+    auto_start = source.get("auto_start") if isinstance(source.get("auto_start"), dict) else {}
+    if auto_start:
+        auto_status = str(auto_start.get("status") or "")
+        command = auto_start.get("command") if isinstance(auto_start.get("command"), list) else []
+        cwd = str(auto_start.get("cwd") or "")
+        if auto_status:
+            parts.append(f"本地服务启动状态为 {auto_status}")
+        if cwd:
+            parts.append(f"服务目录为 {cwd}")
+        if command:
+            parts.append("启动命令为 " + " ".join(str(item) for item in command[:8]))
     return "；".join(part for part in parts if part)
 
 
@@ -448,7 +577,7 @@ def _product_review_problem(evidence: DissatisfactionEvidence) -> str:
     if warnings:
         parts.append("审查提醒：" + "；".join(warnings[:2]))
     if changed_files:
-        parts.append("本轮重点变更文件：" + "、".join(changed_files[:6]))
+        parts.append("当前重点变更文件：" + "、".join(changed_files[:6]))
     if evidence_items:
         parts.append("审查范围：" + "；".join(evidence_items[:2]))
     elif review.get("file_count") not in ("", None):
@@ -776,7 +905,7 @@ def _current_round_fallback_reason(evidence: DissatisfactionEvidence) -> str:
     )
     process = (
         f"过程记录没有按“入口点击、接口或页面状态变化、错误提示、操作记录”把 {areas} 收口说明；"
-        "我看不到哪一步实际点了、预期是什么、结果变成什么，所以这轮还不能按已经验收通过处理。"
+        "模型交付说明没有讲清哪一步实际点了、预期是什么、结果变成什么，导致业务侧不能按已经验收通过处理。"
     )
     return f"{PRODUCT_LABEL}{product}\n{PROCESS_LABEL}{process}"
 

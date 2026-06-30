@@ -150,9 +150,9 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
             }
         if observation.intervention_count >= observation.max_interventions:
             return {
-                "action": "wait",
+                "action": "fail",
                 "reason": "pending_intervention_visible_limit_reached",
-                "recoverable": True,
+                "recoverable": False,
                 **context,
             }
         return {
