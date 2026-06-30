@@ -45,6 +45,11 @@ ACTION_PRIORITY = {
     "keep": 65,
     "run": 60,
 }
+CONFIRM_EXECUTION_TITLE_MARKERS = (
+    "\u786e\u8ba4\u6267\u884c",
+    "confirm execution",
+    "confirm run",
+)
 UNSAFE_BUTTON_MARKERS = (
     "\u5220\u9664",
     "\u6e05\u7a7a",
@@ -108,6 +113,7 @@ CLICK_RECOMMENDATIONS = {
     "click_delete_button",
     "click_discard_button",
     "click_cancel_button",
+    "expand_confirm_card",
 }
 SCROLL_RECOMMENDATIONS = {
     "scroll_inner_panel",
@@ -121,6 +127,7 @@ RECOMMENDATION_ACTIONS = {
     "click_delete_button": "delete_button",
     "click_discard_button": "discard_button",
     "click_cancel_button": "cancel_button",
+    "expand_confirm_card": "expand_confirm_card",
 }
 
 
@@ -207,6 +214,16 @@ def diagnose_ui(
         confidence = float(local_visual_suggested.get("confidence") or 0.0)
         suggested = local_visual_suggested["suggested_intervention"]
         reason = str(local_visual_suggested.get("reason") or "local_visual_action_target")
+    elif _is_direct_visual_action(visual_suggested):
+        state = str(visual_suggested.get("state") or "awaiting_visual_action")
+        confidence = float(visual_suggested.get("confidence") or 0.0)
+        suggested = visual_suggested["suggested_intervention"]
+        reason = str(visual_suggested.get("reason") or "ai_visual_action_target")
+    elif collapsed_confirm_card := _collapsed_confirm_card_intervention(text, buttons, matches, window_rect, window):
+        state = "awaiting_collapsed_confirm_card"
+        confidence = float(collapsed_confirm_card.get("confidence") or 0.86)
+        suggested = collapsed_confirm_card["suggested_intervention"]
+        reason = str(collapsed_confirm_card.get("reason") or "collapsed_confirm_card")
     elif _visual_completion_detected(visual):
         state = "completed"
         confidence = _completion_confidence(text, visual)
@@ -344,17 +361,26 @@ def _has_waiting_action_text(text: str) -> bool:
     return any(marker.lower() in lowered for marker in WAITING_ACTION_MARKERS)
 
 
+def _has_confirm_execution_title(text: str) -> bool:
+    normalized = _normalize(text)
+    return any(_normalize(marker) in normalized for marker in CONFIRM_EXECUTION_TITLE_MARKERS)
+
+
 def _has_destructive_choice_text(text: str) -> bool:
     normalized = _normalize(text)
     return any(_normalize(marker) in normalized for marker in DESTRUCTIVE_CHOICE_MARKERS)
 
 
 def _button_summaries(window) -> list[dict[str, Any]]:
+    return _control_summaries(window, "Button")
+
+
+def _control_summaries(window, control_type: str) -> list[dict[str, Any]]:
     try:
-        controls = window.descendants(control_type="Button")
+        controls = window.descendants(control_type=control_type)
     except Exception as exc:
-        raise TraeAutomationError(f"Could not inspect Trae buttons: {exc}") from exc
-    buttons: list[dict[str, Any]] = []
+        raise TraeAutomationError(f"Could not inspect Trae {control_type} controls: {exc}") from exc
+    controls_summary: list[dict[str, Any]] = []
     for control in controls[:400]:
         try:
             text = control.window_text().strip()
@@ -367,7 +393,7 @@ def _button_summaries(window) -> list[dict[str, Any]]:
         bottom = int(getattr(rect, "bottom", top))
         if right <= left or bottom <= top:
             continue
-        buttons.append(
+        controls_summary.append(
             {
                 "name": text,
                 "x": left,
@@ -378,13 +404,15 @@ def _button_summaries(window) -> list[dict[str, Any]]:
                 "center_y": (top + bottom) // 2,
             }
         )
-    return buttons
+    return controls_summary
 
 
 def _classify_button(button: dict[str, Any]) -> dict | None:
     name = str(button.get("name") or "").strip()
     normalized = _normalize(name)
     if not normalized:
+        return None
+    if _looks_like_confirm_execution_header(button, require_header_shape=True):
         return None
     if any(marker in normalized for marker in (_normalize(item) for item in UNSAFE_BUTTON_MARKERS)):
         return None
@@ -414,6 +442,77 @@ def _action_matches(buttons: list[dict[str, Any]], window_rect: dict | None) -> 
         matches.append(match)
     matches.sort(key=lambda item: (item["priority"], item["confidence"], int(item["button"].get("center_y") or 0)), reverse=True)
     return matches
+
+
+def _collapsed_confirm_card_intervention(
+    text: str,
+    buttons: list[dict[str, Any]],
+    matches: list[dict],
+    window_rect: dict | None,
+    window,
+) -> dict[str, Any]:
+    if matches or not _has_waiting_action_text(text) or not _has_confirm_execution_title(text):
+        return {}
+    header = _confirm_execution_header_target(buttons, window, window_rect)
+    if not header:
+        return {}
+    return {
+        "confidence": 0.88,
+        "reason": "collapsed_confirm_card_header_visible",
+        "suggested_intervention": {
+            "mode": "expand-confirm-card",
+            "action": "expand_confirm_card",
+            "x": header.get("center_x"),
+            "y": header.get("center_y"),
+            "button": header.get("name") or "\u786e\u8ba4\u6267\u884c",
+            "confidence": 0.88,
+            "source": "local_uia",
+            "risk": "safe",
+            "recommended_action": "expand_confirm_card",
+        },
+    }
+
+
+def _confirm_execution_header_target(
+    buttons: list[dict[str, Any]],
+    window,
+    window_rect: dict | None,
+) -> dict[str, Any] | None:
+    for control in buttons:
+        if _looks_like_confirm_execution_header(control) and _button_in_assistant_pane(control, window_rect):
+            return control
+    try:
+        text_controls = _control_summaries(window, "Text")
+    except TraeAutomationError:
+        text_controls = []
+    for control in text_controls:
+        if _looks_like_confirm_execution_header(control) and _button_in_assistant_pane(control, window_rect):
+            return control
+    return None
+
+
+def _looks_like_confirm_execution_header(control: dict[str, Any], *, require_header_shape: bool = False) -> bool:
+    normalized = _normalize(str(control.get("name") or ""))
+    if not normalized:
+        return False
+    markers = [_normalize(marker) for marker in CONFIRM_EXECUTION_TITLE_MARKERS]
+    chinese = _normalize("\u786e\u8ba4\u6267\u884c")
+    looks_like_title = normalized in markers or (normalized.startswith(chinese) and len(normalized) <= len(chinese) + 3)
+    if not looks_like_title:
+        return False
+    if not require_header_shape:
+        return True
+    width = int(control.get("width") or 0)
+    return width >= 96
+
+
+def _is_direct_visual_action(visual_suggested: dict[str, Any]) -> bool:
+    if not isinstance(visual_suggested, dict) or not visual_suggested:
+        return False
+    suggested = visual_suggested.get("suggested_intervention")
+    if not isinstance(suggested, dict):
+        return False
+    return str(suggested.get("mode") or "") in {"click-point", "expand-confirm-card"}
 
 
 def _delete_confirmation_intervention(text: str, matches: list[dict]) -> dict[str, Any]:
@@ -687,13 +786,14 @@ def _visual_diagnosis_context(
             "Never return screen_state=completed or recommended_action=collect_trace_candidate when a waiting-for-user-action card is visible.",
             "If Trae asks whether it can delete/remove something, returning click_delete_button with risk=safe is allowed.",
             "Discard, reset, cancel, clear, or uncertain destructive prompts must stay manual_required/do_not_click.",
-            "If only part of the action card is visible, return recommended_action=scroll_inner_panel instead of completed.",
+            "If the confirmation card is collapsed and only the \u786e\u8ba4\u6267\u884c header is visible, return recommended_action=expand_confirm_card with the header target.",
+            "If only part of the action card is visible below the viewport, return recommended_action=scroll_inner_panel instead of completed.",
             "Safe click actions are explicit run/continue/keep/save buttons and explicit Trae delete confirmations.",
         ],
         "required_json_shape": {
             "status": "found|partial|not_found",
             "screen_state": "completed|still_generating|prompt_submitted|prompt_still_in_composer|prompt_not_submitted|manual_required|awaiting_action|needs_scroll_inner_panel",
-            "recommended_action": "wait|collect_trace_candidate|click_run_button|click_continue_button|click_keep_button|click_save_button|click_delete_button|scroll_inner_panel|do_not_click|type_continue|answer_terminal_prompt",
+            "recommended_action": "wait|collect_trace_candidate|click_run_button|click_continue_button|click_keep_button|click_save_button|click_delete_button|expand_confirm_card|scroll_inner_panel|do_not_click|type_continue|answer_terminal_prompt",
             "risk": "safe|blocked",
             "blocked_reason": "required when risk is blocked",
         },
@@ -724,6 +824,7 @@ def _visual_task_instructions(task: str) -> str:
         "Treat waiting-for-user-action cards as blockers, not completion evidence. "
         "If a visible confirmation card asks whether Trae can delete/remove something, return the delete button target with risk=safe. Keep discard/reset/cancel/clear prompts blocked unless explicitly safe. "
         "If a safe confirmation card asks to execute, continue, or keep/save changes, return the exact visible button target. "
+        "If a \u786e\u8ba4\u6267\u884c confirmation card is collapsed and the execute button is hidden, target the card header with recommended_action=expand_confirm_card. "
         "Return JSON only."
     )
 
@@ -812,12 +913,13 @@ def _visual_suggested_intervention(visual: dict[str, Any], window_rect: dict | N
             "suggested_intervention": {},
         }
     center = target.get("center") if isinstance(target.get("center"), dict) else {}
+    mode = "expand-confirm-card" if action == "expand_confirm_card" else "click-point"
     return {
         "state": str(analysis.get("screen_state") or f"awaiting_{action}"),
         "confidence": analysis.get("confidence") or target.get("confidence") or 0.0,
         "reason": str(analysis.get("reason") or target.get("reason") or "ai_visual_action_target"),
         "suggested_intervention": {
-            "mode": "click-point",
+            "mode": mode,
             "action": action,
             "x": center.get("x"),
             "y": center.get("y"),

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.13-stop-session-browser"
+WORKER_VERSION = "0.1.14-expand-confirm-card"
 
 
 class WorkerSettings(BaseSettings):

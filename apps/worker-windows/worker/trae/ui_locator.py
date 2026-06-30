@@ -27,6 +27,7 @@ SAFE_ACTIONS = {
     "remove_button",
     "reset_button",
     "cancel_button",
+    "expand_confirm_card",
 }
 ACTION_ALIASES = {
     "continue": "continue_button",
@@ -52,6 +53,8 @@ ACTION_ALIASES = {
     "discard": "discard_button",
     "reset": "reset_button",
     "cancel": "cancel_button",
+    "confirm_card_header": "expand_confirm_card",
+    "expand_confirm_card": "expand_confirm_card",
 }
 SEND_BUTTON_BLOCKLIST = (
     "voice",
@@ -189,6 +192,7 @@ def validate_target(
             "remove_button",
             "reset_button",
             "cancel_button",
+            "expand_confirm_card",
         } and not (0.0 <= rx <= 0.55 and 0.08 <= ry <= 0.96):
             return False, "assistant_action_outside_expected_region"
     return True, "ok"

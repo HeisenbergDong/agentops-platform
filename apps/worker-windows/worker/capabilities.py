@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.13-stop-session-browser"
+WORKER_RUNTIME_VERSION = "0.1.14-expand-confirm-card"
 
 CAPABILITIES = [
     "auto_launch_trae",

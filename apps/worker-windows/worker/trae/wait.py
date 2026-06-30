@@ -476,6 +476,8 @@ def _intervention_progress_message(intervention: dict) -> str:
             return "Worker 已处理 Trae CN 终端确认输入，继续观察执行结果。"
         if str(suggested.get("mode") or "") == "scroll-inner-panel":
             return "Worker 已滚动 Trae CN 内层确认区域，继续查找安全操作按钮。"
+        if str(suggested.get("mode") or "") == "expand-confirm-card":
+            return "Worker 检测到 Trae CN「确认执行」卡片已收起，已点击标题展开，继续查找「执行」按钮。"
         return "Worker 已完成一次 Trae CN 自动介入操作，继续观察结果。"
     if status == "skipped":
         return "Worker 识别到 Trae CN 待处理状态，但没有找到符合安全策略的操作目标，继续观察。"
@@ -521,6 +523,7 @@ def _compact_intervention_progress(intervention: dict) -> dict:
         "risk": str(suggested.get("risk") or ""),
         "click_result_status": str(result.get("status") or ""),
         "click_mode": str(result.get("mode") or ""),
+        "result_action": str(result.get("action") or ""),
         "local_visual_status": str(local_visual.get("status") or ""),
         "local_visual_reason": str(local_visual.get("reason") or ""),
     }

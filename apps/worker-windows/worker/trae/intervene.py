@@ -180,6 +180,19 @@ def apply_intervention(
         if _is_forbidden_generation_stop_point(intervention, workspace_path, timeout_seconds):
             raise TraeAutomationError("Refusing to click the Trae composer stop-button region during recovery")
         return click_screen_point(intervention.get("x"), intervention.get("y"))
+    if mode == "expand-confirm-card":
+        if str(intervention.get("risk") or "safe") != "safe":
+            raise TraeAutomationError("LLM marked Trae confirm-card expansion target as unsafe")
+        if workspace_path:
+            focus_trae_workspace_or_any(
+                timeout_seconds=timeout_seconds,
+                workspace_path=workspace_path,
+            )
+        else:
+            focus_trae(timeout_seconds=timeout_seconds)
+        clicked = click_screen_point(intervention.get("x"), intervention.get("y"))
+        time.sleep(0.25)
+        return {**clicked, "mode": "expand-confirm-card", "action": "expand_confirm_card"}
     if mode == "terminal-input":
         return send_text_to_trae(str(intervention.get("text") or "y"), submit=True, workspace_path=workspace_path)
     if mode == "continue-text":
@@ -221,6 +234,8 @@ def _action_taken_from_result(result: dict[str, Any]) -> str:
         return "typed_terminal_input"
     if mode == "scroll-inner-panel":
         return "scrolled_inner_panel"
+    if mode == "expand-confirm-card":
+        return "expanded_confirm_card"
     if mode == "click-point":
         return "clicked_button"
     if mode == "primary-fallback":

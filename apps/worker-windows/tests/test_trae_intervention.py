@@ -210,6 +210,112 @@ def test_diagnose_ui_scrolls_again_when_action_card_is_below_view(monkeypatch: p
     assert result["diagnosis_attempts"][1]["match_count"] == 1
 
 
+def test_diagnose_ui_expands_collapsed_confirm_execution_card(monkeypatch: pytest.MonkeyPatch):
+    class Rect:
+        left = 90
+        top = 340
+        right = 410
+        bottom = 382
+
+    class FakeHeaderButton:
+        def window_text(self):
+            return "\u786e\u8ba4\u6267\u884c"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeHeaderButton()] if control_type == "Button" else []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        "worker.trae.diagnose.window_text_snapshot",
+        lambda window, limit=500: "\u786e\u8ba4\u6267\u884c\n\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c",
+    )
+
+    result = diagnose_ui()
+
+    assert result["ok"] is True
+    assert result["state"] == "awaiting_collapsed_confirm_card"
+    assert result["matches"] == []
+    assert result["suggested_intervention"] == {
+        "mode": "expand-confirm-card",
+        "action": "expand_confirm_card",
+        "x": 250,
+        "y": 361,
+        "button": "\u786e\u8ba4\u6267\u884c",
+        "confidence": 0.88,
+        "source": "local_uia",
+        "risk": "safe",
+        "recommended_action": "expand_confirm_card",
+    }
+
+
+def test_diagnose_ui_expands_collapsed_card_before_ai_scroll(monkeypatch: pytest.MonkeyPatch, tmp_path):
+    screenshot = tmp_path / "collapsed-confirm-card.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+
+    class Rect:
+        left = 90
+        top = 340
+        right = 410
+        bottom = 382
+
+    class FakeHeaderButton:
+        def window_text(self):
+            return "\u786e\u8ba4\u6267\u884c"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeHeaderButton()] if control_type == "Button" else []
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr(
+        "worker.trae.diagnose.window_text_snapshot",
+        lambda window, limit=500: "\u786e\u8ba4\u6267\u884c\n\u6b63\u5728\u7b49\u5f85\u4f60\u7684\u64cd\u4f5c",
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+
+    result = diagnose_ui(
+        ui_analyst=lambda path, context: {
+            "analysis": {
+                "status": "partial",
+                "screen_state": "needs_scroll_inner_panel",
+                "recommended_action": "scroll_inner_panel",
+                "confidence": 0.82,
+                "risk": "safe",
+            }
+        }
+    )
+
+    assert result["state"] == "awaiting_collapsed_confirm_card"
+    assert result["suggested_intervention"]["mode"] == "expand-confirm-card"
+    assert result["suggested_intervention"]["recommended_action"] == "expand_confirm_card"
+
+
 def test_diagnose_ui_prioritizes_3003_recovery_over_keep_button(monkeypatch: pytest.MonkeyPatch):
     class Rect:
         left = 100
@@ -579,6 +685,32 @@ def test_continue_text_intervention_targets_chat_prompt(monkeypatch: pytest.Monk
     assert result["status"] == "applied"
     assert result["mode"] == "continue-text"
     assert result["input"]["method"] == "adbz_coordinate_primary"
+
+
+def test_apply_intervention_expands_confirm_card(monkeypatch: pytest.MonkeyPatch):
+    clicks = []
+
+    monkeypatch.setattr("worker.trae.intervene.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.intervene.time.sleep", lambda seconds: None)
+    monkeypatch.setattr(
+        "worker.trae.intervene.click_screen_point",
+        lambda x, y: clicks.append((x, y)) or {"status": "applied", "mode": "click-point", "x": int(x), "y": int(y)},
+    )
+
+    result = apply_intervention(
+        {
+            "mode": "expand-confirm-card",
+            "action": "expand_confirm_card",
+            "x": 250,
+            "y": 361,
+            "risk": "safe",
+        }
+    )
+
+    assert clicks == [(250, 361)]
+    assert result["status"] == "applied"
+    assert result["mode"] == "expand-confirm-card"
+    assert result["action"] == "expand_confirm_card"
 
 
 def test_click_continue_reports_typed_continue_when_no_button(monkeypatch: pytest.MonkeyPatch):
