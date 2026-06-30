@@ -137,6 +137,7 @@ def diagnose_ui(
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
     task: str = "find_reply_action_button",
     workspace_path: str | Path | None = None,
+    recovery_reason: str = "",
 ) -> dict:
     if workspace_path:
         focus_trae_workspace_or_any(
@@ -179,6 +180,7 @@ def diagnose_ui(
             window_title=window.window_text(),
             text_sample=text[-1600:],
             buttons=buttons[:40],
+            recovery_reason=recovery_reason,
         )
     elif window_rect:
         visual = _diagnose_local_visual(window_rect)
@@ -191,6 +193,7 @@ def diagnose_ui(
     reason = ""
     visual_suggested = _visual_suggested_intervention(visual, window_rect)
     local_visual_suggested = _local_visual_suggested_intervention(visual, window_rect)
+    visual_continue = _is_continue_text_suggestion(visual_suggested)
     delete_confirmation = _delete_confirmation_intervention(text, matches)
     destructive_waiting = _destructive_waiting_intervention(text, buttons)
     safe_destructive_visual = _safe_destructive_visual_intervention(visual_suggested, text, visual, workspace_path)
@@ -209,6 +212,11 @@ def diagnose_ui(
         confidence = float(destructive_waiting.get("confidence") or 0.9)
         suggested = destructive_waiting["suggested_intervention"]
         reason = str(destructive_waiting.get("reason") or "local_waiting_destructive_confirmation")
+    elif visual_continue:
+        state = str(visual_suggested.get("state") or "awaiting_continue")
+        confidence = float(visual_suggested.get("confidence") or 0.82)
+        suggested = visual_suggested["suggested_intervention"]
+        reason = str(visual_suggested.get("reason") or "ai_visual_type_continue")
     elif local_visual_suggested:
         state = str(local_visual_suggested.get("state") or "awaiting_local_visual_action")
         confidence = float(local_visual_suggested.get("confidence") or 0.0)
@@ -515,6 +523,15 @@ def _is_direct_visual_action(visual_suggested: dict[str, Any]) -> bool:
     return str(suggested.get("mode") or "") in {"click-point", "expand-confirm-card"}
 
 
+def _is_continue_text_suggestion(visual_suggested: dict[str, Any]) -> bool:
+    if not isinstance(visual_suggested, dict) or not visual_suggested:
+        return False
+    suggested = visual_suggested.get("suggested_intervention")
+    if not isinstance(suggested, dict):
+        return False
+    return str(suggested.get("mode") or "") == "continue-text"
+
+
 def _delete_confirmation_intervention(text: str, matches: list[dict]) -> dict[str, Any]:
     normalized_text = _normalize(text)
     if not normalized_text or not any(marker in normalized_text for marker in DELETE_CONFIRMATION_MARKERS):
@@ -668,6 +685,7 @@ def _diagnose_ai_visual(
     window_title: str = "",
     text_sample: str = "",
     buttons: list[dict[str, Any]] | None = None,
+    recovery_reason: str = "",
 ) -> dict[str, Any]:
     if not window_rect:
         return {"status": "not_found", "reason": "missing_window_rect"}
@@ -696,6 +714,7 @@ def _diagnose_ai_visual(
                     task=task,
                     text_sample=text_sample,
                     buttons=buttons or [],
+                    recovery_reason=recovery_reason,
                 ),
             )
             ai_analysis = response.get("analysis") if isinstance(response, dict) else response
@@ -756,6 +775,7 @@ def _visual_diagnosis_context(
     task: str,
     text_sample: str = "",
     buttons: list[dict[str, Any]] | None = None,
+    recovery_reason: str = "",
 ) -> dict[str, Any]:
     left, top, right, bottom = rect
     return {
@@ -799,6 +819,7 @@ def _visual_diagnosis_context(
         },
         "visible_text_sample": text_sample,
         "uia_buttons": buttons or [],
+        "recovery_reason": recovery_reason,
         "allow_trae_delete_confirmations": True,
         "allowed_destructive_actions": ["delete_button", "remove_button"],
         "safe_destructive_action_policy": {
@@ -821,6 +842,7 @@ def _visual_task_instructions(task: str) -> str:
         )
     return (
         "Decide whether the current Trae task is completed, still generating, or waiting for a user action. "
+        "If recovery_reason says trae_turn_not_completed:interrupted, inspect the screenshot text first; return type_continue when the turn looks interrupted, failed, retryable, or ready for the user to continue. "
         "Treat waiting-for-user-action cards as blockers, not completion evidence. "
         "If a visible confirmation card asks whether Trae can delete/remove something, return the delete button target with risk=safe. Keep discard/reset/cancel/clear prompts blocked unless explicitly safe. "
         "If a safe confirmation card asks to execute, continue, or keep/save changes, return the exact visible button target. "

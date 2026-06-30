@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.14-expand-confirm-card"
+WORKER_RUNTIME_VERSION = "0.1.15-interrupted-turn-recovery"
 
 CAPABILITIES = [
     "auto_launch_trae",

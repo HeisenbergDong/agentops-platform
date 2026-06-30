@@ -5,11 +5,13 @@ from typing import Any
 
 
 RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
+RECOVERABLE_INTERRUPTED_TURN_REASONS = {"trae_turn_not_completed:interrupted"}
 RECOVERABLE_TURN_REASONS = {
     "awaiting_current_continuation",
     "no_completed_turn_after_prompt_send",
     "current_turn_missing",
     "low_confidence_context_match",
+    "trae_turn_not_completed:interrupted",
 }
 PENDING_INTERVENTION_MARKERS = (
     "\u53d8\u66f4\u5df2\u5b8c\u6210",
@@ -119,6 +121,15 @@ def decide_next_action(observation: SupervisorObservation) -> dict[str, Any]:
         return {
             "action": "recover_service_interruption" if output_reason == "service_interrupted" else "continue_output",
             "reason": output_reason,
+            "recoverable": True,
+            **context,
+        }
+
+    gate_reason = str(gate.get("reason") or "")
+    if gate_reason in RECOVERABLE_INTERRUPTED_TURN_REASONS:
+        return {
+            "action": "recover_interrupted_turn",
+            "reason": gate_reason,
             "recoverable": True,
             **context,
         }

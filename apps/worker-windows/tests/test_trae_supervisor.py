@@ -210,6 +210,24 @@ def test_supervisor_diagnoses_chrome_only_after_idle_threshold():
     assert decision["reason"] == "window_chrome_only"
 
 
+def test_supervisor_recovers_interrupted_turn_even_when_uia_reads_chrome_only():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed",
+            output_probe={"reason": "missing_tool_trace_markers"},
+            turn_probe={"status": "found", "turn_status": "interrupted", "session_id": "s1", "user_message_id": "u1"},
+            window_chrome_only=True,
+            idle_seconds=15,
+            intervention_idle_seconds=30,
+            intervention_count=3,
+            max_interventions=3,
+        )
+    )
+
+    assert decision["action"] == "recover_interrupted_turn"
+    assert decision["reason"] == "trae_turn_not_completed:interrupted"
+
+
 def test_supervisor_collects_trace_from_visible_task_complete_text():
     decision = decide_next_action(
         SupervisorObservation(

@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.14-expand-confirm-card"
+WORKER_VERSION = "0.1.15-interrupted-turn-recovery"
 
 
 class WorkerSettings(BaseSettings):

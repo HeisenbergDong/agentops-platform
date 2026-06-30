@@ -547,6 +547,8 @@ def _supervisor_progress_message(decision: dict) -> str:
     if action == "diagnose_idle":
         idle = int(float(decision.get("idle_seconds") or 0))
         return f"\u0054\u0072\u0061\u0065 \u0043\u004e \u5df2 {idle} \u79d2\u65e0\u660e\u663e\u53d8\u5316\uff0c\u0057\u006f\u0072\u006b\u0065\u0072 \u6b63\u5728\u68c0\u67e5\u662f\u5426\u9700\u8981\u64cd\u4f5c\u3002"
+    if action == "recover_interrupted_turn":
+        return "\u68c0\u6d4b\u5230 \u0054\u0072\u0061\u0065 \u0043\u004e \u56de\u5408\u5f02\u5e38\u4e2d\u65ad\uff0c\u0057\u006f\u0072\u006b\u0065\u0072 \u6b63\u5728\u622a\u56fe\u5224\u65ad\u662f\u5426\u9700\u8981\u53d1\u9001\u7ee7\u7eed\u3002"
     if action in {"apply_pending_ui", "recover_service_interruption", "continue_output", "answer_terminal_prompt"}:
         return "\u0057\u006f\u0072\u006b\u0065\u0072 \u53d1\u73b0\u660e\u786e\u7684 \u0054\u0072\u0061\u0065 \u0043\u004e \u5f85\u5904\u7406\u72b6\u6001\uff0c\u6b63\u5728\u5c1d\u8bd5\u5904\u7406\u3002"
     return ""
@@ -638,7 +640,14 @@ def _handle_supervisor_decision(
         else:
             message = f"Trae supervisor could not recover current turn ({reason})"
         return {"status": "failed", "error": message, "supervisor_decision": decision, **_decision_observation_fields(decision)}
-    if action in {"recover_service_interruption", "continue_output", "answer_terminal_prompt", "apply_pending_ui", "diagnose_idle"}:
+    if action in {
+        "recover_service_interruption",
+        "continue_output",
+        "recover_interrupted_turn",
+        "answer_terminal_prompt",
+        "apply_pending_ui",
+        "diagnose_idle",
+    }:
         reason = str(decision.get("reason") or action)
         if action == "answer_terminal_prompt":
             reason = "terminal_prompt"
@@ -678,7 +687,7 @@ def _handle_supervisor_decision(
                 **_decision_observation_fields(decision),
             }
         interventions.append(intervention)
-        if action in {"recover_service_interruption", "continue_output"} and intervention.get("status") != "applied":
+        if action in {"recover_service_interruption", "continue_output", "recover_interrupted_turn"} and intervention.get("status") != "applied":
             return {
                 "status": "failed",
                 "error": f"Trae output is stable but not complete ({decision.get('reason')}); auto intervention failed",
@@ -760,6 +769,7 @@ def _try_auto_intervention(
             ui_analyst=ui_analyst,
             task="wait_completion_state",
             workspace_path=workspace_path or None,
+            recovery_reason=reason,
         )
     except Exception as exc:
         return {
@@ -777,6 +787,8 @@ def _try_auto_intervention(
         }
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
     if reason == "service_interrupted":
+        suggested = {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}
+    elif reason.startswith("trae_turn_not_completed:interrupted") and not suggested:
         suggested = {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}
     elif not suggested and reason in RECOVERABLE_OUTPUT_REASONS:
         suggested = {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}

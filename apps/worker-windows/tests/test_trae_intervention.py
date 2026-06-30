@@ -351,6 +351,75 @@ def test_diagnose_ui_prioritizes_3003_recovery_over_keep_button(monkeypatch: pyt
     assert result["suggested_intervention"] == {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
 
 
+def test_diagnose_ui_prefers_llm_continue_over_local_run_button(monkeypatch: pytest.MonkeyPatch):
+    class Rect:
+        left = 100
+        top = 200
+        right = 220
+        bottom = 240
+
+    class FakeButton:
+        def window_text(self):
+            return "\u6267\u884c"
+
+        def rectangle(self):
+            return Rect()
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return [FakeButton()] if control_type == "Button" else []
+
+    def fake_ui_analyst(path, context):
+        return {
+            "analysis": {
+                "status": "found",
+                "screen_state": "model_error_3003",
+                "recommended_action": "type_continue",
+                "confidence": 0.95,
+                "risk": "safe",
+                "reason": "model request failed and the composer is available",
+            }
+        }
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
+    monkeypatch.setattr("worker.trae.diagnose._window_rect", lambda window: {"left": 0, "top": 0, "right": 1000, "bottom": 1000})
+    monkeypatch.setattr(
+        "worker.trae.diagnose._local_visual_suggested_intervention",
+        lambda visual, window_rect: {
+            "state": "awaiting_run_confirmation",
+            "confidence": 0.86,
+            "reason": "local_run_button",
+            "suggested_intervention": {
+                "mode": "click-point",
+                "action": "run_button",
+                "x": 677,
+                "y": 394,
+                "button": "\u6267\u884c",
+            },
+        },
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {
+            "path": "fake.png",
+            "status": "captured",
+        },
+    )
+
+    result = diagnose_ui(ui_analyst=fake_ui_analyst)
+
+    assert result["state"] == "model_error_3003"
+    assert result["suggested_intervention"] == {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
+
+
 def test_diagnose_ui_detects_terminal_prompt(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         def window_text(self):
@@ -1068,6 +1137,56 @@ def test_wait_completion_keeps_observing_restored_window_chrome_text(monkeypatch
         )
 
     assert "did not become stable" in str(exc.value)
+
+
+def test_wait_completion_recovers_interrupted_turn_from_chrome_only_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    interventions = []
+    progress = []
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "interrupted", "session_id": "sid", "user_message_id": "uid"},
+    )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+
+    def fake_diagnose(timeout_seconds, scroll_bottom, **_kwargs):
+        assert _kwargs["recovery_reason"] == "trae_turn_not_completed:interrupted"
+        return {"state": "idle_or_running", "suggested_intervention": {}}
+
+    monkeypatch.setattr(wait_module, "diagnose_ui", fake_diagnose)
+
+    def fake_apply(intervention, timeout_seconds, **_kwargs):
+        interventions.append(intervention)
+        return {"status": "applied", "mode": intervention.get("mode")}
+
+    monkeypatch.setattr(wait_module, "apply_intervention", fake_apply)
+
+    with pytest.raises(wait_module.TraeAutomationError):
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            progress_callback=progress.append,
+        )
+
+    assert interventions == [{"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}]
+    assert any(event.get("supervisor_action") == "recover_interrupted_turn" for event in progress)
 
 
 def test_wait_completion_accepts_visible_task_complete_text(monkeypatch: pytest.MonkeyPatch):
