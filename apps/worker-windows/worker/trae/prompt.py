@@ -7,7 +7,12 @@ from worker.system.clipboard import ClipboardError, set_clipboard_text
 from worker.trae import ui_cache
 from worker.trae.session_probe import probe_latest_trae_turn
 from worker.trae.screenshot import capture_screenshot
-from worker.trae.ui_locator import locate_prompt_targets, target_for_action, validate_target
+from worker.trae.ui_locator import (
+    locate_prompt_targets,
+    looks_like_active_send_button_pixel,
+    target_for_action,
+    validate_target,
+)
 from worker.trae.window import TraeAutomationError, focus_trae, wait_for_workspace_window_or_any
 
 PROMPT_INPUT_X_RATIO = 0.26
@@ -1056,7 +1061,7 @@ def _verify_send_button_visual(
     if not (0 <= cx < image.width and 0 <= cy < image.height):
         return {"status": "failed", "reason": "send_visual_guard_center_outside_screenshot"}
     radius = 18
-    green_pixels = 0
+    active_pixels = 0
     bright_pixels = 0
     dark_points: list[tuple[int, int]] = []
     total = 0
@@ -1064,35 +1069,35 @@ def _verify_send_button_visual(
         for x in range(max(0, cx - radius), min(image.width, cx + radius + 1), 2):
             red, green, blue = image.getpixel((x, y))
             total += 1
-            if green >= 45 and green > red * 1.15 and green > blue * 1.05:
-                green_pixels += 1
+            if looks_like_active_send_button_pixel(red, green, blue):
+                active_pixels += 1
             if red >= 170 and green >= 170 and blue >= 170:
                 bright_pixels += 1
             if abs(x - cx) <= 9 and abs(y - cy) <= 9 and red <= 70 and green <= 95 and blue <= 95:
                 dark_points.append((x - cx, y - cy))
-    green_ratio = green_pixels / max(1, total)
+    active_ratio = active_pixels / max(1, total)
     if _looks_like_stop_generation_icon(dark_points):
         return {
             "status": "failed",
             "reason": "send_target_is_stop_generation_button",
-            "green_pixels": green_pixels,
-            "green_ratio": round(green_ratio, 4),
+            "active_pixels": active_pixels,
+            "active_ratio": round(active_ratio, 4),
             "dark_pixels": len(dark_points),
         }
-    # The valid Trae send control has a green square background. A microphone
-    # button is mostly grey/white and should fail this guard.
-    if green_pixels >= 10 and green_ratio >= 0.06:
+    # The valid Trae send control has a saturated green or blue square
+    # background. A microphone button is mostly grey/white and should fail this guard.
+    if active_pixels >= 10 and active_ratio >= 0.06:
         return {
             "status": "passed",
-            "reason": "green_send_button_near_target",
-            "green_pixels": green_pixels,
-            "green_ratio": round(green_ratio, 4),
+            "reason": "active_send_button_near_target",
+            "active_pixels": active_pixels,
+            "active_ratio": round(active_ratio, 4),
         }
     return {
         "status": "failed",
-        "reason": "send_target_not_green_send_button",
-        "green_pixels": green_pixels,
-        "green_ratio": round(green_ratio, 4),
+        "reason": "send_target_not_active_send_button",
+        "active_pixels": active_pixels,
+        "active_ratio": round(active_ratio, 4),
         "bright_pixels": bright_pixels,
     }
 
@@ -1491,7 +1496,8 @@ def _analysis_context(
         ],
         "failed_attempts": failed_attempts[-8:],
         "instructions": (
-            "Locate the Trae chat composer input and the active green send/up-arrow/paper-plane button. "
+            "Locate the Trae chat composer input and the active send/up-arrow/paper-plane button; "
+            "it may be green or blue. "
             "Do not choose microphone, voice input, audio, lightning, attachment, model selector, seed selector, "
             "or any other composer toolbar icon as send_button. If the candidate looks like microphone/voice, "
             "return not_found/do_not_click and explain it. Return JSON only."
@@ -1533,8 +1539,8 @@ def _submission_analysis_context(
             "awaiting_continue, service_interrupted, model_error_3003, or terminal_prompt when the submitted prompt "
             "has left the composer and Trae is processing or waiting for a safe next step. "
             "Return screen_state=prompt_still_in_composer if the prompt text is still visible in the composer or "
-            "the active green send button is still present next to a filled prompt input. "
-            "If the green composer control shows a stop/square icon while Trae is working, that means the prompt was submitted; "
+            "the active green/blue send button is still present next to a filled prompt input. "
+            "If the composer control shows a stop/square icon while Trae is working, that means the prompt was submitted; "
             "return generating or prompt_submitted and do not classify it as an active send button. "
             "Return screen_state=prompt_not_submitted if no submitted user prompt or generation is visible. "
             "Do not choose any click target for this task; classify only."

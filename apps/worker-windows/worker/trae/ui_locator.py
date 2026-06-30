@@ -100,7 +100,7 @@ def locate_prompt_targets(
     input_target = _find_prompt_input_area(image, window_rect)
     if input_target:
         targets.append(input_target)
-    send_target = _find_green_send_button(image, window_rect, input_target=input_target)
+    send_target = _find_active_send_button(image, window_rect, input_target=input_target)
     if send_target:
         targets.append(send_target)
     status = "found" if _has_actions(targets, {"prompt_input", "send_button"}) else "partial" if targets else "not_found"
@@ -277,7 +277,7 @@ def _looks_like_prompt_input_panel(image: Image.Image, cx: int, cy: int) -> bool
     )
 
 
-def _find_green_send_button(
+def _find_active_send_button(
     image: Image.Image,
     window_rect: tuple[int, int, int, int],
     *,
@@ -306,14 +306,15 @@ def _find_green_send_button(
     scan_top = max(0, int(max(height * 0.72, height * (input_ry - 0.08))))
     scan_bottom = min(image.height, int(height * 0.985))
     pixels = image.load()
-    green_points: list[tuple[int, int, int]] = []
+    send_points: list[tuple[int, int, int]] = []
     step = 2
     for y in range(scan_top, min(scan_bottom, image.height), step):
         for x in range(scan_left, min(scan_right, image.width), step):
             red, green, blue = pixels[x, y]
-            if _looks_like_send_green_pixel(red, green, blue):
-                green_points.append((x, y, green - max(red, blue)))
-    candidates = _green_send_button_candidates(green_points, image, window_rect)
+            weight = _send_button_pixel_weight(red, green, blue)
+            if weight > 0:
+                send_points.append((x, y, weight))
+    candidates = _send_button_candidates(send_points, image, window_rect)
     if not candidates:
         return None
     best = max(candidates, key=lambda item: item["score"])
@@ -327,15 +328,38 @@ def _find_green_send_button(
         window_rect,
         confidence,
         "local_vision",
-        f"green send button cluster in composer area; bbox={best['bbox']}; scan=adaptive",
+        f"active send button cluster in composer area; bbox={best['bbox']}; scan=adaptive",
     )
+
+
+def looks_like_active_send_button_pixel(red: int, green: int, blue: int) -> bool:
+    return _looks_like_send_green_pixel(red, green, blue) or _looks_like_send_blue_pixel(red, green, blue)
+
+
+def _send_button_pixel_weight(red: int, green: int, blue: int) -> int:
+    if _looks_like_send_green_pixel(red, green, blue):
+        return max(1, int(green - max(red, blue)))
+    if _looks_like_send_blue_pixel(red, green, blue):
+        return max(1, int(blue - red + max(0, green - red) * 0.35))
+    return 0
 
 
 def _looks_like_send_green_pixel(red: int, green: int, blue: int) -> bool:
     return green >= 54 and green > red * 1.18 and green > blue * 1.04 and green - min(red, blue) >= 10
 
 
-def _green_send_button_candidates(
+def _looks_like_send_blue_pixel(red: int, green: int, blue: int) -> bool:
+    return (
+        blue >= 120
+        and green >= 65
+        and blue >= green * 0.95
+        and blue > red * 1.45
+        and green > red * 1.15
+        and blue - red >= 45
+    )
+
+
+def _send_button_candidates(
     points: list[tuple[int, int, int]],
     image: Image.Image,
     window_rect: tuple[int, int, int, int],
@@ -345,7 +369,7 @@ def _green_send_button_candidates(
     left, top, right, bottom = window_rect
     width = max(1, right - left)
     height = max(1, bottom - top)
-    clusters = _green_pixel_clusters(points, min_points=14)
+    clusters = _send_button_pixel_clusters(points, min_points=14)
     candidates: list[dict[str, Any]] = []
     for cluster in clusters:
         cx = int(cluster["cx"])
@@ -375,7 +399,7 @@ def _green_send_button_candidates(
     return candidates
 
 
-def _green_pixel_clusters(points: list[tuple[int, int, int]], min_points: int) -> list[dict[str, Any]]:
+def _send_button_pixel_clusters(points: list[tuple[int, int, int]], min_points: int) -> list[dict[str, Any]]:
     clusters: list[dict[str, Any]] = []
     for x, y, weight in sorted(points, key=lambda item: (item[0], item[1])):
         match: dict[str, Any] | None = None
@@ -421,7 +445,7 @@ def _green_pixel_clusters(points: list[tuple[int, int, int]], min_points: int) -
 
 
 def _looks_like_stop_generation_icon(image: Image.Image, cx: int, cy: int) -> bool:
-    # During generation Trae reuses the green send-button slot for a stop square.
+    # During generation Trae reuses the send-button slot for a stop square.
     dark_points: list[tuple[int, int]] = []
     radius = 9
     for y in range(max(0, cy - radius), min(image.height, cy + radius + 1)):
@@ -433,16 +457,16 @@ def _looks_like_stop_generation_icon(image: Image.Image, cx: int, cy: int) -> bo
     dark_ratio = len(dark_points) / total
     if dark_ratio < 0.18 or dark_ratio > 0.82:
         return False
-    green_ring_points = 0
+    active_ring_points = 0
     for y in range(max(0, cy - 22), min(image.height, cy + 23), 2):
         for x in range(max(0, cx - 22), min(image.width, cx + 23), 2):
             distance = max(abs(x - cx), abs(y - cy))
             if distance < 12:
                 continue
             red, green, blue = image.getpixel((x, y))
-            if green >= 90 and green > red * 1.25 and green > blue * 1.05:
-                green_ring_points += 1
-    if green_ring_points < 16:
+            if looks_like_active_send_button_pixel(red, green, blue):
+                active_ring_points += 1
+    if active_ring_points < 16:
         return False
     row_counts: dict[int, int] = {}
     col_counts: dict[int, int] = {}

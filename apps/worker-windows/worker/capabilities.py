@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.15-interrupted-turn-recovery"
+WORKER_RUNTIME_VERSION = "0.1.16-blue-send-button"
 
 CAPABILITIES = [
     "auto_launch_trae",

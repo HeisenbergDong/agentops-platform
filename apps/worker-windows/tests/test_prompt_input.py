@@ -2,6 +2,7 @@ import pytest
 from PIL import Image, ImageDraw
 
 from worker.trae import prompt as prompt_module
+from worker.trae.prompt import _verify_send_button_visual as real_verify_send_button_visual
 from worker.trae.ui_locator import locate_prompt_targets
 
 
@@ -602,6 +603,50 @@ def test_local_vision_finds_send_button_in_wider_composer(tmp_path):
     assert "send_button" in actions
     assert 1160 <= actions["send_button"]["center"]["x"] <= 1240
     assert 940 <= actions["send_button"]["center"]["y"] <= 990
+
+
+def test_local_vision_finds_blue_send_button(tmp_path):
+    path = tmp_path / "trae-blue-composer.png"
+    image = Image.new("RGB", (1800, 1033), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((250, 820, 1300, 1015), fill=(42, 43, 48), outline=(65, 66, 72))
+    draw.rectangle((1180, 950, 1220, 984), fill=(22, 132, 240))
+    image.save(path)
+
+    result = locate_prompt_targets(path, (0, 0, 1800, 1033))
+
+    actions = {item["action"]: item for item in result["targets"]}
+    assert result["status"] == "found"
+    assert "prompt_input" in actions
+    assert "send_button" in actions
+    assert 1160 <= actions["send_button"]["center"]["x"] <= 1240
+    assert 940 <= actions["send_button"]["center"]["y"] <= 990
+
+
+def test_send_visual_guard_accepts_blue_send_button(monkeypatch, tmp_path):
+    path = tmp_path / "blue-send-guard.png"
+    image = Image.new("RGB", (640, 420), (28, 29, 30))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle((292, 352, 332, 388), fill=(22, 132, 240))
+    image.save(path)
+
+    monkeypatch.setattr(
+        prompt_module,
+        "capture_screenshot",
+        lambda **kwargs: {
+            "path": str(path),
+            "capture": {"bounds": {"left": 0, "top": 0, "right": 640, "bottom": 420}},
+        },
+    )
+
+    result = real_verify_send_button_visual(
+        {"center": {"x": 312, "y": 370}, "action": "send_button"},
+        (0, 0, 640, 420),
+        None,
+    )
+
+    assert result["status"] == "passed"
+    assert result["reason"] == "active_send_button_near_target"
 
 
 def test_local_vision_does_not_treat_loading_screen_as_prompt_input(tmp_path):
