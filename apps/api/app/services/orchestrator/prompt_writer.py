@@ -1105,6 +1105,15 @@ def _compact_prompt_state(db: Session, job: Job, round_: TaskRound, previous_rea
             for item in recent_logs
             if item.stage == "dissatisfaction_reason"
         ][:4],
+        "recent_no_issue_skips": [
+            {
+                "message": item.message,
+                "prompt": next((round_item.prompt for round_item in previous_rounds if round_item.id == item.round_id), ""),
+                "skip_reason": (item.extra or {}).get("skip_reason") or "review_no_issue",
+            }
+            for item in recent_logs
+            if item.stage == "review_no_issue_skipped"
+        ][:4],
     }
 
 

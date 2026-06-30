@@ -1239,6 +1239,37 @@ def test_review_snapshot_success_queues_scan_without_feishu(monkeypatch):
     assert db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.FEISHU_PREPARING)) is None
 
 
+def test_review_snapshot_failure_blocks_without_dissatisfaction():
+    db = _test_session()
+    job, round_, command = _create_git_submit_rows(db)
+    command.payload = {**command.payload, "purpose": "review_snapshot"}
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Command '['git', 'add', '-A']' timed out after 120 seconds",
+            data={},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    db.refresh(command)
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.GITHUB_FAILED_ABORT))
+    assert job.status == JobState.GITHUB_FAILED_ABORT
+    assert round_.status == JobState.GITHUB_FAILED_ABORT
+    assert round_.github_status == "failed"
+    assert command.status == "manual_required"
+    assert _latest_dissatisfaction_reason(db) is None
+    assert log is not None
+    assert log.extra["business_dissatisfaction_generated"] is False
+
+
 def test_capture_screenshot_rejects_failed_quality_gate():
     db = _test_session()
     job, round_, command = _create_capture_screenshot_rows(db)
@@ -1555,6 +1586,59 @@ def test_browser_acceptance_success_reuses_review_snapshot_for_feishu(monkeypatc
     assert round_.feishu_status == "written"
     assert written["fields"]["github地址"] == "https://github.com/acme/repo/commit/abc123"
     assert db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.GIT_SUBMIT.value)) is None
+
+
+def test_browser_acceptance_pass_after_no_issue_review_skips_current_candidate():
+    db = _test_session()
+    job, round_, command = _create_browser_acceptance_rows(db)
+    round_.round_index = 2
+    db.add(
+        RuntimeLog(
+            job_id=job.id,
+            round_id=round_.id,
+            stage="github_llm_product_review",
+            message="GitHub LLM product review completed.",
+            level="info",
+            extra={
+                "product_review": {
+                    "decision": "no_issue",
+                    "issues": [],
+                    "accepted_findings": [],
+                    "github_review": {"decision": "no_issue"},
+                }
+            },
+        )
+    )
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={"status": "passed", "url": "http://localhost:5173", "http_status": 200},
+        ),
+    )
+
+    next_round = db.scalar(
+        select(TaskRound)
+        .where(TaskRound.job_id == job.id, TaskRound.id != round_.id)
+        .order_by(TaskRound.created_at.desc())
+        .limit(1)
+    )
+    skip_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "review_no_issue_skipped"))
+    db.refresh(job)
+    db.refresh(round_)
+    assert job.status == JobState.GENERATING_PROMPT
+    assert round_.status == "review_no_issue_skipped"
+    assert _latest_dissatisfaction_reason(db) is None
+    assert db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.FEISHU_PREPARING)) is None
+    assert next_round is not None
+    assert next_round.status == JobState.GENERATING_PROMPT
+    assert skip_log is not None
+    assert skip_log.extra["business_dissatisfaction_generated"] is False
 
 
 def test_browser_acceptance_pass_after_product_review_issue_generates_single_final_reason():
@@ -2488,9 +2572,11 @@ def test_git_submit_failure_marks_github_failed_abort():
     assert round_.github_status == "push_failed"
     assert command.status == "manual_required"
     reason = _latest_dissatisfaction_reason(db)
-    assert reason is not None
-    assert "auth failed" in reason.extra["reason"]
-    assert "https_token_or_credential_failed" in reason.extra["reason"]
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.GITHUB_FAILED_ABORT))
+    assert reason is None
+    assert log is not None
+    assert "auth failed" in str(log.extra)
+    assert "https_token_or_credential_failed" in str(log.extra)
 
 
 def test_capture_screenshot_failure_marks_manual_required():

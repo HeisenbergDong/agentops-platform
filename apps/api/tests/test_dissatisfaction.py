@@ -25,6 +25,27 @@ def test_dissatisfaction_reason_skips_platform_feishu_failure():
     assert "developer.mozilla.org" not in result["platform_failure"]
 
 
+def test_dissatisfaction_reason_skips_platform_github_failure_without_product_evidence():
+    result = generate_dissatisfaction_reason(
+        DissatisfactionEvidence(
+            failure_stage="github_submitting",
+            failure_message="GitHub review snapshot failed; stopping before product review.",
+            prompt="招聘方工作台要支持职位列表、编辑操作、联动预览、数据统计、校验和异常反馈",
+            runtime_log_text=(
+                "[job_starting] 作业已创建\n"
+                "[cleaning_old_runtime] 已清理上一次运行遗留记录\n"
+                "[direction_queue] Job directions were normalized\n"
+            ),
+            data={"error": "Command '['git', 'add', '-A']' timed out after 120 seconds"},
+        )
+    )
+
+    assert result["status"] == "skipped_platform_submission_failure"
+    assert result["reason"] == ""
+    assert result["product_reason"] == ""
+    assert result["process_reason"] == ""
+
+
 def test_dissatisfaction_reason_uses_domain_hint_without_inventing_clicks():
     result = generate_dissatisfaction_reason(
         DissatisfactionEvidence(

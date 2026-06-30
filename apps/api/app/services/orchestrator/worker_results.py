@@ -40,7 +40,7 @@ MAX_ROUNDS_PER_PROJECT = 5
 MAX_ROUNDS_PER_INTERACTION_GROUP = 5
 MAX_SATISFIED_RATIO = 0.20
 TERMINAL_JOB_STATES = {JobState.STOPPED, JobState.PROJECT_COMPLETED}
-TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded"}
+TERMINAL_ROUND_STATES = {JobState.STOPPED, JobState.ROUND_COMPLETED, "first_round_discarded", "review_no_issue_skipped"}
 PAUSED_STATES = {JobState.PAUSED}
 IGNORED_RESULT_COMMAND_STATES = {"cancelled"}
 RECOVERABLE_COPY_GATE_REASONS = {
@@ -1686,6 +1686,9 @@ def _handle_browser_acceptance_result(db: Session, command: WorkerCommand, resul
                 level="warning",
             )
             return
+        if _should_skip_after_no_issue_review(db, job, round_):
+            _skip_round_after_no_issue_review(db, job, round_, extra)
+            return
         if round_ and _should_discard_satisfied_first_round(db, job, round_):
             _discard_first_round_satisfied(db, job, round_, extra)
             return
@@ -1760,28 +1763,13 @@ def _handle_git_submit_result(db: Session, command: WorkerCommand, result: Worke
 
     command.status = "manual_required"
     command.error = "Git submission failed; stopping before Feishu write."
-    _record_dissatisfaction(
+    _mark_github_blocked(
         db,
         job,
         round_,
-        command,
-        result,
-        JobState.GITHUB_SUBMITTING,
         "Git submission failed; stopping before Feishu write.",
+        data_status or result.status or "failed",
         extra,
-    )
-    job.status = JobState.GITHUB_FAILED_ABORT
-    if round_:
-        round_.status = JobState.GITHUB_FAILED_ABORT
-        round_.github_status = data_status or result.status or "failed"
-    add_log(
-        db,
-        job_id=job.id,
-        round_id=round_.id if round_ else None,
-        stage=JobState.GITHUB_FAILED_ABORT,
-        message="Git submission failed; stopping before Feishu write.",
-        level="error",
-        extra=extra,
     )
 
 
@@ -1811,26 +1799,40 @@ def _handle_github_review_snapshot_result(
 
     command.status = "manual_required"
     command.error = "GitHub review snapshot failed; stopping before product review."
-    _record_dissatisfaction(
+    block_extra = {
+        **extra,
+        "block_reason": "github_review_snapshot_failed",
+        "review_decision": "blocked_before_product_review",
+        "business_dissatisfaction_generated": False,
+    }
+    _mark_github_blocked(
         db,
         job,
         round_,
-        command,
-        result,
-        JobState.GITHUB_SUBMITTING,
-        "GitHub review snapshot failed; stopping before product review.",
-        extra,
+        "GitHub review snapshot failed; Trae成果物还没有形成可供LLM审查的GitHub快照。",
+        data_status or result.status or "review_snapshot_failed",
+        block_extra,
     )
+
+
+def _mark_github_blocked(
+    db: Session,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    github_status: str,
+    extra: dict,
+) -> None:
     job.status = JobState.GITHUB_FAILED_ABORT
     if round_:
         round_.status = JobState.GITHUB_FAILED_ABORT
-        round_.github_status = data_status or result.status or "review_snapshot_failed"
+        round_.github_status = github_status
     add_log(
         db,
         job_id=job.id,
         round_id=round_.id if round_ else None,
         stage=JobState.GITHUB_FAILED_ABORT,
-        message="GitHub review snapshot failed; stopping before product review.",
+        message=message,
         level="error",
         extra=extra,
     )
@@ -2551,6 +2553,54 @@ def _discard_first_round_satisfied(db: Session, job: Job, round_: TaskRound, ext
         stage=JobState.GENERATING_PROMPT,
         message="A new first round was prepared after discarding the satisfied first round.",
         extra={"discarded_round_id": round_.id},
+    )
+    _auto_dispatch_next_round(db, job, next_round)
+
+
+def _should_skip_after_no_issue_review(db: Session, job: Job, round_: TaskRound | None) -> bool:
+    if not round_:
+        return False
+    if _has_dissatisfaction_reason(db, job.id, round_.id):
+        return False
+    review = _latest_github_llm_product_review(db, job.id, round_.id)
+    if not review or not isinstance(review.extra, dict):
+        return False
+    product_review = review.extra.get("product_review") if isinstance(review.extra.get("product_review"), dict) else {}
+    decision = str(product_review.get("decision") or product_review.get("review_decision") or "").strip()
+    if decision != "no_issue":
+        return False
+    return not _product_review_has_blocking(product_review)
+
+
+def _skip_round_after_no_issue_review(db: Session, job: Job, round_: TaskRound, extra: dict) -> None:
+    round_.status = "review_no_issue_skipped"
+    project = db.get(Project, round_.project_id) if round_.project_id else None
+    if project:
+        project.status = "skipped_no_issue"
+    next_round = TaskRound(
+        job_id=job.id,
+        round_index=1,
+        status=JobState.GENERATING_PROMPT,
+    )
+    db.add(next_round)
+    db.flush()
+    job.status = JobState.GENERATING_PROMPT
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="review_no_issue_skipped",
+        message="Trae成果物审查和浏览器验收都没有发现可成立的不满意点，当前候选问题已跳过并准备下一题。",
+        level="info",
+        extra={**extra, "next_round_id": next_round.id, "business_dissatisfaction_generated": False},
+    )
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=next_round.id,
+        stage=JobState.GENERATING_PROMPT,
+        message="Next candidate issue is ready for prompt generation after no-issue review.",
+        extra={"skipped_round_id": round_.id, "skip_reason": "review_no_issue"},
     )
     _auto_dispatch_next_round(db, job, next_round)
 
@@ -4755,6 +4805,21 @@ def _has_pending_product_review_evidence(db: Session, job_id: str, round_id: str
             )
             .limit(1)
         )
+    )
+
+
+def _latest_github_llm_product_review(db: Session, job_id: str, round_id: str | None) -> RuntimeLog | None:
+    if not round_id:
+        return None
+    return db.scalar(
+        select(RuntimeLog)
+        .where(
+            RuntimeLog.job_id == job_id,
+            RuntimeLog.round_id == round_id,
+            RuntimeLog.stage == "github_llm_product_review",
+        )
+        .order_by(RuntimeLog.created_at.desc())
+        .limit(1)
     )
 
 

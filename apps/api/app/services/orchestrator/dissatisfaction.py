@@ -100,6 +100,18 @@ def generate_dissatisfaction_reason(
             "failure_stage": evidence.failure_stage,
             "platform_failure": sanitize_reason_phrase(evidence.failure_message),
         }
+    if _is_platform_submission_failure(evidence):
+        return {
+            "status": "skipped_platform_submission_failure",
+            "reason": "",
+            "product_reason": "",
+            "process_reason": "",
+            "task_done": TASK_DONE_INCOMPLETE,
+            "satisfaction": "满意",
+            "failure_stage": evidence.failure_stage,
+            "platform_failure": sanitize_reason_phrase(evidence.failure_message),
+            "evidence_summary": _evidence_summary(evidence),
+        }
     forced = _forced_test_unsatisfied(evidence)
     if forced:
         return _finalize_reason(forced, evidence, previous_reason=previous_reason)
@@ -147,6 +159,31 @@ def _forced_test_unsatisfied(evidence: DissatisfactionEvidence) -> dict[str, Any
 
 def _is_platform_record_write_failure(evidence: DissatisfactionEvidence) -> bool:
     return str(evidence.failure_stage or "") in {"feishu_writing", "feishu_failed_abort"}
+
+
+def _is_platform_submission_failure(evidence: DissatisfactionEvidence) -> bool:
+    if str(evidence.failure_stage or "") != "github_submitting":
+        return False
+    data = evidence.data if isinstance(evidence.data, dict) else {}
+    return not _has_trae_product_failure_evidence(data)
+
+
+def _has_trae_product_failure_evidence(data: dict[str, Any]) -> bool:
+    review = _extract_product_review(data)
+    if review and _string_list(review.get("issues")):
+        return True
+    if review and review.get("accepted_findings"):
+        return True
+    inspection = data.get("inspection")
+    if isinstance(inspection, dict) and _string_list(inspection.get("issues")):
+        return True
+    if isinstance(data.get("diagnostics"), dict):
+        return True
+    if str(data.get("returncode") or "") not in {"", "0", "None"}:
+        return True
+    if str(data.get("http_status") or "").startswith(("4", "5")):
+        return True
+    return False
 
 
 def _reviewer_reason(
