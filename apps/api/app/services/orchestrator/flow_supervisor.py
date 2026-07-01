@@ -72,6 +72,7 @@ def decide_flow_recovery(
     reason = str(context.get("recovery_reason") or "")
     previous_type = str(context.get("previous_command_type") or "")
     resume_after_pause = bool(context.get("resume_after_pause"))
+    resume_strategy = str(context.get("resume_strategy") or "")
 
     if event == "resume_diagnosis" and previous_type == WorkerCommandType.WAIT_COMPLETION.value:
         if resume_after_pause and _is_recoverable(reason):
@@ -90,6 +91,17 @@ def decide_flow_recovery(
             )
 
     if event == "wait_failure":
+        if (
+            resume_strategy == "flow_supervisor_resume_prompt"
+            and resume_attempts > 0
+            and (reason == "wait_completion_timeout" or _is_recoverable(reason))
+        ):
+            return _decision(
+                "send_resume_prompt",
+                "resume_prompt_wait_failed",
+                context,
+                confidence=0.88,
+            )
         if _is_recoverable(reason) and (
             bool(context.get("resume_after_pause"))
             or _wait_observations(context) >= WAIT_OBSERVATIONS_BEFORE_PROMPT

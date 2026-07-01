@@ -591,6 +591,112 @@ def test_wait_completion_recoverable_loop_sends_resume_prompt_before_more_observ
     assert len(wait_commands) == 1
 
 
+def test_resume_prompt_success_queues_short_wait_completion():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+    command.payload = {
+        "prompt": "resume prompt",
+        "resume_strategy": "flow_supervisor_resume_prompt",
+        "resume_prompt_attempts": 1,
+        "max_resume_prompt_attempts": 2,
+        "wait_timeout_seconds": worker_results.RESUME_PROMPT_WAIT_TIMEOUT_SECONDS,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"sent_at_epoch": 123}),
+    )
+
+    wait = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+
+    assert wait.payload["timeout_seconds"] == worker_results.RESUME_PROMPT_WAIT_TIMEOUT_SECONDS
+    assert wait.payload["resume_strategy"] == "flow_supervisor_resume_prompt"
+    assert wait.payload["resume_prompt_attempts"] == 1
+
+
+def test_resume_prompt_wait_timeout_sends_second_prompt_before_observation():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {
+        "prompt": "original prompt",
+        "resume_strategy": "flow_supervisor_resume_prompt",
+        "resume_after_pause": True,
+        "resume_prompt_attempts": 1,
+        "max_resume_prompt_attempts": 2,
+        "wait_observation_attempts": 0,
+        "continue_attempts": 0,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    send = _latest_command(db, WorkerCommandType.SEND_PROMPT)
+    click = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    waits = list(
+        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)).all()
+    )
+
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert send.payload["open_new_task"] is False
+    assert send.payload["resume_prompt_attempts"] == 2
+    assert send.payload["wait_timeout_seconds"] == worker_results.RESUME_PROMPT_WAIT_TIMEOUT_SECONDS
+    assert click is None
+    assert len(waits) == 1
+
+
+def test_resume_prompt_limit_marks_manual_required_after_second_wait_failure():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {
+        "prompt": "original prompt",
+        "resume_strategy": "flow_supervisor_resume_prompt",
+        "resume_after_pause": True,
+        "resume_prompt_attempts": 2,
+        "max_resume_prompt_attempts": 2,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={"output_probe": {"complete_like": False, "reason": "missing_tool_trace_markers"}},
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    send = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value))
+    click = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == JobState.MANUAL_REQUIRED))
+
+    assert job.status == JobState.MANUAL_REQUIRED
+    assert round_.status == JobState.MANUAL_REQUIRED
+    assert send is None
+    assert click is None
+    assert log is not None
+    assert log.extra["reason"] == "resume_prompt_limit_reached"
+
+
 def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)

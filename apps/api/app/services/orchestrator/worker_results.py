@@ -69,6 +69,7 @@ FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
 DEFAULT_MAX_RESUME_PROMPT_ATTEMPTS = 2
+RESUME_PROMPT_WAIT_TIMEOUT_SECONDS = 240
 CONTINUE_TEXT_SUPPRESSION_SECONDS = 60
 DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
 TRACE_UNAVAILABLE_AFTER_COMPLETION = "trace_unavailable_after_completed"
@@ -354,6 +355,29 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
             extra,
             extra.get("data") if isinstance(extra.get("data"), dict) else {},
             message="Trae appears complete after wait timeout; collecting trace before attempting any recovery click.",
+        )
+        return
+
+    if _resume_prompt_limit_exhausted(command) and _resume_prompt_failure_reason(extra):
+        _mark_manual_required(
+            db,
+            job,
+            round_,
+            "Flow supervisor already sent the maximum number of resume prompts, but Trae still did not produce a completed turn; manual inspection is required.",
+            "resume_prompt_limit_reached",
+            {
+                **extra,
+                "reason": "resume_prompt_limit_reached",
+                "recovery_reason": _recovery_reason(extra),
+                "resume_prompt_attempts": int(command.payload.get("resume_prompt_attempts") or 0),
+                "max_resume_prompt_attempts": int(
+                    command.payload.get("max_resume_prompt_attempts") or DEFAULT_MAX_RESUME_PROMPT_ATTEMPTS
+                ),
+                "display_message": (
+                    "恢复提示词已经达到最大次数，但 Trae 仍未产生可收口回合，调度已停止继续点击/等待，"
+                    "需要人工检查当前 Trae 任务。"
+                ),
+            },
         )
         return
 
@@ -2978,7 +3002,8 @@ def _queue_resume_prompt(
             "verify_submission": True,
             "strict_submission_verification": True,
             "submission_timeout_seconds": source_command.payload.get("submission_timeout_seconds", 30),
-            "wait_timeout_seconds": source_command.payload.get("wait_timeout_seconds", 900),
+            "wait_timeout_seconds": _resume_prompt_wait_timeout_seconds(source_command),
+            "resume_prompt_wait_timeout_seconds": _resume_prompt_wait_timeout_seconds(source_command),
             "stable_seconds": source_command.payload.get("stable_seconds", 15),
             "poll_interval_seconds": source_command.payload.get("poll_interval_seconds", 2),
             "intervention_idle_seconds": 1,
@@ -3031,6 +3056,47 @@ def _queue_resume_prompt(
         },
     )
     return True
+
+
+def _resume_prompt_wait_timeout_seconds(source_command: WorkerCommand) -> int:
+    cap = _positive_int(
+        source_command.payload.get("resume_prompt_wait_timeout_seconds"),
+        RESUME_PROMPT_WAIT_TIMEOUT_SECONDS,
+    )
+    inherited = _positive_int(source_command.payload.get("wait_timeout_seconds"), cap)
+    return max(30, min(inherited, cap))
+
+
+def _resume_prompt_limit_exhausted(command: WorkerCommand) -> bool:
+    if str(command.payload.get("resume_strategy") or "") != "flow_supervisor_resume_prompt":
+        return False
+    attempts = int(command.payload.get("resume_prompt_attempts") or 0)
+    max_attempts = int(command.payload.get("max_resume_prompt_attempts") or DEFAULT_MAX_RESUME_PROMPT_ATTEMPTS)
+    return attempts >= max_attempts
+
+
+def _resume_prompt_failure_reason(extra: dict) -> str:
+    reason = _recovery_reason(extra)
+    if reason in {
+        "wait_completion_timeout",
+        "awaiting_continuation",
+        "awaiting_current_continuation",
+        "service_interrupted",
+        "missing_tool_trace_markers",
+        "no_completed_turn_after_prompt_send",
+    } or reason.startswith("trae_turn_not_completed"):
+        return reason
+    if _is_wait_completion_timeout_error(extra):
+        return "wait_completion_timeout"
+    return ""
+
+
+def _positive_int(value: object, default: int) -> int:
+    try:
+        parsed = int(value)
+    except (TypeError, ValueError):
+        return default
+    return parsed if parsed > 0 else default
 
 
 def _resume_prompt_text(job: Job, round_: TaskRound, extra: dict) -> str:
