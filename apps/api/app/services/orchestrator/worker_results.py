@@ -66,6 +66,7 @@ DEFAULT_MAX_WAIT_RECOVERY_DIAGNOSIS_ATTEMPTS = 2
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
+CONTINUE_TEXT_SUPPRESSION_SECONDS = 60
 DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
 TRACE_UNAVAILABLE_AFTER_COMPLETION = "trace_unavailable_after_completed"
 INVALID_BUSINESS_TRACE_PATTERNS = (
@@ -3027,9 +3028,7 @@ def _queue_wait_recovery_diagnosis(
             "continue_action_sent": bool(
                 source_command.payload.get("continue_action_sent") or _wait_result_has_continue_action(extra)
             ),
-            "continue_text_sent": bool(
-                source_command.payload.get("continue_text_sent") or _wait_result_has_continue_action(extra)
-            ),
+            "continue_text_sent": _recent_continue_text_sent(source_command, extra),
             "continue_sent_at": source_command.payload.get("continue_sent_at") or extra.get("continue_sent_at", ""),
         },
     )
@@ -3161,9 +3160,7 @@ def _queue_wait_observation_retry(
                 "continue_action_sent": bool(
                     source_command.payload.get("continue_action_sent") or _wait_result_has_continue_action(extra)
                 ),
-                "continue_text_sent": bool(
-                    source_command.payload.get("continue_text_sent") or _wait_result_has_continue_action(extra)
-                ),
+                "continue_text_sent": _recent_continue_text_sent(source_command, extra),
                 "continue_sent_at": source_command.payload.get("continue_sent_at") or extra.get("continue_sent_at", ""),
             },
         ),
@@ -3406,6 +3403,31 @@ def _wait_result_has_continue_action(extra: dict) -> bool:
         return True
     interventions = data.get("interventions") if isinstance(data.get("interventions"), list) else []
     return any(_intervention_is_continue_action(item) for item in interventions)
+
+
+def _wait_result_data_has_continue_action(extra: dict) -> bool:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    if bool(data.get("continue_action_sent") or data.get("continue_text_sent")):
+        return True
+    interventions = data.get("interventions") if isinstance(data.get("interventions"), list) else []
+    return any(_intervention_is_continue_action(item) for item in interventions)
+
+
+def _recent_continue_text_sent(command: WorkerCommand, extra: dict) -> bool:
+    if _wait_result_data_has_continue_action(extra):
+        return True
+    if not bool(command.payload.get("continue_text_sent") or command.payload.get("continue_text_already_sent")):
+        return False
+    sent_at = str(command.payload.get("continue_sent_at") or extra.get("continue_sent_at") or "").strip()
+    if not sent_at:
+        return True
+    try:
+        parsed = datetime.fromisoformat(sent_at.replace("Z", "+00:00"))
+    except ValueError:
+        return True
+    if parsed.tzinfo is None:
+        return True
+    return (datetime.now(timezone.utc) - parsed).total_seconds() < CONTINUE_TEXT_SUPPRESSION_SECONDS
 
 
 def _continue_action_was_sent(command: WorkerCommand, extra: dict) -> bool:

@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from pathlib import Path
 import json
 import tempfile
@@ -647,7 +648,7 @@ def test_wait_completion_after_continue_reobserves_without_second_continue_comma
     command.payload = {
         "prompt": "demo",
         "continue_text_sent": True,
-        "continue_sent_at": "2026-06-22T00:00:00+00:00",
+        "continue_sent_at": datetime.now(timezone.utc).isoformat(),
     }
     db.commit()
 
@@ -672,6 +673,45 @@ def test_wait_completion_after_continue_reobserves_without_second_continue_comma
     assert retry.id != command.id
     assert retry.payload["continue_text_sent"] is True
     assert retry.payload["continue_action_sent"] is True
+
+
+def test_wait_completion_old_continue_marker_expires_on_reobserve():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {
+        "prompt": "demo",
+        "continue_text_sent": True,
+        "continue_action_sent": True,
+        "continue_sent_at": "2026-06-22T00:00:00+00:00",
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "output_probe": {"reason": "missing_tool_trace_markers"},
+                "supervisor_decision": {"action": "recover_interrupted_turn", "reason": "trae_turn_not_completed:interrupted"},
+                "text_sample": "最小化\n恢复\n关闭",
+            },
+        ),
+    )
+
+    retry = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+    click_continue = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+
+    assert job.status == JobState.WAITING_TRAE
+    assert round_.status == JobState.WAITING_TRAE
+    assert click_continue is None
+    assert retry.id != command.id
+    assert retry.payload["continue_action_sent"] is True
+    assert retry.payload["continue_text_sent"] is False
+    assert retry.payload["continue_sent_at"] == "2026-06-22T00:00:00+00:00"
 
 
 def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():

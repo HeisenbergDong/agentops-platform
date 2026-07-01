@@ -1189,6 +1189,110 @@ def test_wait_completion_recovers_interrupted_turn_from_chrome_only_text(monkeyp
     assert any(event.get("supervisor_action") == "recover_interrupted_turn" for event in progress)
 
 
+def test_wait_completion_allows_continue_text_again_after_cooldown(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    interventions = []
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module.time, "time", lambda: 1200.0)
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "interrupted", "session_id": "sid", "user_message_id": "uid"},
+    )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(
+        wait_module,
+        "diagnose_ui",
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
+            "state": "model_error_3003",
+            "suggested_intervention": {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"},
+        },
+    )
+
+    def fake_apply(intervention, timeout_seconds, **_kwargs):
+        interventions.append(intervention)
+        return {"status": "applied", "mode": intervention.get("mode")}
+
+    monkeypatch.setattr(wait_module, "apply_intervention", fake_apply)
+
+    with pytest.raises(wait_module.TraeAutomationError):
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=30,
+            max_interventions=1,
+            continue_text_already_sent=True,
+            continue_sent_at="1970-01-01T00:18:00+00:00",
+        )
+
+    assert interventions == [{"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"}]
+
+
+def test_wait_completion_suppresses_recent_continue_text(monkeypatch: pytest.MonkeyPatch):
+    class FakeWindow:
+        pass
+
+    now = {"value": 100.0}
+    interventions = []
+
+    monkeypatch.setattr(wait_module, "focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr(wait_module, "find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr(wait_module, "window_text_snapshot", lambda window: "\u6700\u5c0f\u5316\n\u6062\u590d\n\u5173\u95ed")
+    monkeypatch.setattr(wait_module.time, "monotonic", lambda: now["value"])
+    monkeypatch.setattr(wait_module.time, "time", lambda: 1200.0)
+    monkeypatch.setattr(
+        wait_module,
+        "probe_latest_trae_turn",
+        lambda **kwargs: {"status": "found", "turn_status": "interrupted", "session_id": "sid", "user_message_id": "uid"},
+    )
+    monkeypatch.setattr(wait_module, "build_trae_observation", lambda **kwargs: _watcher_observation(False))
+
+    def fake_sleep(seconds, cancellation_check):
+        now["value"] += max(seconds, 0.1)
+
+    monkeypatch.setattr(wait_module, "_sleep_with_cancellation", fake_sleep)
+    monkeypatch.setattr(
+        wait_module,
+        "diagnose_ui",
+        lambda timeout_seconds, scroll_bottom, **_kwargs: {
+            "state": "model_error_3003",
+            "suggested_intervention": {"mode": "continue-text", "text": "\u7ee7\u7eed", "action": "continue"},
+        },
+    )
+
+    def fake_apply(intervention, timeout_seconds, **_kwargs):
+        interventions.append(intervention)
+        return {"status": "applied", "mode": intervention.get("mode")}
+
+    monkeypatch.setattr(wait_module, "apply_intervention", fake_apply)
+
+    with pytest.raises(wait_module.TraeAutomationError):
+        wait_module.wait_completion(
+            timeout_seconds=2,
+            stable_seconds=0.5,
+            poll_interval_seconds=0.5,
+            intervention_idle_seconds=30,
+            max_interventions=1,
+            continue_text_already_sent=True,
+            continue_sent_at="1970-01-01T00:19:50+00:00",
+        )
+
+    assert interventions == []
+
+
 def test_wait_completion_accepts_visible_task_complete_text(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         pass

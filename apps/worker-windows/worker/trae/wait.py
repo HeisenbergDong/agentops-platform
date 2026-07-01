@@ -1,5 +1,6 @@
 import hashlib
 import time
+from datetime import datetime
 from typing import Callable
 
 from worker.trae.diagnose import detect_terminal_prompt, diagnose_ui
@@ -33,6 +34,7 @@ BUSY_MARKERS = (
 RECOVERABLE_OUTPUT_REASONS = {"awaiting_continuation", "service_interrupted"}
 WINDOW_CHROME_TEXTS = {"最小化", "最大化", "关闭", "Minimize", "Maximize", "Close"}
 MIN_COMPLETION_TEXT_CHARS = 80
+CONTINUE_TEXT_SUPPRESSION_SECONDS = 60.0
 WINDOW_CHROME_TEXTS = WINDOW_CHROME_TEXTS | {
     "\u6700\u5c0f\u5316",
     "\u6700\u5927\u5316",
@@ -58,6 +60,7 @@ def wait_completion(
     sent_at: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
     continue_text_already_sent: bool = False,
+    continue_sent_at: str = "",
 ) -> dict:
     if workspace_path:
         focus_trae_workspace_or_any(
@@ -75,6 +78,10 @@ def wait_completion(
     diagnostics: list[dict] = []
     last_progress_at: dict[str, float] = {}
     last_decision: dict = {}
+    suppress_initial_continue_text = _should_suppress_initial_continue_text(
+        continue_text_already_sent,
+        continue_sent_at,
+    )
 
     while time.monotonic() < deadline:
         if cancellation_check:
@@ -123,7 +130,10 @@ def wait_completion(
                     timeout_seconds=timeout_seconds,
                     workspace_path=workspace_path,
                     ui_analyst=ui_analyst,
-                    suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
+                    suppress_continue_text=_should_suppress_continue_text(
+                        suppress_initial_continue_text,
+                        interventions,
+                    ),
                     progress_callback=progress_callback,
                     last_progress_at=last_progress_at,
                 )
@@ -186,7 +196,10 @@ def wait_completion(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
-                suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
+                suppress_continue_text=_should_suppress_continue_text(
+                    suppress_initial_continue_text,
+                    interventions,
+                ),
             )
             if visual_completion:
                 return visual_completion
@@ -217,7 +230,10 @@ def wait_completion(
                 timeout_seconds=timeout_seconds,
                 workspace_path=workspace_path,
                 ui_analyst=ui_analyst,
-                suppress_continue_text=continue_text_already_sent or _has_continue_text_intervention(interventions),
+                suppress_continue_text=_should_suppress_continue_text(
+                    suppress_initial_continue_text,
+                    interventions,
+                ),
                 progress_callback=progress_callback,
                 last_progress_at=last_progress_at,
             )
@@ -852,6 +868,28 @@ def _has_continue_text_intervention(interventions: list[dict]) -> bool:
         if _is_continue_text_intervention(suggested) or _is_continue_text_intervention(result):
             return True
     return False
+
+
+def _should_suppress_continue_text(initial_suppression: bool, interventions: list[dict]) -> bool:
+    return bool(initial_suppression or _has_continue_text_intervention(interventions))
+
+
+def _should_suppress_initial_continue_text(already_sent: bool, sent_at: str) -> bool:
+    if not already_sent:
+        return False
+    if not str(sent_at or "").strip():
+        return True
+    return _continue_sent_age_seconds(sent_at) < CONTINUE_TEXT_SUPPRESSION_SECONDS
+
+
+def _continue_sent_age_seconds(sent_at: str) -> float:
+    try:
+        parsed = datetime.fromisoformat(str(sent_at).replace("Z", "+00:00"))
+    except ValueError:
+        return 0.0
+    if parsed.tzinfo is None:
+        return 0.0
+    return max(0.0, time.time() - parsed.timestamp())
 
 
 def _compact_diagnosis(diagnosis: dict[str, object]) -> dict[str, object]:
