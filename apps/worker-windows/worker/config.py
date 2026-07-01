@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.16-blue-send-button"
+WORKER_VERSION = "0.1.17-completion-evidence"
 
 
 class WorkerSettings(BaseSettings):

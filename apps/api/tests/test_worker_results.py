@@ -761,6 +761,154 @@ def test_wait_completion_timeout_with_completion_decision_queues_trace_collectio
     assert copy_command.payload["completion_observation"]["supervisor_decision"]["trae_turn_completion_decision"]["is_complete"] is True
 
 
+def test_wait_completion_timeout_with_visual_completion_queues_trace_collection():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "output_probe": {"reason": "service_interrupted"},
+                "completion_gate": {"passed": False, "reason": "trae_turn_not_completed:interrupted"},
+                "supervisor_decision": {
+                    "action": "recover_service_interruption",
+                    "reason": "service_interrupted",
+                    "diagnosis": {
+                        "state": "completed",
+                        "visual": {
+                            "ai_analysis": {
+                                "screen_state": "completed",
+                                "recommended_action": "collect_trace_candidate",
+                            }
+                        },
+                    },
+                    "trae_turn_completion_decision": {
+                        "is_complete": False,
+                        "next_action": "wait_or_recover",
+                        "evidence": [
+                            "ui_completion_visible",
+                            "project_write_detected",
+                            "recoverable_output:service_interrupted",
+                        ],
+                    },
+                },
+                "watcher_observation": {
+                    "project_write": {"path": "D:/work/demo/app.js", "mtime": 1000.0},
+                    "activity": {"recent": False, "quiet_seconds": 120.0},
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_command is not None
+    assert copy_command.payload["completion_observation"]["supervisor_decision"]["diagnosis"]["state"] == "completed"
+
+
+def test_wait_completion_timeout_strong_completion_evidence_overrides_service_interruption():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "output_probe": {"reason": "service_interrupted"},
+                "completion_gate": {"passed": False, "reason": "trae_turn_not_completed:interrupted"},
+                "supervisor_decision": {
+                    "action": "recover_service_interruption",
+                    "reason": "service_interrupted",
+                    "trae_turn_completion_decision": {
+                        "is_complete": False,
+                        "next_action": "wait_or_recover",
+                        "evidence": [
+                            "strong_ui_completion_visible",
+                            "project_write_detected",
+                            "recoverable_output:service_interrupted",
+                        ],
+                    },
+                },
+                "watcher_observation": {
+                    "project_write": {"path": "D:/work/demo/app.js", "mtime": 1000.0},
+                    "activity": {"recent": False, "quiet_seconds": 120.0},
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+
+    assert job.status == JobState.COLLECTING_TRACE
+    assert round_.status == JobState.COLLECTING_TRACE
+    assert copy_command is not None
+
+
+def test_wait_completion_timeout_pending_action_blocks_completion_override():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="manual_required",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "output_probe": {"reason": "service_interrupted"},
+                "completion_gate": {"passed": False, "reason": "trae_turn_not_completed:interrupted"},
+                "supervisor_decision": {
+                    "action": "recover_service_interruption",
+                    "reason": "service_interrupted",
+                    "trae_turn_completion_decision": {
+                        "is_complete": True,
+                        "next_action": "copy_trace",
+                        "evidence": [
+                            "strong_ui_completion_visible",
+                            "project_write_detected",
+                            "pending_keep_or_safe_action_visible",
+                            "recoverable_output:service_interrupted",
+                        ],
+                    },
+                },
+                "watcher_observation": {
+                    "project_write": {"path": "D:/work/demo/app.js", "mtime": 1000.0},
+                    "activity": {"recent": False, "quiet_seconds": 120.0},
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    continue_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert copy_command is None
+    assert continue_command is not None
+
+
 def test_stop_current_task_result_logs_structured_stop_confirmation():
     db = _test_session()
     job = Job(id="job1", user_id="user1", status=JobState.PAUSED, directions=["demo"])

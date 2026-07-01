@@ -275,6 +275,87 @@ def test_supervisor_collects_trace_from_trae_code_change_completion_view():
     assert "project_write_detected" in completion["evidence"]
 
 
+def test_supervisor_collects_strong_completion_despite_stale_service_interruption():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text=(
+                "npm run check passed\n"
+                "npm run build\n"
+                "built in 5.13s\n"
+                "任务完成\n"
+                "所有复查任务全部通过\n"
+                "所有需求均已落实并验证"
+            ),
+            output_probe={"reason": "service_interrupted"},
+            turn_probe={"status": "found", "turn_status": "interrupted", "session_id": "s1", "user_message_id": "u1"},
+            idle_seconds=90,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            watcher_observation={
+                "project_write": {"mtime": 1000.0, "path": "D:/work/demo/src/App.tsx"},
+                "activity": {"recent": False, "quiet_seconds": 90.0, "source": "project"},
+            },
+        )
+    )
+
+    assert decision["action"] == "collect_trace"
+    assert decision["reason"] == "ui_completion_detected"
+    completion = decision["trae_turn_completion_decision"]
+    assert completion["is_complete"] is True
+    assert completion["risk"] == "completion_after_recoverable_output"
+    assert "recoverable_output_overridden_by_completion" in completion["evidence"]
+
+
+def test_supervisor_keeps_recovering_service_error_without_strong_completion():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text="模型请求失败，请稍后重试。(3003)\n继续",
+            output_probe={"reason": "service_interrupted"},
+            turn_probe={"status": "found", "turn_status": "interrupted", "session_id": "s1", "user_message_id": "u1"},
+            idle_seconds=90,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            watcher_observation={
+                "project_write": {"mtime": 1000.0, "path": "D:/work/demo/src/App.tsx"},
+                "activity": {"recent": False, "quiet_seconds": 90.0, "source": "project"},
+            },
+        )
+    )
+
+    assert decision["action"] == "recover_service_interruption"
+    assert decision["reason"] == "service_interrupted"
+    assert decision["trae_turn_completion_decision"]["is_complete"] is False
+
+
+def test_supervisor_does_not_collect_when_completion_text_still_needs_action():
+    decision = decide_next_action(
+        SupervisorObservation(
+            latest_text=(
+                "任务完成\n"
+                "所有复查任务全部通过\n"
+                "正在等待你的操作\n"
+                "请确认是否继续执行"
+            ),
+            output_probe={"reason": "service_interrupted"},
+            turn_probe={"status": "found", "turn_status": "interrupted", "session_id": "s1", "user_message_id": "u1"},
+            idle_seconds=90,
+            intervention_idle_seconds=30,
+            max_interventions=3,
+            watcher_observation={
+                "project_write": {"mtime": 1000.0, "path": "D:/work/demo/src/App.tsx"},
+                "activity": {"recent": False, "quiet_seconds": 90.0, "source": "project"},
+            },
+        )
+    )
+
+    completion = decision["trae_turn_completion_decision"]
+
+    assert decision["action"] == "recover_service_interruption"
+    assert completion["is_complete"] is False
+    assert "pending_keep_or_safe_action_visible" in completion["evidence"]
+    assert "recoverable_output_overridden_by_completion" not in completion["evidence"]
+
+
 def test_supervisor_collects_trace_from_low_confidence_completed_candidate_with_project_write():
     decision = decide_next_action(
         SupervisorObservation(

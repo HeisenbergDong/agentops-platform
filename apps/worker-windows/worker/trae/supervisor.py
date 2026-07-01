@@ -54,6 +54,22 @@ UI_COMPLETION_MARKERS = (
     "Task completed",
     "task completed",
 )
+UI_COMPLETION_CONTEXT_MARKERS = (
+    "\u6587\u4ef6\u53d8\u66f4",
+    "\u4ee3\u7801\u53d8\u66f4",
+    "\u6784\u5efa",
+    "\u8fd0\u884c\u9a8c\u8bc1",
+    "\u590d\u67e5",
+    "\u5168\u90e8\u901a\u8fc7",
+    "\u6240\u6709\u9700\u6c42",
+    "\u901a\u8fc7",
+    "files changed",
+    "code changes",
+    "build",
+    "built in",
+    "passed",
+    "verified",
+)
 
 
 @dataclass(frozen=True)
@@ -268,6 +284,7 @@ def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict
     evidence: list[str] = []
     risk = "safe"
     score = 0.0
+    strong_ui_completion = has_strong_ui_completion_text(observation.latest_text)
 
     if gate.get("passed"):
         evidence.append("completion_gate_passed")
@@ -276,6 +293,9 @@ def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict
     if has_ui_completion_text(observation.latest_text):
         evidence.append("ui_completion_visible")
         score += 0.42
+        if strong_ui_completion:
+            evidence.append("strong_ui_completion_visible")
+            score += 0.2
 
     if has_pending_intervention_text(observation.latest_text):
         evidence.append("pending_keep_or_safe_action_visible")
@@ -313,8 +333,19 @@ def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict
 
     if output_reason in RECOVERABLE_OUTPUT_REASONS:
         evidence.append(f"recoverable_output:{output_reason}")
-        score -= 0.72
-        risk = "recoverable_before_trace"
+        if (
+            strong_ui_completion
+            and "project_write_detected" in evidence
+            and "pending_keep_or_safe_action_visible" not in evidence
+            and not observation.busy
+            and not observation.terminal_prompt
+        ):
+            evidence.append("recoverable_output_overridden_by_completion")
+            score -= 0.12
+            risk = "completion_after_recoverable_output"
+        else:
+            score -= 0.72
+            risk = "recoverable_before_trace"
     if observation.terminal_prompt:
         evidence.append("terminal_prompt_visible")
         score -= 0.55
@@ -329,14 +360,19 @@ def trae_turn_completion_decision(observation: SupervisorObservation, gate: dict
 
     confidence = max(0.0, min(0.99, score))
     strong_gate = bool(gate.get("passed"))
-    robust_visual = "ui_completion_visible" in evidence and "no_recent_meaningful_activity" in evidence
+    recoverable_output = output_reason in RECOVERABLE_OUTPUT_REASONS
+    recoverable_output_overridden = "recoverable_output_overridden_by_completion" in evidence
+    robust_visual = (
+        ("ui_completion_visible" in evidence and "no_recent_meaningful_activity" in evidence)
+        or ("strong_ui_completion_visible" in evidence and "project_write_detected" in evidence)
+    )
     robust_candidate = (
         any(item in evidence for item in {"completed_turn_candidate", "low_confidence_completed_turn_candidate"})
         and "project_write_detected" in evidence
         and any(item in evidence for item in {"no_recent_meaningful_activity", "activity_quiet_long_enough"})
     )
     is_complete = bool(
-        output_reason not in RECOVERABLE_OUTPUT_REASONS
+        (not recoverable_output or recoverable_output_overridden)
         and not observation.busy
         and not observation.terminal_prompt
         and (
@@ -374,6 +410,11 @@ def has_pending_intervention_text(text: str) -> bool:
 def has_ui_completion_text(text: str) -> bool:
     lowered = str(text or "").lower()
     return any(marker.lower() in lowered for marker in UI_COMPLETION_MARKERS)
+
+
+def has_strong_ui_completion_text(text: str) -> bool:
+    lowered = str(text or "").lower()
+    return has_ui_completion_text(lowered) and any(marker.lower() in lowered for marker in UI_COMPLETION_CONTEXT_MARKERS)
 
 
 def _idle_ready(observation: SupervisorObservation) -> bool:

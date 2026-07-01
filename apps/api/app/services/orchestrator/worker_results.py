@@ -3355,12 +3355,16 @@ def _looks_like_chrome_text_sample(text: str) -> bool:
 
 
 def _wait_failure_can_collect_trace(extra: dict) -> bool:
-    if _recovery_reason(extra) != "wait_completion_timeout":
+    if _recovery_reason(extra) != "wait_completion_timeout" and not _is_wait_completion_timeout_error(extra):
         return False
     data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
     supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    if _supervisor_has_visual_completion(supervisor):
+        return True
     completion = supervisor.get("trae_turn_completion_decision") if isinstance(supervisor.get("trae_turn_completion_decision"), dict) else {}
-    if completion.get("is_complete") is True and str(completion.get("next_action") or "") == "copy_trace":
+    if _completion_decision_can_collect_trace(completion):
+        return True
+    if _completion_evidence_overrides_recoverable_error(completion):
         return True
     if str(supervisor.get("action") or "") == "collect_trace":
         return True
@@ -3419,14 +3423,72 @@ def _continuation_after_continue_can_collect_trace(command: WorkerCommand, extra
     supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
     if str(supervisor.get("action") or "") == "collect_trace":
         return True
+    if _supervisor_has_visual_completion(supervisor):
+        return True
     completion = supervisor.get("trae_turn_completion_decision") if isinstance(supervisor.get("trae_turn_completion_decision"), dict) else {}
-    if completion.get("is_complete") is True and str(completion.get("next_action") or "") == "copy_trace":
+    if _completion_decision_can_collect_trace(completion):
+        return True
+    if _completion_evidence_overrides_recoverable_error(completion):
         return True
     gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
     if gate.get("passed") is True:
         return True
     turn = data.get("trae_turn") if isinstance(data.get("trae_turn"), dict) else {}
     return turn.get("status") == "found" and str(turn.get("turn_status") or "") == "completed"
+
+
+def _is_wait_completion_timeout_error(extra: dict) -> bool:
+    return "did not become stable" in str(extra.get("error") or "")
+
+
+def _supervisor_has_visual_completion(supervisor: dict) -> bool:
+    if not isinstance(supervisor, dict):
+        return False
+    diagnosis = supervisor.get("diagnosis") if isinstance(supervisor.get("diagnosis"), dict) else {}
+    if str(diagnosis.get("state") or "").strip() == "completed":
+        return True
+    visual = diagnosis.get("visual") if isinstance(diagnosis.get("visual"), dict) else {}
+    ai = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    return (
+        str(ai.get("screen_state") or "").strip() == "completed"
+        and str(ai.get("recommended_action") or "").strip() == "collect_trace_candidate"
+    )
+
+
+def _completion_decision_can_collect_trace(completion: dict) -> bool:
+    return (
+        isinstance(completion, dict)
+        and completion.get("is_complete") is True
+        and str(completion.get("next_action") or "") == "copy_trace"
+        and not _completion_evidence_has_active_blocker(completion)
+    )
+
+
+def _completion_evidence_overrides_recoverable_error(completion: dict) -> bool:
+    if not isinstance(completion, dict):
+        return False
+    evidence = {str(item) for item in completion.get("evidence", []) if str(item)}
+    if "recoverable_output:service_interrupted" not in evidence:
+        return False
+    strong_completion = bool(
+        {"strong_ui_completion_visible", "ui_completion_visible"}.intersection(evidence)
+        and "project_write_detected" in evidence
+    )
+    if not strong_completion:
+        return False
+    return not _completion_evidence_has_active_blocker(completion)
+
+
+def _completion_evidence_has_active_blocker(completion: dict) -> bool:
+    if not isinstance(completion, dict):
+        return False
+    evidence = {str(item) for item in completion.get("evidence", []) if str(item)}
+    blocked = {
+        "terminal_prompt_visible",
+        "busy_marker_visible",
+        "pending_keep_or_safe_action_visible",
+    }.intersection(evidence)
+    return bool(blocked)
 
 
 def _click_continue_action_was_sent(data: dict) -> bool:
