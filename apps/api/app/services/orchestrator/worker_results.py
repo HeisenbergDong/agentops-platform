@@ -4739,7 +4739,11 @@ def _handle_stop_result(db: Session, command: WorkerCommand, result: WorkerResul
         command.finished_at = command.finished_at or datetime.now(timezone.utc)
         command.result = result.data
         command.message = result.message or command.message
-    if str(job.status) == str(JobState.PAUSED):
+    if stop_report and result.status == "cancelled" and str(job.status) not in {str(item) for item in TERMINAL_JOB_STATES}:
+        job.status = JobState.PAUSED
+        if round_ and str(round_.status) not in {str(item) for item in TERMINAL_ROUND_STATES}:
+            round_.status = JobState.PAUSED
+    elif str(job.status) == str(JobState.PAUSED):
         if round_:
             round_.status = JobState.PAUSED
         job.status = JobState.PAUSED

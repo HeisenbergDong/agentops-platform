@@ -1348,6 +1348,53 @@ def test_cancelled_active_command_with_stop_report_logs_stop_confirmation():
     assert log.extra["stop_report_summary"]["trae_stop_clicked"] is True
 
 
+def test_cancelled_active_command_stop_report_restores_paused_state_from_waiting():
+    db = _test_session()
+    job = Job(id="job1", user_id="user1", status=JobState.WAITING_TRAE, directions=["demo"])
+    round_ = TaskRound(id="round1", job_id=job.id, round_index=1, status=JobState.WAITING_TRAE)
+    command = WorkerCommand(
+        id="wait1",
+        worker_id="worker1",
+        user_id="user1",
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"reason": "user_stop"},
+        status="cancelled",
+    )
+    db.add_all([job, round_, command])
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="cancelled",
+            data={
+                "stopped": True,
+                "stop_report": {
+                    "worker_command_cancelled": True,
+                    "stop_confirmed": True,
+                    "cleanup_status": "skipped",
+                    "local_processes_matched": 0,
+                    "local_processes_killed": 0,
+                    "local_process_kill_errors": 0,
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    pause_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "pause_confirmed"))
+
+    assert job.status == JobState.PAUSED
+    assert round_.status == JobState.PAUSED
+    assert pause_log is not None
+
+
 def test_copy_latest_reply_validates_trace_and_advances_to_screenshot(monkeypatch, tmp_path):
     db = _test_session()
     job, round_, command = _create_copy_latest_reply_rows(db)
