@@ -343,6 +343,40 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
     extra = _result_extra(command, result)
     _maybe_notify_slow_trae(db, job, round_, command, result)
     if result.status in {"ok", "success", "completed"}:
+        wait_success_blocker = _wait_success_blocks_trace_collection(extra)
+        if wait_success_blocker:
+            recovery_extra = {
+                **extra,
+                "recovery_reason": wait_success_blocker,
+                "wait_success_blocked_trace": True,
+            }
+            if _queue_wait_recovery_diagnosis(
+                db,
+                command,
+                job,
+                round_,
+                "Worker reported Trae as complete, but the result still shows an active pause/intervention state; scheduler will diagnose before collecting trace.",
+                recovery_extra,
+            ):
+                return
+            if _queue_wait_observation_retry(
+                db,
+                command,
+                job,
+                round_,
+                "Worker reported Trae as complete, but the result still shows an active pause/intervention state; scheduler will observe before collecting trace.",
+                recovery_extra,
+            ):
+                return
+            _queue_continue_recovery(
+                db,
+                command,
+                job,
+                round_,
+                "Worker reported Trae as complete, but the result still shows an active pause/intervention state; scheduler will recover before trace collection.",
+                recovery_extra,
+            )
+            return
         _queue_trace_collection_after_wait(db, command, job, round_, extra, result.data)
         return
 
@@ -548,7 +582,7 @@ def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: Work
             {**diagnostic_extra, "intervention_idle_seconds": 1},
         )
         return
-    if state in {"needs_scroll_inner_panel", "service_interrupted", "awaiting_continuation", "awaiting_terminal_input"} or suggested:
+    if _diagnosis_state_suggests_continue_recovery(state) or suggested:
         _queue_continue_recovery(
             db,
             command,
@@ -3539,6 +3573,66 @@ def _should_observe_wait_failure_without_recovery(extra: dict) -> bool:
     return False
 
 
+def _wait_success_blocks_trace_collection(extra: dict) -> str:
+    data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    reason = _first_active_wait_blocker_reason(
+        data.get("output_probe"),
+        data.get("trace_probe"),
+        data.get("current_turn_gate"),
+        data.get("completion_gate"),
+        data.get("trae_turn"),
+    )
+    if reason:
+        return reason
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    reason = _first_active_wait_blocker_reason(
+        supervisor.get("output_probe"),
+        supervisor.get("trace_probe"),
+        supervisor.get("current_turn_gate"),
+        supervisor.get("completion_gate"),
+        supervisor.get("turn_probe"),
+    )
+    if reason:
+        return reason
+    completion = supervisor.get("trae_turn_completion_decision") if isinstance(supervisor.get("trae_turn_completion_decision"), dict) else {}
+    if _completion_evidence_has_active_blocker(completion):
+        return "pending_intervention_visible"
+    gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
+    if gate.get("pending_intervention_visible") is True:
+        return "pending_intervention_visible"
+    return ""
+
+
+def _first_active_wait_blocker_reason(*values: object) -> str:
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        reason = str(value.get("reason") or "").strip()
+        if _is_active_wait_blocker_reason(reason):
+            return reason
+        turn_status = str(value.get("turn_status") or "").strip()
+        if turn_status in {"interrupted", "stopped", "manual_stopped"}:
+            return f"trae_turn_not_completed:{turn_status}"
+        if value.get("pending_intervention_visible") is True:
+            return "pending_intervention_visible"
+    return ""
+
+
+def _is_active_wait_blocker_reason(reason: str) -> bool:
+    if reason in {
+        "manual_stopped",
+        "generation_interrupted",
+        "pending_intervention_visible",
+        "awaiting_continuation",
+        "awaiting_current_continuation",
+        "service_interrupted",
+        "missing_tool_trace_markers",
+        "no_completed_turn_after_prompt_send",
+    }:
+        return True
+    return reason.startswith("trae_turn_not_completed")
+
+
 def _wait_failure_needs_visual_diagnosis(extra: dict) -> bool:
     data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
     supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
@@ -3768,6 +3862,19 @@ def _diagnosis_suggests_continue_recovery(suggested: dict) -> bool:
     if not isinstance(suggested, dict):
         return False
     return _intervention_is_continue_action(suggested) or str(suggested.get("mode") or "") == "terminal-input"
+
+
+def _diagnosis_state_suggests_continue_recovery(state: str) -> bool:
+    return state in {
+        "awaiting_run_confirmation",
+        "awaiting_confirm",
+        "awaiting_action",
+        "awaiting_continuation",
+        "awaiting_current_continuation",
+        "awaiting_terminal_input",
+        "needs_scroll_inner_panel",
+        "service_interrupted",
+    }
 
 
 def _recovery_reason(extra: dict) -> str:

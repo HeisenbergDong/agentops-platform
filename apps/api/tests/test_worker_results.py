@@ -793,6 +793,61 @@ def test_pause_resume_service_interruption_sends_resume_prompt_instead_of_click_
     assert log.extra["flow_supervisor_decision"]["action"] == "send_resume_prompt"
 
 
+def test_wait_success_manual_stopped_then_run_confirmation_clicks_continue_instead_of_copying_trace():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.payload = {"prompt": "demo prompt", "resume_after_pause": True}
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="completed",
+            data={
+                "output_probe": {"complete_like": False, "reason": "manual_stopped"},
+                "completion_gate": {
+                    "passed": True,
+                    "reason": "ok",
+                    "pending_intervention_visible": True,
+                },
+                "supervisor_decision": {"action": "collect_trace", "reason": "trae_turn_completed"},
+            },
+        ),
+    )
+
+    diagnose = _latest_command(db, WorkerCommandType.DIAGNOSE_UI)
+    handle_worker_result(
+        db,
+        diagnose,
+        WorkerResult(
+            command_id=diagnose.id,
+            worker_id=diagnose.worker_id,
+            status="success",
+            data={
+                "state": "awaiting_run_confirmation",
+                "reason": "manual_stopped",
+                "output_probe": {"complete_like": False, "reason": "manual_stopped"},
+                "suggested_intervention": {},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    click = _latest_command(db, WorkerCommandType.CLICK_CONTINUE)
+
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert copy_command is None
+    assert click.payload["continue_attempts"] == 1
+    assert click.payload["recovery_reason"] == "manual_stopped"
+    assert click.payload["prompt"] == "demo prompt"
+
+
 def test_wait_completion_diagnosis_uncertain_probes_trace_before_waiting_again():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
@@ -959,6 +1014,49 @@ def test_wait_completion_timeout_with_completed_turn_queues_trace_collection():
     assert copy_command.payload["allow_local_trace_fallback"] is False
     assert copy_command.payload["completion_observation"]["supervisor_decision"]["action"] == "collect_trace"
     assert click_command is None
+
+
+def test_wait_completion_success_with_manual_stopped_probe_diagnoses_before_trace_collection():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="completed",
+            data={
+                "output_probe": {"complete_like": False, "reason": "manual_stopped"},
+                "completion_gate": {
+                    "passed": True,
+                    "reason": "ok",
+                    "pending_intervention_visible": True,
+                },
+                "trae_turn": {
+                    "status": "found",
+                    "turn_status": "completed",
+                    "session_id": "s1",
+                    "user_message_id": "u1",
+                    "trace_id": VALID_TRAE_TRACE_ID,
+                    "tool_call_count": 0,
+                },
+                "supervisor_decision": {"action": "collect_trace", "reason": "trae_turn_completed"},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
+    diagnose = _latest_command(db, WorkerCommandType.DIAGNOSE_UI)
+
+    assert job.status == JobState.AWAITING_CONTINUE
+    assert round_.status == JobState.AWAITING_CONTINUE
+    assert copy_command is None
+    assert diagnose.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
+    assert diagnose.payload["recovery_reason"] == "manual_stopped"
 
 
 def test_wait_completion_timeout_with_completion_decision_queues_trace_collection():
