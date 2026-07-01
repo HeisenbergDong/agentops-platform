@@ -8,7 +8,7 @@ from typing import Any
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
-WORKER_VERSION = "0.1.18-continue-cooldown"
+WORKER_VERSION = "0.1.19-round-context-supervisor"
 
 
 class WorkerSettings(BaseSettings):

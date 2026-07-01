@@ -290,6 +290,7 @@ class CommandRunner:
             task=task,
             workspace_path=self._launch_workspace_path(workspace_path),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+            round_context=self._round_context(payload),
         )
         result["open_trae"] = open_result
         return result
@@ -368,6 +369,7 @@ class CommandRunner:
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
             continue_text_already_sent=bool(payload.get("continue_text_sent") or payload.get("continue_text_already_sent")),
             continue_sent_at=str(payload.get("continue_sent_at") or ""),
+            round_context=self._round_context(payload),
         )
 
     def _post_wait_progress(self, command_id: str, payload: dict[str, Any], event: dict[str, Any]) -> None:
@@ -426,8 +428,31 @@ class CommandRunner:
             recovery_reason=str(payload.get("recovery_reason") or ""),
             workspace_path=self._launch_workspace_path(workspace_path),
             ui_analyst=self._analyze_trae_ui if bool(payload.get("use_ai_ui_analyst", True)) else None,
+            round_context=self._round_context(payload),
         )
         result["open_trae"] = open_result
+        return result
+
+    def _round_context(self, payload: dict[str, Any]) -> dict[str, Any]:
+        context = payload.get("round_context") if isinstance(payload.get("round_context"), dict) else {}
+        result = dict(context)
+        for source, target in (
+            ("prompt", "trae_prompt_sent"),
+            ("directions", "direction_queue"),
+            ("job_id", "job_id"),
+            ("round_id", "round_id"),
+            ("round_index", "round_index"),
+            ("workspace_path", "workspace_path"),
+            ("trae_workspace_path", "workspace_path"),
+            ("project_name", "project_name"),
+            ("browser_url", "browser_url"),
+            ("url", "browser_url"),
+        ):
+            value = payload.get(source)
+            if value not in (None, "", [], {}) and target not in result:
+                result[target] = value
+        if "prompt" not in result and result.get("trae_prompt_sent"):
+            result["prompt"] = result["trae_prompt_sent"]
         return result
 
     def _analyze_trae_ui(self, screenshot_path: str, context: dict[str, Any]) -> dict:

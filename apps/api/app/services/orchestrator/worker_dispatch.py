@@ -9,6 +9,7 @@ from app.db.models import Job, Project, TaskRound, User, WorkerCommand
 from app.db.repositories.jobs import add_log
 from app.db.repositories.workers import create_worker_command, get_worker_by_worker_id
 from app.services.github.repository import build_project_remote_url
+from app.services.orchestrator.round_context import build_round_context
 from app.services.orchestrator.states import JobState
 from app.services.user_settings import load_user_settings
 from app.worker_gateway.contracts import CreateWorkerCommandRequest, WorkerCommandType
@@ -48,6 +49,7 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
         raise WorkerDispatchError("Configured worker is not available for current user")
 
     project_context = ensure_round_project_context(db, job, round_, worker_settings, settings.get("github", {}))
+    round_context = build_round_context(job, round_, stage=JobState.SENDING_TO_WORKER)
     command = create_worker_command(
         db,
         worker_id=worker.worker_id,
@@ -69,6 +71,7 @@ def dispatch_prompt_to_worker(db: Session, user: User, job: Job, round_: TaskRou
                 "round_index": round_.round_index,
                 "open_new_task": _should_open_new_trae_task(round_),
                 "directions": job.directions,
+                "round_context": round_context,
                 "github_remote_url": project_context.get("github_remote_url", ""),
                 "github_repo_name": project_context["project_name"],
                 "github_branch": str(worker_settings.get("github_branch") or "main"),

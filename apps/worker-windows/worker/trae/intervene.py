@@ -69,6 +69,7 @@ def click_continue(
     recovery_reason: str = "",
     workspace_path: str | Path | None = None,
     ui_analyst: Callable[[str, dict[str, Any]], dict[str, Any]] | None = None,
+    round_context: dict[str, Any] | None = None,
 ) -> dict:
     if workspace_path:
         focus_trae_workspace_or_any(
@@ -82,6 +83,7 @@ def click_continue(
         scroll_bottom=True,
         workspace_path=workspace_path,
         ui_analyst=ui_analyst,
+        round_context=round_context or {},
     )
     suggested = diagnosis.get("suggested_intervention") if isinstance(diagnosis, dict) else {}
     if isinstance(suggested, dict) and suggested:

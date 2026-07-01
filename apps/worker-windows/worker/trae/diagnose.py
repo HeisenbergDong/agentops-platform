@@ -138,6 +138,7 @@ def diagnose_ui(
     task: str = "find_reply_action_button",
     workspace_path: str | Path | None = None,
     recovery_reason: str = "",
+    round_context: dict[str, Any] | None = None,
 ) -> dict:
     if workspace_path:
         focus_trae_workspace_or_any(
@@ -181,6 +182,7 @@ def diagnose_ui(
             text_sample=text[-1600:],
             buttons=buttons[:40],
             recovery_reason=recovery_reason,
+            round_context=round_context or {},
         )
     elif window_rect:
         visual = _diagnose_local_visual(window_rect)
@@ -686,6 +688,7 @@ def _diagnose_ai_visual(
     text_sample: str = "",
     buttons: list[dict[str, Any]] | None = None,
     recovery_reason: str = "",
+    round_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     if not window_rect:
         return {"status": "not_found", "reason": "missing_window_rect"}
@@ -715,6 +718,7 @@ def _diagnose_ai_visual(
                     text_sample=text_sample,
                     buttons=buttons or [],
                     recovery_reason=recovery_reason,
+                    round_context=round_context or {},
                 ),
             )
             ai_analysis = response.get("analysis") if isinstance(response, dict) else response
@@ -776,10 +780,15 @@ def _visual_diagnosis_context(
     text_sample: str = "",
     buttons: list[dict[str, Any]] | None = None,
     recovery_reason: str = "",
+    round_context: dict[str, Any] | None = None,
 ) -> dict[str, Any]:
     left, top, right, bottom = rect
     return {
         "task": task,
+        "global_task_context": round_context or {},
+        "original_user_requirement": (round_context or {}).get("original_user_requirement", ""),
+        "trae_prompt_sent": (round_context or {}).get("trae_prompt_sent", ""),
+        "current_direction": (round_context or {}).get("current_direction", ""),
         "window": {
             "title": window_title,
             "bounds": {

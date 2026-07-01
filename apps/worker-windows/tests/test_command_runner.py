@@ -814,6 +814,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         ui_analyst=None,
         continue_text_already_sent: bool = False,
         continue_sent_at: str = "",
+        round_context=None,
     ):
         received["timeout_seconds"] = timeout_seconds
         received["stable_seconds"] = stable_seconds
@@ -830,6 +831,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         received["ui_analyst"] = callable(ui_analyst)
         received["continue_text_already_sent"] = continue_text_already_sent
         received["continue_sent_at"] = continue_sent_at
+        received["round_context"] = round_context
         return {"status": "completed"}
 
     monkeypatch.setattr(command_runner, "wait_completion", fake_wait_completion)
@@ -857,6 +859,7 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
                 "progress_interval_seconds": 7,
                 "continue_text_sent": True,
                 "continue_sent_at": "2026-06-13T00:00:01+00:00",
+                "round_context": {"original_user_requirement": "user req"},
             },
         }
     )
@@ -878,6 +881,12 @@ def test_wait_completion_routes_payload(monkeypatch: pytest.MonkeyPatch):
         "ui_analyst": True,
         "continue_text_already_sent": True,
         "continue_sent_at": "2026-06-13T00:00:01+00:00",
+        "round_context": {
+            "original_user_requirement": "user req",
+            "trae_prompt_sent": "build feature",
+            "workspace_path": "current",
+            "prompt": "build feature",
+        },
     }
 
 
@@ -1021,6 +1030,7 @@ def test_diagnose_ui_routes_visual_recovery_payload(monkeypatch: pytest.MonkeyPa
         received["scroll_bottom"] = scroll_bottom
         received["ui_analyst"] = ui_analyst
         received["task"] = task
+        received["round_context"] = _kwargs.get("round_context")
         return {"state": "prompt_ready"}
 
     monkeypatch.setattr(command_runner, "diagnose_ui", fake_diagnose_ui)
@@ -1034,6 +1044,8 @@ def test_diagnose_ui_routes_visual_recovery_payload(monkeypatch: pytest.MonkeyPa
                 "timeout_seconds": 6,
                 "scroll_bottom": False,
                 "use_ai_ui_analyst": False,
+                "prompt": "Trae prompt",
+                "round_context": {"original_user_requirement": "用户原始需求", "current_direction": "招聘平台"},
             },
         }
     )
@@ -1044,6 +1056,12 @@ def test_diagnose_ui_routes_visual_recovery_payload(monkeypatch: pytest.MonkeyPa
         "scroll_bottom": False,
         "ui_analyst": None,
         "task": "find_prompt_input_and_send_button",
+        "round_context": {
+            "original_user_requirement": "用户原始需求",
+            "current_direction": "招聘平台",
+            "trae_prompt_sent": "Trae prompt",
+            "prompt": "Trae prompt",
+        },
     }
 
 

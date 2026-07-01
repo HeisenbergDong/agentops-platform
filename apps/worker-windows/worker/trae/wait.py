@@ -61,6 +61,7 @@ def wait_completion(
     ui_analyst: Callable[[str, dict], dict] | None = None,
     continue_text_already_sent: bool = False,
     continue_sent_at: str = "",
+    round_context: dict | None = None,
 ) -> dict:
     if workspace_path:
         focus_trae_workspace_or_any(
@@ -136,6 +137,7 @@ def wait_completion(
                     ),
                     progress_callback=progress_callback,
                     last_progress_at=last_progress_at,
+                    round_context=round_context or {},
                 )
                 if outcome.get("status") == "completed":
                     return outcome
@@ -200,6 +202,7 @@ def wait_completion(
                     suppress_initial_continue_text,
                     interventions,
                 ),
+                round_context=round_context or {},
             )
             if visual_completion:
                 return visual_completion
@@ -236,6 +239,7 @@ def wait_completion(
                 ),
                 progress_callback=progress_callback,
                 last_progress_at=last_progress_at,
+                round_context=round_context or {},
             )
             if outcome.get("status") == "completed":
                 return outcome
@@ -303,6 +307,7 @@ def _try_visual_completion(
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None,
     suppress_continue_text: bool = False,
+    round_context: dict | None = None,
 ) -> dict | None:
     if not ui_analyst:
         return None
@@ -312,6 +317,7 @@ def _try_visual_completion(
         workspace_path=workspace_path,
         ui_analyst=ui_analyst,
         suppress_continue_text=suppress_continue_text,
+        round_context=round_context or {},
     )
     if intervention.get("status") != "completed":
         _remember_diagnostic(diagnostics, intervention)
@@ -637,6 +643,7 @@ def _handle_supervisor_decision(
     suppress_continue_text: bool = False,
     progress_callback: Callable[[dict], None] | None = None,
     last_progress_at: dict[str, float] | None = None,
+    round_context: dict | None = None,
 ) -> dict:
     action = str(decision.get("action") or "wait")
     if action == "collect_trace":
@@ -675,6 +682,7 @@ def _handle_supervisor_decision(
             workspace_path=workspace_path,
             ui_analyst=ui_analyst,
             suppress_continue_text=suppress_continue_text,
+            round_context=round_context or {},
         )
         intervention["supervisor_action"] = action
         intervention["supervisor_reason"] = str(decision.get("reason") or "")
@@ -777,6 +785,7 @@ def _try_auto_intervention(
     workspace_path: str = "",
     ui_analyst: Callable[[str, dict], dict] | None = None,
     suppress_continue_text: bool = False,
+    round_context: dict | None = None,
 ) -> dict:
     try:
         diagnosis = diagnose_ui(
@@ -786,6 +795,7 @@ def _try_auto_intervention(
             task="wait_completion_state",
             workspace_path=workspace_path or None,
             recovery_reason=reason,
+            round_context=round_context or {},
         )
     except Exception as exc:
         return {

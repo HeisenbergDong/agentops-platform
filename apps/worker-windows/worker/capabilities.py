@@ -1,6 +1,6 @@
 SUPPORTED_APPS = ["Trae CN"]
 
-WORKER_RUNTIME_VERSION = "0.1.18-continue-cooldown"
+WORKER_RUNTIME_VERSION = "0.1.19-round-context-supervisor"
 
 CAPABILITIES = [
     "auto_launch_trae",

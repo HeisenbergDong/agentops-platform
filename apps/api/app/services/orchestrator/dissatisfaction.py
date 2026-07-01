@@ -75,6 +75,7 @@ class DissatisfactionEvidence:
     command_type: str = ""
     result_status: str = ""
     prompt: str = ""
+    original_user_requirement: str = ""
     trace_text: str = ""
     screenshot_path: str = ""
     runtime_log_text: str = ""
@@ -783,6 +784,8 @@ def _compact_evidence_for_reviewer(evidence: DissatisfactionEvidence, rule_resul
             "不满意原因": rule_result.get("reason") or "",
         },
         "draft": {
+            "Original User Requirement": evidence.original_user_requirement,
+            "Trae Prompt Sent": evidence.prompt,
             "User Prompt": evidence.prompt,
             "failure_stage": evidence.failure_stage,
             "failure_message": evidence.failure_message,
@@ -795,7 +798,7 @@ def _compact_evidence_for_reviewer(evidence: DissatisfactionEvidence, rule_resul
             "runtime_log_text": _short_text(evidence.runtime_log_text, 8000),
         },
         "evidence_summary": _evidence_summary(evidence),
-        "code_review": {
+        "product_review": {
             "issues": _string_list(product_review.get("issues"))[:8],
             "warnings": _string_list(product_review.get("warnings"))[:6],
             "changed_files": _string_list(product_review.get("changed_files"))[:10],
@@ -804,6 +807,14 @@ def _compact_evidence_for_reviewer(evidence: DissatisfactionEvidence, rule_resul
             "file_count": product_review.get("file_count"),
             "llm_process_observations": _string_list(product_review.get("llm_process_observations"))[:6],
             "github_review": product_review.get("github_review") if isinstance(product_review.get("github_review"), dict) else {},
+        },
+        "code_review": {
+            "deprecated": True,
+            "use": "product_review",
+            "issues": _string_list(product_review.get("issues"))[:8],
+            "warnings": _string_list(product_review.get("warnings"))[:6],
+            "changed_files": _string_list(product_review.get("changed_files"))[:10],
+            "evidence": _string_list(product_review.get("evidence"))[:6],
         },
         "data": _compact_data(evidence.data),
         "domain_acceptance_areas": _expected_acceptance_areas(evidence.prompt),

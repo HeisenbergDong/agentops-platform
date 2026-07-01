@@ -22,6 +22,7 @@ from app.services.orchestrator.prompt_writer import (
     generate_round_prompt,
     mark_prompt_generation_failed,
 )
+from app.services.orchestrator.round_context import build_round_context, merge_round_context
 from app.services.orchestrator.states import JobState
 from app.services.trace.validator import is_recoverable_trace_reason, validate_full_trace
 from app.services.user_settings import load_user_settings, save_user_settings
@@ -270,6 +271,10 @@ def _queue_send_prompt_visual_diagnosis(
         "verify_visual_submission": True,
         "submission_timeout_seconds": max(30, int(source_command.payload.get("submission_timeout_seconds") or 30)),
     }
+    retry_payload = merge_round_context(
+        retry_payload,
+        build_round_context(job, round_, stage="send_prompt_visual_recovery"),
+    )
     result_data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
     if result_data.get("sent_at_epoch") and not retry_payload.get("sent_at_epoch"):
         retry_payload["sent_at_epoch"] = result_data.get("sent_at_epoch")
@@ -308,6 +313,7 @@ def _queue_send_prompt_visual_diagnosis(
             "max_send_prompt_visual_recovery_attempts": max_attempts,
             "recovery_reason": recovery_reason,
             "use_ai_ui_analyst": source_command.payload.get("use_ai_ui_analyst", True),
+            "round_context": retry_payload.get("round_context", {}),
         },
     )
     add_log(
@@ -2730,6 +2736,7 @@ def _dissatisfaction_evidence(
         command_type=command_type,
         result_status=result_status,
         prompt=round_.prompt or "",
+        original_user_requirement=str(job.scope_text or "").strip() or _first_direction(job),
         trace_text=_latest_trace_text(db, job.id, round_.id),
         screenshot_path=screenshot.path if screenshot else "",
         runtime_log_text=_runtime_log_text(db, job.id, round_.id),
@@ -4573,6 +4580,8 @@ def _enqueue_worker_command(
 ) -> WorkerCommand:
     payload = _merge_context(source_command, payload)
     payload = _merge_round_project_context(db, source_command, payload)
+    job, round_ = _load_job_round(db, source_command)
+    payload = merge_round_context(payload, build_round_context(job, round_, stage=command_type.value))
     return create_worker_command(
         db,
         worker_id=source_command.worker_id,
@@ -4611,6 +4620,7 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "sent_at",
         "prompt_sent_at_epoch",
         "prompt_sent_at",
+        "round_context",
     ):
         if key in source_command.payload and key not in result:
             result[key] = source_command.payload[key]
@@ -4823,6 +4833,9 @@ def _advance_to_product_review_after_snapshot(
     )
     scan_payload = {
         "prompt": round_.prompt or "",
+        "original_user_requirement": str(job.scope_text or "").strip() or _first_direction(job),
+        "trae_prompt_sent": round_.prompt or "",
+        "round_context": build_round_context(job, round_, stage=JobState.PRODUCT_REVIEWING),
         "github_review_snapshot": {
             "status": git_result.data.get("status"),
             "commit_sha": git_result.data.get("commit_sha") or "",
@@ -4861,6 +4874,8 @@ def _github_llm_product_review(db: Session, job: Job, round_: TaskRound, git_res
         github_config=github_config,
         git_data=git_result.data or {},
         prompt=round_.prompt or "",
+        original_user_requirement=str(job.scope_text or "").strip() or _first_direction(job),
+        round_context=build_round_context(job, round_, stage="github_llm_product_review"),
         trace_text=_latest_trace_text(db, job.id, round_.id),
         runtime_log_text=_runtime_log_text(db, job.id, round_.id),
     )

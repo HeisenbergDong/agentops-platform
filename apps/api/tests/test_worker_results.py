@@ -438,6 +438,8 @@ def test_wait_completion_success_queues_trace_copy():
 def test_wait_completion_chrome_only_queues_visual_diagnosis_without_click_continue():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
+    job.scope_text = "用户原始需求：做招聘平台"
+    round_.prompt = "Trae prompt: 实现招聘平台工作台"
     command.payload = {"prompt": "demo", "workspace_path": "project-a"}
     db.commit()
 
@@ -471,6 +473,9 @@ def test_wait_completion_chrome_only_queues_visual_diagnosis_without_click_conti
     assert diagnose.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
     assert diagnose.payload["wait_recovery_diagnosis_attempts"] == 1
     assert diagnose.payload["workspace_path"] == "project-a"
+    assert diagnose.payload["round_context"]["original_user_requirement"] == "用户原始需求：做招聘平台"
+    assert diagnose.payload["round_context"]["trae_prompt_sent"] == "Trae prompt: 实现招聘平台工作台"
+    assert diagnose.payload["round_context"]["current_direction"] == "demo"
     assert click_commands == []
     assert "截图诊断" in last_log.display_message
 

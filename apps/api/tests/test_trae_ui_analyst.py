@@ -201,6 +201,34 @@ def test_trae_ui_analyst_normalizes_inner_panel_scroll_action():
     assert result["risk"] == "safe"
 
 
+def test_trae_ui_analyst_preserves_expand_confirm_card_action():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_collapsed_confirm_card",
+        "recommended_action": "expand_confirm_card",
+        "confidence": 0.89,
+        "risk": "safe",
+        "target": {
+            "action": "expand_confirm_card",
+            "label": "确认执行",
+            "center": {"x": 240, "y": 320},
+            "confidence": 0.89,
+            "risk": "safe",
+        },
+        "evidence": ["Only the confirmation header is visible."],
+    }
+
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 1000, "height": 800}}},
+    )
+
+    assert result["screen_state"] == "awaiting_collapsed_confirm_card"
+    assert result["recommended_action"] == "expand_confirm_card"
+    assert result["target"]["action"] == "expand_confirm_card"
+    assert result["risk"] == "safe"
+
+
 def test_trae_ui_analyst_treats_keep_bar_as_click_target_during_wait_completion():
     data = {
         "status": "found",

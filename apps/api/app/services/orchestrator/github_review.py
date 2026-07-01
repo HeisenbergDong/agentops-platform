@@ -73,6 +73,8 @@ def review_github_snapshot(
     github_config: dict[str, Any],
     git_data: dict[str, Any],
     prompt: str,
+    original_user_requirement: str = "",
+    round_context: dict[str, Any] | None = None,
     trace_text: str = "",
     runtime_log_text: str = "",
 ) -> dict[str, Any]:
@@ -86,12 +88,15 @@ def review_github_snapshot(
     model_key = role.model_config_key if role else "default"
     context = {
         "github_snapshot": _compact_snapshot(snapshot),
+        "original_user_requirement": original_user_requirement,
+        "trae_prompt_sent": prompt,
         "user_prompt": prompt,
+        "round_context": round_context or {},
         "trace_summary": _short_text(trace_text, 12000),
         "runtime_log_summary": _short_text(runtime_log_text, 5000),
         "review_contract": {
             "review_target": "Trae generated project files in the GitHub snapshot",
-            "compare_against": "the user_prompt sent to Trae for this round",
+            "compare_against": "the original_user_requirement and the trae_prompt_sent for this round",
             "do_not_use_as_product_issue": ["AgentOps scheduler logs", "Worker status", "GitHub auth/push failures", "Feishu write failures"],
             "valid_finding_requires": ["requirement", "location_or_feature", "code_problem", "objective_symptom", "unmet_requirement"],
         },

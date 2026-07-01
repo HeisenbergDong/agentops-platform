@@ -13,12 +13,13 @@ Analyze a Trae CN screenshot and classify whether Trae is still working, complet
 You never control the mouse or keyboard. Return JSON only.
 Do not guess. If uncertain, return status "need_more_context" or "not_found".
 Coordinates must be absolute screen coordinates when window.bounds is provided, and also include ratios relative to that window.
-Allowed click targets include prompt_input, send_button, copy_trace_button, more_actions_button, continue_button, run_button, confirm_button, keep_button, save_button, delete_button, discard_button, remove_button, reset_button, cancel_button.
-Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bottom, scroll_inner_panel, click_run_button, click_confirm_button, click_keep_button, click_save_button, click_continue_button, click_delete_button, click_discard_button, click_cancel_button, type_continue, answer_terminal_prompt, do_not_click, need_more_context.
+Allowed click targets include prompt_input, send_button, copy_trace_button, more_actions_button, continue_button, run_button, confirm_button, keep_button, save_button, delete_button, discard_button, remove_button, reset_button, cancel_button, expand_confirm_card.
+Allowed recommended actions are wait, collect_trace_candidate, scroll_reply_bottom, scroll_inner_panel, click_run_button, click_confirm_button, click_keep_button, click_save_button, click_continue_button, click_delete_button, click_discard_button, click_cancel_button, expand_confirm_card, type_continue, answer_terminal_prompt, do_not_click, need_more_context.
 If the screenshot contains "正在等待你的操作", "等待您的操作", "确认执行", "保留", "删除", "应用", "继续", "运行", "允许", or "拒绝", classify it as a pending user action instead of ordinary generation.
 Hard rule: a visible waiting-for-user-action card is never a completed task. If that card explicitly asks whether Trae can delete/remove something, return awaiting_delete_confirmation + click_delete_button with risk "safe". If it asks to clear, reset, discard, cancel, or abandon, return screen_state "manual_required", recommended_action "do_not_click", risk "blocked", and explain blocked_reason.
 Example: if Trae shows "正在等待你的操作" with "删除 startup.log" and buttons "保留" / "删除", the correct answer is awaiting_delete_confirmation + click_delete_button with risk safe, not completed.
 If the pending action is inside a nested reply card or small inner panel and the card content is cut off or not fully visible, use screen_state "needs_scroll_inner_panel" and recommended_action "scroll_inner_panel".
+If a confirmation card has collapsed and only the "确认执行" header is visible, use screen_state "awaiting_collapsed_confirm_card" and recommended_action "expand_confirm_card" with the header target.
 For destructive-looking actions such as clear, reset, discard, cancel, or abandon, use risk "blocked" and recommended_action "do_not_click" unless task context explicitly allows that exact destructive action. Trae delete/remove confirmation cards are allowed when explicit.
 If the model request failed with 3003 or service interruption, prefer recommended_action "type_continue" with risk "safe".
 If the assistant appears to still be generating or tools are running, use recommended_action "wait".
@@ -40,8 +41,8 @@ SYSTEM_INSTRUCTIONS += (
 
 OUTPUT_SCHEMA = {
     "status": "found | partial | need_more_context | not_found",
-    "screen_state": "generating | completed | prompt_submitted | prompt_still_in_composer | prompt_not_submitted | manual_required | awaiting_run_confirmation | awaiting_confirm | awaiting_keep_changes | awaiting_save | awaiting_continue | awaiting_delete_confirmation | awaiting_discard_confirmation | awaiting_cancel_confirmation | model_error_3003 | service_interrupted | terminal_prompt | needs_scroll_reply_bottom | needs_scroll_inner_panel | editor_only | window_chrome_only | unknown",
-    "recommended_action": "wait | collect_trace_candidate | scroll_reply_bottom | scroll_inner_panel | click_run_button | click_confirm_button | click_keep_button | click_save_button | click_continue_button | click_delete_button | click_discard_button | click_cancel_button | type_continue | answer_terminal_prompt | do_not_click | need_more_context",
+    "screen_state": "generating | completed | prompt_submitted | prompt_still_in_composer | prompt_not_submitted | manual_required | awaiting_run_confirmation | awaiting_confirm | awaiting_keep_changes | awaiting_save | awaiting_continue | awaiting_collapsed_confirm_card | awaiting_delete_confirmation | awaiting_discard_confirmation | awaiting_cancel_confirmation | model_error_3003 | service_interrupted | terminal_prompt | needs_scroll_reply_bottom | needs_scroll_inner_panel | editor_only | window_chrome_only | unknown",
+    "recommended_action": "wait | collect_trace_candidate | scroll_reply_bottom | scroll_inner_panel | click_run_button | click_confirm_button | click_keep_button | click_save_button | click_continue_button | click_delete_button | click_discard_button | click_cancel_button | expand_confirm_card | type_continue | answer_terminal_prompt | do_not_click | need_more_context",
     "confidence": 0.0,
     "risk": "safe | blocked | unknown",
     "target": {
@@ -79,6 +80,7 @@ SCREEN_STATES = {
     "awaiting_keep_changes",
     "awaiting_save",
     "awaiting_continue",
+    "awaiting_collapsed_confirm_card",
     "awaiting_delete_confirmation",
     "awaiting_discard_confirmation",
     "awaiting_cancel_confirmation",
@@ -104,6 +106,7 @@ RECOMMENDED_ACTIONS = {
     "click_delete_button",
     "click_discard_button",
     "click_cancel_button",
+    "expand_confirm_card",
     "type_continue",
     "answer_terminal_prompt",
     "do_not_click",
@@ -123,6 +126,7 @@ ACTION_TO_RECOMMENDATION = {
     "discard_button": "click_discard_button",
     "reset_button": "click_discard_button",
     "cancel_button": "click_cancel_button",
+    "expand_confirm_card": "expand_confirm_card",
 }
 UNSAFE_TEXT_MARKERS = (
     "delete",
