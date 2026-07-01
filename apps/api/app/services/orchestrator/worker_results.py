@@ -16,6 +16,7 @@ from app.services.orchestrator.dissatisfaction import (
     DissatisfactionEvidence,
     generate_dissatisfaction_reason,
 )
+from app.services.orchestrator.flow_supervisor import decide_flow_recovery_for_orchestrator
 from app.services.orchestrator.github_review import review_github_snapshot
 from app.services.orchestrator.prompt_writer import (
     PromptGenerationError,
@@ -67,6 +68,7 @@ DEFAULT_MAX_WAIT_RECOVERY_DIAGNOSIS_ATTEMPTS = 2
 FIRST_ROUND_INTERVENTION_IDLE_SECONDS = 30
 FOLLOWUP_ROUND_INTERVENTION_IDLE_SECONDS = 30
 DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS = 10
+DEFAULT_MAX_RESUME_PROMPT_ATTEMPTS = 2
 CONTINUE_TEXT_SUPPRESSION_SECONDS = 60
 DEFAULT_TRAE_SLOW_NOTIFY_SECONDS = 30 * 60
 TRACE_UNAVAILABLE_AFTER_COMPLETION = "trace_unavailable_after_completed"
@@ -355,6 +357,24 @@ def _handle_wait_completion_result(db: Session, command: WorkerCommand, result: 
         )
         return
 
+    decision = decide_flow_recovery_for_orchestrator(
+        db,
+        event="wait_failure",
+        command=command,
+        job=job,
+        round_=round_,
+        extra={**extra, "recovery_reason": _recovery_reason(extra)},
+    )
+    if decision.get("action") == "send_resume_prompt" and _queue_resume_prompt(
+        db,
+        command,
+        job,
+        round_,
+        "Flow supervisor detected a stuck Trae recovery loop; sending a resume prompt instead of observing again.",
+        {**extra, "flow_supervisor_decision": decision},
+    ):
+        return
+
     if _should_observe_wait_failure_without_recovery(extra):
         if _wait_failure_needs_visual_diagnosis(extra) and _queue_wait_recovery_diagnosis(
             db,
@@ -476,6 +496,23 @@ def _handle_diagnose_ui_result(db: Session, command: WorkerCommand, result: Work
             {"supervisor_decision": {"action": "collect_trace", "reason": "resume_diagnosis_keep_changes_complete"}},
             message="Continue diagnosis found completed Trae changes waiting to be kept; collecting the full assistant trace.",
         )
+        return
+    decision = decide_flow_recovery_for_orchestrator(
+        db,
+        event="resume_diagnosis",
+        command=command,
+        job=job,
+        round_=round_,
+        extra=diagnostic_extra,
+    )
+    if decision.get("action") == "send_resume_prompt" and _queue_resume_prompt(
+        db,
+        command,
+        job,
+        round_,
+        "Flow supervisor decided the paused Trae turn is not resuming cleanly; sending a resume prompt.",
+        {**diagnostic_extra, "flow_supervisor_decision": decision},
+    ):
         return
     if suggested and not _diagnosis_suggests_continue_recovery(suggested):
         _queue_wait_observation_retry(
@@ -2914,6 +2951,109 @@ def _queue_continue_recovery(
     )
 
 
+def _queue_resume_prompt(
+    db: Session,
+    source_command: WorkerCommand,
+    job: Job,
+    round_: TaskRound | None,
+    message: str,
+    extra: dict,
+) -> bool:
+    if not round_:
+        return False
+    attempts = int(source_command.payload.get("resume_prompt_attempts") or 0) + 1
+    max_attempts = int(source_command.payload.get("max_resume_prompt_attempts") or DEFAULT_MAX_RESUME_PROMPT_ATTEMPTS)
+    if attempts > max_attempts:
+        return False
+
+    prompt = _resume_prompt_text(job, round_, extra)
+    payload = _suppress_open_new_task_for_retry(
+        {
+            "prompt": prompt,
+            "resume_prompt_attempts": attempts,
+            "max_resume_prompt_attempts": max_attempts,
+            "resume_after_pause": True,
+            "resume_strategy": "flow_supervisor_resume_prompt",
+            "flow_supervisor_decision": extra.get("flow_supervisor_decision", {}),
+            "verify_submission": True,
+            "strict_submission_verification": True,
+            "submission_timeout_seconds": source_command.payload.get("submission_timeout_seconds", 30),
+            "wait_timeout_seconds": source_command.payload.get("wait_timeout_seconds", 900),
+            "stable_seconds": source_command.payload.get("stable_seconds", 15),
+            "poll_interval_seconds": source_command.payload.get("poll_interval_seconds", 2),
+            "intervention_idle_seconds": 1,
+            "max_interventions": source_command.payload.get("max_interventions", 3),
+            "continue_attempts": 0,
+            "max_continue_attempts": source_command.payload.get("max_continue_attempts", 20),
+            "wait_observation_attempts": 0,
+            "max_wait_observation_attempts": source_command.payload.get(
+                "max_wait_observation_attempts",
+                DEFAULT_MAX_WAIT_OBSERVATION_ATTEMPTS,
+            ),
+            "use_ai_ui_analyst": source_command.payload.get("use_ai_ui_analyst", True),
+        },
+        "flow_supervisor_resume_prompt",
+    )
+
+    job.status = JobState.SENDING_TO_WORKER
+    round_.status = JobState.SENDING_TO_WORKER
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage="flow_supervisor_decision",
+        message=message,
+        level="warning",
+        extra={
+            **extra,
+            "resume_prompt_attempts": attempts,
+            "max_resume_prompt_attempts": max_attempts,
+            "display_message": (
+                f"流程督导判断旧 Trae 回合没有顺利恢复，已切换为发送恢复提示词"
+                f"（第 {attempts}/{max_attempts} 次），避免继续空转观察。"
+            ),
+        },
+    )
+    command = _enqueue_worker_command(db, source_command, WorkerCommandType.SEND_PROMPT, payload)
+    add_log(
+        db,
+        job_id=job.id,
+        round_id=round_.id,
+        stage=JobState.SENDING_TO_WORKER,
+        message="send_prompt worker command queued by flow supervisor resume recovery.",
+        extra={
+            "worker_id": command.worker_id,
+            "command_id": command.id,
+            "resume_prompt_attempts": attempts,
+            "max_resume_prompt_attempts": max_attempts,
+            "open_new_task": False,
+            "display_message": "已向 Worker 下发恢复提示词，让 Trae 从暂停/中断处继续当前作业。",
+        },
+    )
+    return True
+
+
+def _resume_prompt_text(job: Job, round_: TaskRound, extra: dict) -> str:
+    decision = extra.get("flow_supervisor_decision") if isinstance(extra.get("flow_supervisor_decision"), dict) else {}
+    decision_reason = str(decision.get("reason") or extra.get("recovery_reason") or "").strip()
+    current_prompt = str(round_.prompt or "").strip()
+    original = str(job.scope_text or "").strip()
+    directions = [str(item).strip() for item in (job.directions or []) if str(item).strip()]
+    direction_text = directions[min(max(int(round_.round_index or 1) - 1, 0), len(directions) - 1)] if directions else ""
+    text = (
+        "继续刚才被暂停或中断的任务，从当前已有项目和文件继续往下完成，不要重新初始化项目，"
+        "不要清空已有文件，也不要另起一个无关项目。\n"
+        "如果界面上仍有确认执行、继续、保留、保存等与当前任务相关的安全确认，请先处理；"
+        "如果旧回复已经无法续接，请按下面的本轮目标继续完成剩余工作。\n\n"
+        f"恢复原因：{decision_reason or '旧 Trae 回合没有顺利恢复'}。\n"
+        f"当前方向：{direction_text or '沿用本轮方向'}。\n"
+        f"原始需求范围：{original or '沿用平台最初输入的需求范围'}。\n\n"
+        f"本轮 Trae 原始提示词：\n{current_prompt or '沿用当前轮已生成的提示词'}\n\n"
+        "完成后简短说明实际改动、关键文件和最小验证情况。"
+    )
+    return text
+
+
 def _queue_trace_recovery_diagnosis(
     db: Session,
     source_command: WorkerCommand,
@@ -3566,6 +3706,15 @@ def _diagnosis_suggests_continue_recovery(suggested: dict) -> bool:
 
 def _recovery_reason(extra: dict) -> str:
     data = extra.get("data") if isinstance(extra.get("data"), dict) else {}
+    supervisor = data.get("supervisor_decision") if isinstance(data.get("supervisor_decision"), dict) else {}
+    completion_gate = data.get("completion_gate") if isinstance(data.get("completion_gate"), dict) else {}
+    supervisor_gate = (
+        supervisor.get("completion_gate")
+        if isinstance(supervisor.get("completion_gate"), dict)
+        else {}
+    )
+    trae_turn = data.get("trae_turn") if isinstance(data.get("trae_turn"), dict) else {}
+    supervisor_turn = supervisor.get("turn_probe") if isinstance(supervisor.get("turn_probe"), dict) else {}
     for source in (
         extra.get("current_turn_gate"),
         data.get("current_turn_gate"),
@@ -3575,6 +3724,11 @@ def _recovery_reason(extra: dict) -> str:
         data.get("trace_probe"),
         extra.get("output_probe"),
         data.get("output_probe"),
+        completion_gate,
+        supervisor_gate,
+        trae_turn,
+        supervisor_turn,
+        supervisor,
     ):
         if isinstance(source, dict) and str(source.get("reason") or "").strip():
             return str(source.get("reason")).strip()
@@ -4629,6 +4783,12 @@ def _merge_context(source_command: WorkerCommand, payload: dict) -> dict:
         "max_continue_attempts",
         "wait_observation_attempts",
         "max_wait_observation_attempts",
+        "resume_prompt_attempts",
+        "max_resume_prompt_attempts",
+        "resume_after_pause",
+        "resume_after_stop",
+        "resume_strategy",
+        "flow_supervisor_decision",
         "wait_timeout_seconds",
         "stable_seconds",
         "poll_interval_seconds",

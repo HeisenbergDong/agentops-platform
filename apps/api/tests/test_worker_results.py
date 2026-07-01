@@ -544,6 +544,53 @@ def test_wait_completion_observation_limit_queues_visual_diagnosis_before_manual
     assert manual_error is None
 
 
+def test_wait_completion_recoverable_loop_sends_resume_prompt_before_more_observation():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    round_.prompt = "原始本轮提示词"
+    command.payload = {
+        "prompt": round_.prompt,
+        "resume_after_pause": True,
+        "continue_attempts": 2,
+        "wait_observation_attempts": 2,
+        "max_wait_observation_attempts": 10,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Trae output did not become stable before wait_completion timeout",
+            data={
+                "trae_turn": {"status": "missing", "reason": "awaiting_current_continuation"},
+                "completion_gate": {
+                    "passed": False,
+                    "reason": "awaiting_current_continuation",
+                    "recoverable": True,
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    send = _latest_command(db, WorkerCommandType.SEND_PROMPT)
+    wait_commands = list(
+        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)).all()
+    )
+
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert send.payload["open_new_task"] is False
+    assert send.payload["resume_prompt_attempts"] == 1
+    assert "原始本轮提示词" in send.payload["prompt"]
+    assert len(wait_commands) == 1
+
+
 def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
@@ -590,6 +637,54 @@ def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete(
         == "resume_diagnosis_keep_changes_complete"
     )
     assert manual_error is None
+
+
+def test_pause_resume_service_interruption_sends_resume_prompt_instead_of_click_loop():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    job.scope_text = "原始范围"
+    round_.prompt = "本轮原始提示词"
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+        "resume_after_stop": True,
+        "resume_strategy": "observe_then_decide",
+        "resume_previous_payload": {"prompt": round_.prompt},
+        "continue_attempts": 1,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "service_interrupted",
+                "reason": "ai_visual_type_continue",
+                "output_probe": {"complete_like": False, "reason": "service_interrupted"},
+                "suggested_intervention": {"mode": "continue-text", "text": "继续", "action": "continue"},
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    send = _latest_command(db, WorkerCommandType.SEND_PROMPT)
+    click = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "flow_supervisor_decision"))
+
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert click is None
+    assert send.payload["open_new_task"] is False
+    assert send.payload["resume_prompt_attempts"] == 1
+    assert send.payload["resume_strategy"] == "flow_supervisor_resume_prompt"
+    assert "本轮原始提示词" in send.payload["prompt"]
+    assert log is not None
+    assert log.extra["flow_supervisor_decision"]["action"] == "send_resume_prompt"
 
 
 def test_wait_completion_diagnosis_uncertain_probes_trace_before_waiting_again():

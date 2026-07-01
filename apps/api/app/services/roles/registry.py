@@ -69,6 +69,15 @@ ROLE_REGISTRY: list[RoleDefinition] = [
         rules=["11_worker_trae_cn_rules.md"],
         purpose="根据截图、日志和 UI 信号决定 Trae CN / Windows Worker 的安全操作。",
     ),
+    RoleDefinition(
+        key="flow_supervisor",
+        name="Flow Supervisor",
+        rules=["01_global_rules.md", "02_orchestrator_rules.md", "12_state_machine_rules.yaml"],
+        purpose=(
+            "Decides whether a stuck pause/resume or wait-completion recovery should continue the deterministic "
+            "state machine or send a resume prompt into the existing Trae task."
+        ),
+    ),
 ]
 
 
