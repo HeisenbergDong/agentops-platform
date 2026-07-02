@@ -54,6 +54,18 @@ class FakeClient:
         }
 
 
+class FailingResultClient(FakeClient):
+    def __init__(self, commands, ack_response, failures: int = 1):
+        super().__init__(commands=commands, ack_response=ack_response)
+        self.failures = failures
+
+    def post_result(self, worker_id, payload):
+        if self.failures > 0:
+            self.failures -= 1
+            raise RuntimeError("network down")
+        return super().post_result(worker_id, payload)
+
+
 class FakeRunner:
     def __init__(self):
         self.state = type("State", (), {"stage": "idle", "current_window_title": "", "busy": False})()
@@ -209,6 +221,62 @@ def test_run_once_renews_running_command_lease(monkeypatch, tmp_path: Path):
     assert active_heartbeats[-1]["busy"] is True
     assert active_heartbeats[-1]["runtime_status"]["active_command"]["type"] == "wait_completion"
     assert client.results[0]["status"] == "success"
+
+
+def test_run_once_saves_result_to_outbox_when_post_result_fails(monkeypatch, tmp_path: Path):
+    command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
+    client = FailingResultClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"}, failures=4)
+    outbox_dir = tmp_path / "outbox"
+    result_outbox_class = worker_main.ResultOutbox
+    monkeypatch.setattr(worker_main, "ResultOutbox", lambda: result_outbox_class(outbox_dir, retry_delays=()))
+
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=FakeRunner(), worker_settings=settings)
+
+    saved = list(outbox_dir.glob("*.json"))
+    assert processed == 1
+    assert client.results == []
+    assert len(saved) == 1
+    assert '"command_id": "cmd1"' in saved[0].read_text(encoding="utf-8")
+
+
+def test_run_once_flushes_saved_result_outbox(monkeypatch, tmp_path: Path):
+    command = {"command_id": "cmd1", "type": "wait_completion", "payload": {}, "lease_id": "claim-1"}
+    outbox_dir = tmp_path / "outbox"
+    result_outbox_class = worker_main.ResultOutbox
+    outbox = result_outbox_class(outbox_dir)
+    outbox.save(
+        "worker-test",
+        {
+            "command_id": "old-cmd",
+            "worker_id": "worker-test",
+            "lease_id": "old-run",
+            "status": "manual_required",
+            "message": "saved",
+            "data": {"reason": "service_interrupted"},
+        },
+    )
+    client = FakeClient(commands=[command], ack_response={**command, "status": "running", "lease_id": "run-1"})
+    monkeypatch.setattr(worker_main, "ResultOutbox", lambda: result_outbox_class(outbox_dir))
+
+    settings = WorkerSettings(
+        worker_id="worker-test",
+        token="test-token",
+        workspace_root=tmp_path,
+        trae_exe_path=tmp_path / "Trae.exe",
+    )
+
+    processed = worker_main.run_once(client=client, runner=FakeRunner(), worker_settings=settings)
+
+    assert processed == 1
+    assert [item["command_id"] for item in client.results] == ["old-cmd", "cmd1"]
+    assert list(outbox_dir.glob("*.json")) == []
 
 
 def test_run_once_converts_success_to_cancelled_stop_when_server_cancelled_after_run(tmp_path: Path):

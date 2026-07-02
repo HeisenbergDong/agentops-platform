@@ -12,6 +12,7 @@ from app.worker_gateway.contracts import (
     CreateWorkerCommandRequest,
     WorkerCommandType,
     WorkerHeartbeat,
+    WorkerLogEntry,
     WorkerRegisterRequest,
     WorkerResult,
 )
@@ -163,6 +164,53 @@ def test_stale_result_is_ignored_by_worker_api():
     assert response["reason"] == "stale_lease"
     assert command.status == "running"
     assert command.result == {}
+
+
+def test_finished_log_recovers_result_when_results_callback_is_missing():
+    db = _test_session()
+    worker = Worker(worker_id="worker1", user_id="user1", machine_name="host", token_hash="hash")
+    job, round_, command = _create_job_round_command(db)
+    command.status = "running"
+    command.lease_id = "run-current"
+    command.lease_expires_at = now_utc() + timedelta(minutes=5)
+    db.add(worker)
+    db.commit()
+
+    response = workers_api.post_log(
+        "worker1",
+        WorkerLogEntry(
+            command_id=command.id,
+            job_id=job.id,
+            round_id=round_.id,
+            level="info",
+            stage="worker_command_finished",
+            message="wait_completion worker_command_finished",
+            extra={
+                "command_type": WorkerCommandType.WAIT_COMPLETION.value,
+                "result_status": "manual_required",
+                "error": "Trae output did not become stable before wait_completion timeout",
+                "result": {
+                    "output_probe": {"complete_like": False, "reason": "service_interrupted", "marker": "任务中断"},
+                    "trae_turn": {"status": "missing", "reason": "awaiting_current_continuation"},
+                    "completion_gate": {"passed": False, "reason": "pending_intervention_visible", "recoverable": True},
+                    "supervisor_decision": {"action": "recover_service_interruption", "reason": "service_interrupted"},
+                },
+            },
+        ),
+        worker=worker,
+        db=db,
+    )
+
+    db.refresh(command)
+    db.refresh(job)
+    recovery_log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "worker_result_recovered_from_log"))
+
+    assert response["status"] == "received"
+    assert command.status == "manual_required"
+    assert command.lease_id == ""
+    assert command.result["output_probe"]["reason"] == "service_interrupted"
+    assert job.status != "manual_required"
+    assert recovery_log is not None
 
 
 def test_cancelled_result_with_stop_report_is_accepted_after_server_cancelled_command():

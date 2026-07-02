@@ -15,6 +15,7 @@ if __package__ in {None, ""}:
 from worker.capabilities import CAPABILITIES, SUPPORTED_APPS, WORKER_RUNTIME_VERSION
 from worker.config import WorkerSettings, apply_assigned_config, default_config_path, load_worker_settings
 from worker.connection.client import WorkerClient
+from worker.connection.outbox import ResultOutbox
 from worker.connection.uploader import AttachmentUploader
 from worker.registration import RegistrationOptions, is_registered, machine_fingerprint, register_worker
 from worker.runtime.supervisor import SupervisorOptions, run_supervisor
@@ -37,6 +38,8 @@ def run_once(
     worker_settings = worker_settings or load_worker_settings()
     client = client or WorkerClient(worker_settings.server_url, worker_settings.token)
     runner = runner or create_command_runner(worker_settings)
+    outbox = ResultOutbox()
+    flush_result_outbox(outbox, client, worker_settings.worker_id)
     if getattr(runner, "cancellation_checker", None) is None:
         attach_cancellation_checker(runner, client, worker_settings)
     heartbeat = build_heartbeat_payload(worker_settings, runner)
@@ -47,7 +50,7 @@ def run_once(
     for command in commands:
         if is_cancelled_command(command):
             result = cancelled_result(worker_settings.worker_id, command, "Command was cancelled before ack.")
-            client.post_result(worker_settings.worker_id, result)
+            post_worker_result(outbox, client, worker_settings.worker_id, result)
             processed += 1
             continue
         acked = client.ack_command(
@@ -61,7 +64,7 @@ def run_once(
             continue
         if is_cancelled_command(acked):
             result = cancelled_result(worker_settings.worker_id, command, "Command was cancelled before worker execution.")
-            client.post_result(worker_settings.worker_id, result)
+            post_worker_result(outbox, client, worker_settings.worker_id, result)
             processed += 1
             continue
         command = {**command, "lease_id": str(acked.get("lease_id") or command.get("lease_id") or "")}
@@ -93,7 +96,7 @@ def run_once(
                     "result": result.get("data") if isinstance(result.get("data"), dict) else {},
                 },
             )
-            client.post_result(worker_settings.worker_id, result)
+            post_worker_result(outbox, client, worker_settings.worker_id, result)
         finally:
             renewer.stop()
         processed += 1
@@ -133,6 +136,20 @@ def build_heartbeat_payload(
         "runtime_status": runtime_status,
         "busy": bool(getattr(state, "busy", False)),
     }
+
+
+def flush_result_outbox(outbox: ResultOutbox, client: WorkerClient, worker_id: str) -> None:
+    try:
+        outbox.flush(client, worker_id)
+    except Exception as exc:
+        log(f"Could not flush result outbox: {exc}")
+
+
+def post_worker_result(outbox: ResultOutbox, client: WorkerClient, worker_id: str, result: dict) -> None:
+    try:
+        outbox.post_or_save(client, worker_id, result)
+    except Exception as exc:
+        log(f"Could not post worker result; saved to outbox for retry: {exc}")
 
 
 class CommandLeaseRenewer:

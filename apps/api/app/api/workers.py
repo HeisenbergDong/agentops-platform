@@ -280,8 +280,52 @@ def post_log(
         extra={"worker_id": worker_id, "command_id": payload.command_id, **payload.extra},
         display_message=payload.display_message,
     )
+    fallback_result = _result_from_finished_log(worker_id, command, payload)
+    if fallback_result:
+        finished_command, finish_status = finish_worker_command(db, worker_id, fallback_result)
+        if finished_command and finish_status != "stale_lease":
+            add_log(
+                db,
+                job_id=finished_command.job_id,
+                round_id=finished_command.round_id,
+                level="warning",
+                stage="worker_result_recovered_from_log",
+                message="Worker result was recovered from worker_command_finished log because the /results callback was not received first.",
+                extra={
+                    "worker_id": worker_id,
+                    "command_id": finished_command.id,
+                    "command_type": finished_command.command_type,
+                    "finish_status": finish_status,
+                    "source_log_id": log.id,
+                    "result_status": fallback_result.status,
+                },
+            )
+            handle_worker_result(db, finished_command, fallback_result)
     db.commit()
     return {"status": "received", "log_id": log.id}
+
+
+def _result_from_finished_log(worker_id: str, command: WorkerCommand | None, payload: WorkerLogEntry) -> WorkerResult | None:
+    if payload.stage != "worker_command_finished" or not command:
+        return None
+    if command.status not in {"claimed", "running"}:
+        return None
+    extra = payload.extra if isinstance(payload.extra, dict) else {}
+    result_data = extra.get("result")
+    if not isinstance(result_data, dict):
+        return None
+    result_status = str(extra.get("result_status") or "").strip()
+    if not result_status:
+        return None
+    return WorkerResult(
+        command_id=command.id,
+        worker_id=worker_id,
+        lease_id=str(command.lease_id or ""),
+        status=result_status,
+        message=str(extra.get("message") or payload.message or ""),
+        error=str(extra.get("error") or "") or None,
+        data=result_data,
+    )
 
 
 @router.post("/{worker_id}/attachments")
