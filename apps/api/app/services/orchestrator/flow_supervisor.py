@@ -17,23 +17,41 @@ from app.worker_gateway.contracts import WorkerCommandType
 RECOVERABLE_REASONS = {
     "awaiting_continuation",
     "awaiting_current_continuation",
+    "manual_stopped",
+    "pending_intervention_visible",
     "service_interrupted",
     "missing_tool_trace_markers",
     "no_completed_turn_after_prompt_send",
 }
+FLOW_RECOVERY_ACTIONS = {
+    "continue_state_machine",
+    "type_continue_text",
+    "apply_ui_suggestion",
+    "send_resume_prompt",
+    "wait_observe",
+    "collect_trace",
+    "manual_required",
+}
+FORBIDDEN_UI_ACTIONS = {
+    "stop_button",
+    "stop_generation",
+    "cancel_generation",
+    "cancel_generation_button",
+}
 
 MAX_RESUME_PROMPT_ATTEMPTS = 2
+MAX_CONTINUE_TEXT_ATTEMPTS = 2
 SAFE_ACTIONS_BEFORE_PROMPT = 2
 WAIT_OBSERVATIONS_BEFORE_PROMPT = 2
 FLOW_SUPERVISOR_LLM_TIMEOUT_SECONDS = 12.0
 FLOW_SUPERVISOR_MIN_CONFIDENCE = 0.62
 
 FLOW_SUPERVISOR_SYSTEM = """You are the flow supervisor for an automation platform that controls Trae CN through a Windows Worker.
-You decide whether the scheduler should continue the existing deterministic state machine or send a resume prompt to Trae.
+You decide the next recovery action for the current Trae task.
 
 Return one JSON object only:
 {
-  "action": "continue_state_machine|send_resume_prompt",
+  "action": "continue_state_machine|type_continue_text|apply_ui_suggestion|send_resume_prompt|wait_observe|collect_trace|manual_required",
   "reason": "...",
   "confidence": 0.0,
   "stuck_pattern": "...",
@@ -42,9 +60,13 @@ Return one JSON object only:
 
 Rules:
 - Do not judge product quality or write dissatisfaction reasons.
-- Choose send_resume_prompt when the old Trae turn is likely stuck after pause, service interruption, collapsed confirmation cards, repeated safe actions, or wait-completion loops.
-- Choose continue_state_machine when the current state machine still has a clear safe next action and there is not enough evidence that the old Trae turn is stale.
-- Never suggest arbitrary UI clicks, deleting files, restarting unrelated local processes, or opening a new task.
+- Choose type_continue_text when Trae's model output was interrupted/stopped and the best recovery is to type a short continuation instruction into the existing chat.
+- Choose apply_ui_suggestion when the UI diagnosis has a current safe click/scroll/terminal target and that action should be executed now.
+- Choose send_resume_prompt when a short continue is unlikely to be enough and Trae needs the full original-task recovery context.
+- Choose wait_observe only when Trae is actively generating or there is credible recent activity.
+- Choose collect_trace only when the current Trae turn is complete and trace collection is appropriate.
+- Choose manual_required only when the state is blocked or unsafe.
+- Never stop/cancel Trae generation, open a new Trae task, delete unrelated files, or restart unrelated local processes.
 - Prefer preserving the current project and continuing the same round over starting a new Trae task.
 """
 
@@ -61,6 +83,7 @@ def decide_flow_recovery(
 
     context = _context(event=event, command=command, job=job, round_=round_, extra=extra or {})
     resume_attempts = int(context.get("resume_prompt_attempts") or 0)
+    continue_text_attempts = int(context.get("continue_text_attempts") or 0)
     if resume_attempts >= MAX_RESUME_PROMPT_ATTEMPTS:
         return _decision(
             "continue_state_machine",
@@ -75,6 +98,27 @@ def decide_flow_recovery(
     resume_strategy = str(context.get("resume_strategy") or "")
 
     if event == "resume_diagnosis" and previous_type == WorkerCommandType.WAIT_COMPLETION.value:
+        if _ui_suggestion_is_forbidden(context):
+            return _decision(
+                "manual_required",
+                "forbidden_ui_recovery_action",
+                context,
+                confidence=0.95,
+            )
+        if _should_type_continue_text(context) and continue_text_attempts < MAX_CONTINUE_TEXT_ATTEMPTS:
+            return _decision(
+                "type_continue_text",
+                "interrupted_trae_turn_needs_continue_text",
+                context,
+                confidence=0.9,
+            )
+        if _has_safe_ui_suggestion(context):
+            return _decision(
+                "apply_ui_suggestion",
+                "ui_diagnosis_has_recovery_action",
+                context,
+                confidence=0.82,
+            )
         if resume_after_pause and _is_recoverable(reason):
             return _decision(
                 "send_resume_prompt",
@@ -91,6 +135,13 @@ def decide_flow_recovery(
             )
 
     if event == "wait_failure":
+        if _should_type_continue_text(context) and continue_text_attempts < MAX_CONTINUE_TEXT_ATTEMPTS:
+            return _decision(
+                "type_continue_text",
+                "wait_failure_after_interrupted_turn_needs_continue_text",
+                context,
+                confidence=0.86,
+            )
         if (
             resume_strategy == "flow_supervisor_resume_prompt"
             and resume_attempts > 0
@@ -192,10 +243,10 @@ def _context(
 
     reason = _first_reason(
         extra.get("recovery_reason"),
-        extra.get("diagnosis_state"),
         output_probe.get("reason"),
         trace_probe.get("reason"),
         current_gate.get("reason"),
+        extra.get("diagnosis_state"),
         supervisor.get("reason"),
         turn.get("reason"),
     )
@@ -215,7 +266,11 @@ def _context(
         "diagnosis_state": str(extra.get("diagnosis_state") or ""),
         "suggested_mode": str(suggested.get("mode") or ""),
         "suggested_action": str(suggested.get("action") or ""),
+        "suggested_recommended_action": str(suggested.get("recommended_action") or ""),
+        "suggested_risk": str(suggested.get("risk") or ""),
+        "suggested_manual_message": str(suggested.get("manual_message") or ""),
         "continue_attempts": int(payload.get("continue_attempts") or 0),
+        "continue_text_attempts": int(payload.get("continue_text_attempts") or 0),
         "wait_observation_attempts": int(payload.get("wait_observation_attempts") or 0),
         "resume_prompt_attempts": int(payload.get("resume_prompt_attempts") or 0),
         "safe_action_attempts": _count_safe_actions(data),
@@ -234,7 +289,10 @@ def _decision(action: str, reason: str, context: dict[str, Any], *, confidence: 
         "context": context,
         "allowed_actions": [
             "continue_state_machine",
+            "type_continue_text",
+            "apply_ui_suggestion",
             "send_resume_prompt",
+            "wait_observe",
             "manual_required",
             "collect_trace",
         ],
@@ -253,6 +311,48 @@ def _wait_observations(context: dict[str, Any]) -> int:
 
 def _safe_action_attempts(context: dict[str, Any]) -> int:
     return max(int(context.get("continue_attempts") or 0), int(context.get("safe_action_attempts") or 0))
+
+
+def _should_type_continue_text(context: dict[str, Any]) -> bool:
+    reason = str(context.get("recovery_reason") or "")
+    state = str(context.get("diagnosis_state") or "")
+    suggested_action = str(context.get("suggested_action") or "")
+    suggested_recommended = str(context.get("suggested_recommended_action") or "")
+    if reason in {"manual_stopped", "generation_interrupted", "service_interrupted"}:
+        if state in {
+            "awaiting_run_confirmation",
+            "awaiting_confirm",
+            "awaiting_action",
+            "awaiting_continuation",
+            "awaiting_current_continuation",
+            "service_interrupted",
+        }:
+            return True
+        if suggested_action in {"run_button", "confirm_button", "continue_button", "continue"}:
+            return True
+        if suggested_recommended in {"click_run_button", "click_confirm_button", "click_continue_button", "type_continue"}:
+            return True
+    return False
+
+
+def _has_safe_ui_suggestion(context: dict[str, Any]) -> bool:
+    mode = str(context.get("suggested_mode") or "")
+    action = str(context.get("suggested_action") or "")
+    recommended = str(context.get("suggested_recommended_action") or "")
+    risk = str(context.get("suggested_risk") or "safe")
+    if not any((mode, action, recommended)):
+        return False
+    if _ui_suggestion_is_forbidden(context):
+        return False
+    return risk in {"", "safe"}
+
+
+def _ui_suggestion_is_forbidden(context: dict[str, Any]) -> bool:
+    values = {
+        str(context.get("suggested_action") or ""),
+        str(context.get("suggested_recommended_action") or "").replace("click_", ""),
+    }
+    return bool(values & FORBIDDEN_UI_ACTIONS)
 
 
 def _count_safe_actions(data: dict[str, Any]) -> int:
@@ -283,6 +383,8 @@ def _should_consult_llm(rule_decision: dict[str, Any]) -> bool:
     return any(
         [
             rule_decision.get("action") == "send_resume_prompt",
+            rule_decision.get("action") == "type_continue_text",
+            rule_decision.get("action") == "apply_ui_suggestion",
             context.get("resume_after_pause"),
             context.get("recovery_reason"),
             context.get("diagnosis_state"),
@@ -357,7 +459,7 @@ def _llm_context(
     payload = command.payload if isinstance(command.payload, dict) else {}
     return {
         "event": event,
-        "allowed_actions": ["continue_state_machine", "send_resume_prompt"],
+        "allowed_actions": sorted(FLOW_RECOVERY_ACTIONS),
         "rule_fallback_decision": _compact_decision(rule_decision),
         "flow_context": rule_decision.get("context") if isinstance(rule_decision.get("context"), dict) else {},
         "job": {
@@ -379,8 +481,14 @@ def _llm_context(
         },
         "worker_result_extra": _compact_value(extra, max_string=2500, max_items=80),
         "decision_contract": {
+            "type_continue_text_means": "type a short continuation instruction into the existing Trae chat; this is preferred for model-output interruption/manual_stopped states",
+            "apply_ui_suggestion_means": "execute the current safe UI diagnosis suggestion through Worker; forbidden if it would stop or cancel generation",
             "send_resume_prompt_means": "send a natural-language continuation prompt into the existing Trae task, with open_new_task=false",
+            "wait_observe_means": "continue observing only when Trae appears active or recently changed",
+            "collect_trace_means": "collect the assistant trace only after the current Trae turn is complete",
             "continue_state_machine_means": "let the existing deterministic wait/diagnose/click/trace logic keep running",
+            "manual_required_means": "stop automation and ask for human inspection",
+            "forbidden_ui_actions": sorted(FORBIDDEN_UI_ACTIONS),
             "unsupported_actions_are_invalid": True,
         },
     }
@@ -394,7 +502,7 @@ def _normalize_llm_decision(
     wire_api: str,
 ) -> dict[str, Any] | None:
     action = str(proposal.get("action") or "").strip()
-    if action not in {"continue_state_machine", "send_resume_prompt"}:
+    if action not in FLOW_RECOVERY_ACTIONS:
         return None
     confidence = _float(proposal.get("confidence"), 0.0)
     reason = str(proposal.get("reason") or "llm_flow_supervisor").strip()[:300]
@@ -414,10 +522,14 @@ def _can_accept_llm_decision(rule_decision: dict[str, Any], llm_decision: dict[s
         return False
     action = str(llm_decision.get("action") or "")
     confidence = _float(llm_decision.get("confidence"), 0.0)
+    if action not in FLOW_RECOVERY_ACTIONS:
+        return False
     if action == rule_decision.get("action"):
         return confidence >= 0.5
-    if rule_decision.get("action") == "continue_state_machine" and action == "send_resume_prompt":
+    if action in {"type_continue_text", "apply_ui_suggestion", "send_resume_prompt", "wait_observe", "manual_required"}:
         return confidence >= FLOW_SUPERVISOR_MIN_CONFIDENCE
+    if action == "collect_trace":
+        return confidence >= 0.85
     return False
 
 

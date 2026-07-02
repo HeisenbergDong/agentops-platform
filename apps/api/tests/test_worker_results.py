@@ -616,6 +616,32 @@ def test_resume_prompt_success_queues_short_wait_completion():
     assert wait.payload["resume_prompt_attempts"] == 1
 
 
+def test_continue_text_success_preserves_attempts_on_wait_completion():
+    db = _test_session()
+    job, round_, command = _create_send_prompt_rows(db)
+    command.payload = {
+        "prompt": "继续",
+        "resume_strategy": "flow_supervisor_continue_text",
+        "continue_text_attempts": 1,
+        "max_continue_text_attempts": 2,
+        "wait_timeout_seconds": worker_results.RESUME_PROMPT_WAIT_TIMEOUT_SECONDS,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(command_id=command.id, worker_id=command.worker_id, status="success", data={"sent_at_epoch": 123}),
+    )
+
+    wait = _latest_command(db, WorkerCommandType.WAIT_COMPLETION)
+
+    assert wait.payload["timeout_seconds"] == worker_results.RESUME_PROMPT_WAIT_TIMEOUT_SECONDS
+    assert wait.payload["resume_strategy"] == "flow_supervisor_continue_text"
+    assert wait.payload["continue_text_attempts"] == 1
+    assert wait.payload["max_continue_text_attempts"] == 2
+
+
 def test_resume_prompt_wait_timeout_sends_second_prompt_before_observation():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
@@ -745,7 +771,7 @@ def test_wait_completion_diagnosis_collects_trace_when_keep_changes_is_complete(
     assert manual_error is None
 
 
-def test_pause_resume_service_interruption_sends_resume_prompt_instead_of_click_loop():
+def test_pause_resume_service_interruption_types_continue_text_instead_of_click_loop():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
     job.scope_text = "原始范围"
@@ -786,14 +812,69 @@ def test_pause_resume_service_interruption_sends_resume_prompt_instead_of_click_
     assert round_.status == JobState.SENDING_TO_WORKER
     assert click is None
     assert send.payload["open_new_task"] is False
-    assert send.payload["resume_prompt_attempts"] == 1
-    assert send.payload["resume_strategy"] == "flow_supervisor_resume_prompt"
-    assert "本轮原始提示词" in send.payload["prompt"]
+    assert send.payload["continue_text_attempts"] == 1
+    assert send.payload["resume_strategy"] == "flow_supervisor_continue_text"
+    assert send.payload["prompt"].startswith("继续。")
     assert log is not None
-    assert log.extra["flow_supervisor_decision"]["action"] == "send_resume_prompt"
+    assert log.extra["flow_supervisor_decision"]["action"] == "type_continue_text"
 
 
-def test_wait_success_manual_stopped_then_run_confirmation_clicks_continue_instead_of_copying_trace():
+def test_pause_resume_manual_stopped_run_button_types_continue_text_instead_of_waiting():
+    db = _test_session()
+    job, round_, command = _create_wait_completion_rows(db)
+    command.command_type = WorkerCommandType.DIAGNOSE_UI.value
+    command.payload = {
+        "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+        "resume_after_stop": True,
+        "resume_strategy": "observe_then_decide",
+        "wait_observation_attempts": 9,
+        "max_wait_observation_attempts": 10,
+        "continue_attempts": 0,
+    }
+    db.commit()
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="success",
+            data={
+                "state": "awaiting_run_confirmation",
+                "reason": "high-risk command confirmation card with rightmost light action button",
+                "output_probe": {"complete_like": False, "reason": "manual_stopped"},
+                "suggested_intervention": {
+                    "mode": "click-point",
+                    "action": "run_button",
+                    "recommended_action": "click_run_button",
+                    "risk": "safe",
+                },
+            },
+        ),
+    )
+
+    db.refresh(job)
+    db.refresh(round_)
+    send = _latest_command(db, WorkerCommandType.SEND_PROMPT)
+    wait_commands = list(
+        db.scalars(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.WAIT_COMPLETION.value)).all()
+    )
+    click = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.CLICK_CONTINUE.value))
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "flow_supervisor_decision"))
+
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
+    assert send.payload["open_new_task"] is False
+    assert send.payload["continue_text_attempts"] == 1
+    assert send.payload["resume_strategy"] == "flow_supervisor_continue_text"
+    assert send.payload["prompt"].startswith("继续。")
+    assert wait_commands == []
+    assert click is None
+    assert log.extra["flow_supervisor_decision"]["action"] == "type_continue_text"
+
+
+def test_wait_success_manual_stopped_then_run_confirmation_types_continue_text_instead_of_copying_trace():
     db = _test_session()
     job, round_, command = _create_wait_completion_rows(db)
     command.payload = {"prompt": "demo prompt", "resume_after_pause": True}
@@ -838,14 +919,15 @@ def test_wait_success_manual_stopped_then_run_confirmation_clicks_continue_inste
     db.refresh(job)
     db.refresh(round_)
     copy_command = db.scalar(select(WorkerCommand).where(WorkerCommand.command_type == WorkerCommandType.COPY_LATEST_REPLY.value))
-    click = _latest_command(db, WorkerCommandType.CLICK_CONTINUE)
+    send = _latest_command(db, WorkerCommandType.SEND_PROMPT)
 
-    assert job.status == JobState.AWAITING_CONTINUE
-    assert round_.status == JobState.AWAITING_CONTINUE
+    assert job.status == JobState.SENDING_TO_WORKER
+    assert round_.status == JobState.SENDING_TO_WORKER
     assert copy_command is None
-    assert click.payload["continue_attempts"] == 1
-    assert click.payload["recovery_reason"] == "manual_stopped"
-    assert click.payload["prompt"] == "demo prompt"
+    assert send.payload["open_new_task"] is False
+    assert send.payload["continue_text_attempts"] == 1
+    assert send.payload["resume_strategy"] == "flow_supervisor_continue_text"
+    assert send.payload["prompt"].startswith("继续。")
 
 
 def test_wait_completion_diagnosis_uncertain_probes_trace_before_waiting_again():
