@@ -420,6 +420,86 @@ def test_diagnose_ui_prefers_llm_continue_over_local_run_button(monkeypatch: pyt
     assert result["suggested_intervention"] == {"mode": "continue-text", "action": "continue", "text": "\u7ee7\u7eed"}
 
 
+def test_diagnose_ui_prefers_ai_firewall_allow_over_local_run_button(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path,
+):
+    screenshot = tmp_path / "windows-firewall.png"
+    Image.new("RGB", (1920, 1032), (28, 29, 30)).save(screenshot)
+
+    class FakeWindow:
+        hwnd = 101
+
+        def window_text(self):
+            return "Trae CN"
+
+        def descendants(self, control_type):
+            return []
+
+    def fake_ui_analyst(path, context):
+        assert path == str(screenshot)
+        return {
+            "analysis": {
+                "status": "found",
+                "screen_state": "awaiting_confirm",
+                "recommended_action": "click_confirm_button",
+                "confidence": 0.96,
+                "risk": "safe",
+                "target": {
+                    "action": "confirm_button",
+                    "label": "\u5141\u8bb8",
+                    "center": {"x": 868, "y": 668},
+                    "ratio": {"x": 0.4525, "y": 0.645},
+                    "confidence": 0.96,
+                    "risk": "safe",
+                    "reason": "\u5141\u8bb8 server.exe \u7f51\u7edc\u8bbf\u95ee",
+                },
+                "evidence": [
+                    "Windows \u5b89\u5168\u4e2d\u5fc3 asks whether to allow public network access for server.exe",
+                ],
+            }
+        }
+
+    monkeypatch.setattr("worker.trae.diagnose.focus_trae", lambda timeout_seconds: {"status": "focused"})
+    monkeypatch.setattr("worker.trae.diagnose.find_trae_window", lambda timeout_seconds: FakeWindow())
+    monkeypatch.setattr("worker.trae.diagnose.scroll_assistant_to_bottom", lambda window: {"status": "scrolled"})
+    monkeypatch.setattr("worker.trae.diagnose.window_text_snapshot", lambda window, limit=500: "\u6700\u5c0f\u5316\n\u5173\u95ed")
+    monkeypatch.setattr(
+        "worker.trae.diagnose._window_rect",
+        lambda window: {"left": 0, "top": 0, "right": 1920, "bottom": 1032, "width": 1920, "height": 1032},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose.capture_screenshot",
+        lambda target, timeout_seconds, quality_required: {"status": "captured", "path": str(screenshot)},
+    )
+    monkeypatch.setattr(
+        "worker.trae.diagnose._local_visual_suggested_intervention",
+        lambda visual, window_rect: {
+            "state": "awaiting_run_confirmation",
+            "confidence": 0.86,
+            "reason": "local_run_button",
+            "suggested_intervention": {
+                "mode": "click-point",
+                "action": "run_button",
+                "x": 834,
+                "y": 449,
+                "button": "\u6267\u884c",
+                "source": "local_vision",
+                "risk": "safe",
+                "recommended_action": "click_run_button",
+            },
+        },
+    )
+
+    result = diagnose_ui(ui_analyst=fake_ui_analyst)
+
+    assert result["state"] == "awaiting_confirm"
+    assert result["suggested_intervention"]["action"] == "confirm_button"
+    assert result["suggested_intervention"]["x"] == 868
+    assert result["suggested_intervention"]["y"] == 668
+    assert result["suggested_intervention"]["source"] == "ai_vision"
+
+
 def test_diagnose_ui_detects_terminal_prompt(monkeypatch: pytest.MonkeyPatch):
     class FakeWindow:
         def window_text(self):

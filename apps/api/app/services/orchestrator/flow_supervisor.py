@@ -38,6 +38,35 @@ FORBIDDEN_UI_ACTIONS = {
     "cancel_generation",
     "cancel_generation_button",
 }
+FIREWALL_ALLOW_CONTEXT_MARKERS = (
+    "windows security",
+    "windows defender",
+    "defender firewall",
+    "firewall",
+    "\u9632\u706b\u5899",
+    "\u5b89\u5168\u4e2d\u5fc3",
+    "\u7f51\u7edc\u8bbf\u95ee",
+    "public network",
+    "private network",
+    "allow access",
+)
+FIREWALL_LOCAL_SERVICE_MARKERS = (
+    "server.exe",
+    "localhost",
+    "127.0.0.1",
+    "local development",
+    "local dev",
+    "\u672c\u5730",
+    "vite",
+    "node.exe",
+    "go.exe",
+)
+FIREWALL_ALLOW_LABEL_MARKERS = (
+    "allow",
+    "allow access",
+    "\u5141\u8bb8",
+    "\u5141\u8bb8\u8bbf\u95ee",
+)
 
 MAX_RESUME_PROMPT_ATTEMPTS = 2
 MAX_CONTINUE_TEXT_ATTEMPTS = 2
@@ -240,6 +269,9 @@ def _context(
     output_probe = data.get("output_probe") if isinstance(data.get("output_probe"), dict) else {}
     trace_probe = data.get("trace_probe") if isinstance(data.get("trace_probe"), dict) else {}
     suggested = data.get("suggested_intervention") if isinstance(data.get("suggested_intervention"), dict) else {}
+    visual = data.get("visual") if isinstance(data.get("visual"), dict) else {}
+    ai_analysis = visual.get("ai_analysis") if isinstance(visual.get("ai_analysis"), dict) else {}
+    visual_target = ai_analysis.get("target") if isinstance(ai_analysis.get("target"), dict) else {}
 
     reason = _first_reason(
         extra.get("recovery_reason"),
@@ -269,6 +301,14 @@ def _context(
         "suggested_recommended_action": str(suggested.get("recommended_action") or ""),
         "suggested_risk": str(suggested.get("risk") or ""),
         "suggested_manual_message": str(suggested.get("manual_message") or ""),
+        "visual_screen_state": str(ai_analysis.get("screen_state") or ""),
+        "visual_recommended_action": str(ai_analysis.get("recommended_action") or ""),
+        "visual_risk": str(ai_analysis.get("risk") or ""),
+        "visual_blocked_reason": str(ai_analysis.get("blocked_reason") or ""),
+        "visual_target_action": str(visual_target.get("action") or ""),
+        "visual_target_label": str(visual_target.get("label") or ""),
+        "visual_target_reason": str(visual_target.get("reason") or ""),
+        "visual_evidence": _string_list(ai_analysis.get("evidence"), limit=6),
         "continue_attempts": int(payload.get("continue_attempts") or 0),
         "continue_text_attempts": int(payload.get("continue_text_attempts") or 0),
         "wait_observation_attempts": int(payload.get("wait_observation_attempts") or 0),
@@ -524,6 +564,12 @@ def _can_accept_llm_decision(rule_decision: dict[str, Any], llm_decision: dict[s
     confidence = _float(llm_decision.get("confidence"), 0.0)
     if action not in FLOW_RECOVERY_ACTIONS:
         return False
+    if (
+        action == "manual_required"
+        and rule_decision.get("action") == "apply_ui_suggestion"
+        and _context_has_firewall_allow_confirmation(rule_decision)
+    ):
+        return False
     if action == rule_decision.get("action"):
         return confidence >= 0.5
     if action in {"type_continue_text", "apply_ui_suggestion", "send_resume_prompt", "wait_observe", "manual_required"}:
@@ -531,6 +577,44 @@ def _can_accept_llm_decision(rule_decision: dict[str, Any], llm_decision: dict[s
     if action == "collect_trace":
         return confidence >= 0.85
     return False
+
+
+def _context_has_firewall_allow_confirmation(rule_decision: dict[str, Any]) -> bool:
+    context = rule_decision.get("context") if isinstance(rule_decision.get("context"), dict) else {}
+    suggested_action = str(context.get("suggested_action") or "")
+    suggested_recommended = str(context.get("suggested_recommended_action") or "")
+    if suggested_action != "confirm_button" or suggested_recommended != "click_confirm_button":
+        return False
+    if str(context.get("suggested_risk") or "") not in {"", "safe"}:
+        return False
+    text = _normalized_text(
+        "\n".join(
+            [
+                str(context.get("visual_screen_state") or ""),
+                str(context.get("visual_recommended_action") or ""),
+                str(context.get("visual_risk") or ""),
+                str(context.get("visual_blocked_reason") or ""),
+                str(context.get("visual_target_action") or ""),
+                str(context.get("visual_target_label") or ""),
+                str(context.get("visual_target_reason") or ""),
+                *(str(item) for item in context.get("visual_evidence") or []),
+            ]
+        )
+    )
+    return (
+        _has_marker(text, FIREWALL_ALLOW_CONTEXT_MARKERS)
+        and _has_marker(text, FIREWALL_LOCAL_SERVICE_MARKERS)
+        and _has_marker(text, FIREWALL_ALLOW_LABEL_MARKERS)
+    )
+
+
+def _normalized_text(value: object) -> str:
+    return str(value or "").casefold().replace("/", "\\")
+
+
+def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
+    normalized = _normalized_text(text)
+    return any(_normalized_text(marker) in normalized for marker in markers)
 
 
 def _parse_json_object(text: str) -> dict[str, Any]:

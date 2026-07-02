@@ -29,6 +29,7 @@ When task context desired_action is send_button, the target must be the active g
 When task context desired_action is verify_prompt_submission, classify only whether the prompt submission succeeded. If the prompt text still appears in the composer or the active green send/up-arrow button is still visible beside a filled composer, return screen_state "prompt_still_in_composer", recommended_action "do_not_click", risk "blocked". If the composer button is a green stop/square while Trae is working, treat that as submitted/generating, not as an active send button. If no submitted user prompt or generation is visible, return screen_state "prompt_not_submitted". If the prompt has left the composer and Trae is generating or waiting for a safe follow-up action, return screen_state "prompt_submitted" or the more specific generating/awaiting_* state. Do not return click targets for this task.
 If Trae is asking whether to execute, continue, or keep/adopt/save changes, classify the prompt and return the exact visible safe button target when that is the correct next action.
 If Trae is asking whether to delete/remove something, classify it as awaiting_delete_confirmation/click_delete_button with risk safe. Keep discard/reset/cancel/clear prompts manual_required/do_not_click unless task context explicitly allows that destructive action.
+If Windows Security or Defender Firewall asks whether to allow network access for the current local development server, classify the Allow/允许 button as awaiting_confirm + click_confirm_button with risk "safe". Do not choose Cancel/Block.
 When task context asks for wait_completion_state, the screenshot is the source of truth for pending UI actions; do not treat visible confirmation cards as completion unless the prompt is already resolved.
 """.strip()
 
@@ -169,6 +170,35 @@ DESTRUCTIVE_CONFIRMATION_ACTIONS = {
     "reset_button": ("awaiting_discard_confirmation", "click_discard_button"),
     "cancel_button": ("awaiting_cancel_confirmation", "click_cancel_button"),
 }
+FIREWALL_ALLOW_CONTEXT_MARKERS = (
+    "windows security",
+    "windows defender",
+    "defender firewall",
+    "firewall",
+    "\u9632\u706b\u5899",
+    "\u5b89\u5168\u4e2d\u5fc3",
+    "\u7f51\u7edc\u8bbf\u95ee",
+    "public network",
+    "private network",
+    "allow access",
+)
+FIREWALL_LOCAL_SERVICE_MARKERS = (
+    "server.exe",
+    "localhost",
+    "127.0.0.1",
+    "local development",
+    "local dev",
+    "\u672c\u5730",
+    "vite",
+    "node.exe",
+    "go.exe",
+)
+FIREWALL_ALLOW_LABEL_MARKERS = (
+    "allow",
+    "allow access",
+    "\u5141\u8bb8",
+    "\u5141\u8bb8\u8bbf\u95ee",
+)
 
 
 def analyze_trae_ui(
@@ -264,6 +294,7 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
     if not risk:
         risk = _risk_from_target(target, targets)
     blocked_reason = str(data.get("blocked_reason") or "")
+    firewall_allow_target = _firewall_allow_confirmation_target(target, targets, data, context)
     if _should_force_delete_confirmation(screen_state, recommended_action, target, targets, data, context):
         screen_state = "awaiting_delete_confirmation"
         recommended_action = "click_delete_button"
@@ -274,7 +305,17 @@ def _normalize_analysis(data: dict[str, Any], context: dict[str, Any]) -> dict[s
         for item in targets:
             if str(item.get("action") or "") in {"delete_button", "remove_button"}:
                 item["risk"] = "safe"
-    if _should_block_destructive_analysis(screen_state, recommended_action, target, targets, data, context):
+    if firewall_allow_target:
+        screen_state = "awaiting_confirm"
+        recommended_action = "click_confirm_button"
+        risk = "safe"
+        blocked_reason = ""
+        target = {**firewall_allow_target, "action": "confirm_button", "risk": "safe"}
+        for item in targets:
+            if _is_firewall_allow_target(item):
+                item["action"] = "confirm_button"
+                item["risk"] = "safe"
+    elif _should_block_destructive_analysis(screen_state, recommended_action, target, targets, data, context):
         if screen_state == "completed":
             screen_state = "manual_required"
         risk = "blocked"
@@ -578,6 +619,70 @@ def _context_or_analysis_has_allowed_delete_confirmation(
     if any(marker in text for marker in confirmation_markers):
         return True
     return bool(target and str(target.get("action") or "") in {"delete_button", "remove_button"})
+
+
+def _firewall_allow_confirmation_target(
+    target: dict,
+    targets: list[dict],
+    data: dict[str, Any],
+    context: dict[str, Any],
+) -> dict:
+    candidates = [item for item in ([target] if target else []) + targets if isinstance(item, dict)]
+    text = _analysis_text_blob(context, data, candidates)
+    if not _has_marker(text, FIREWALL_ALLOW_CONTEXT_MARKERS):
+        return {}
+    if not _has_marker(text, FIREWALL_LOCAL_SERVICE_MARKERS):
+        return {}
+    safe_candidates = [item for item in candidates if str(item.get("risk") or "") == "safe"]
+    for item in safe_candidates + candidates:
+        if _is_firewall_allow_target(item):
+            return dict(item)
+    return {}
+
+
+def _is_firewall_allow_target(target: dict) -> bool:
+    if not isinstance(target, dict):
+        return False
+    action = str(target.get("action") or "")
+    if action not in {"confirm_button", "run_button"}:
+        return False
+    text = _normalized_text(
+        "\n".join(
+            str(target.get(key) or "")
+            for key in ("label", "name", "reason", "button", "action")
+        )
+    )
+    return _has_marker(text, FIREWALL_ALLOW_LABEL_MARKERS)
+
+
+def _analysis_text_blob(context: dict[str, Any], data: dict[str, Any], targets: list[dict]) -> str:
+    text_parts = [
+        str(data.get("reason") or ""),
+        str(data.get("blocked_reason") or ""),
+        str(data.get("screen_state") or ""),
+        str(data.get("recommended_action") or ""),
+        str(context.get("visible_text_sample") or ""),
+    ]
+    evidence = data.get("evidence") if isinstance(data.get("evidence"), list) else []
+    text_parts.extend(str(item) for item in evidence)
+    buttons = context.get("uia_buttons")
+    if isinstance(buttons, list):
+        for item in buttons:
+            if isinstance(item, dict):
+                text_parts.extend(str(item.get(key) or "") for key in ("name", "label", "action", "reason"))
+    for item in targets:
+        if isinstance(item, dict):
+            text_parts.extend(str(item.get(key) or "") for key in ("action", "label", "name", "reason", "button"))
+    return _normalized_text("\n".join(text_parts))
+
+
+def _normalized_text(text: str) -> str:
+    return str(text or "").casefold().replace("/", "\\")
+
+
+def _has_marker(text: str, markers: tuple[str, ...]) -> bool:
+    normalized = _normalized_text(text)
+    return any(_normalized_text(marker) in normalized for marker in markers)
 
 
 def _target_in_list(target: dict, targets: list[dict]) -> bool:

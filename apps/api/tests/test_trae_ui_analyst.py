@@ -181,6 +181,57 @@ def test_trae_ui_analyst_blocks_target_when_llm_marks_blocked():
     assert result["recommended_action"] == "do_not_click"
 
 
+def test_trae_ui_analyst_allows_windows_firewall_for_local_server():
+    data = {
+        "status": "found",
+        "screen_state": "awaiting_confirm",
+        "recommended_action": "do_not_click",
+        "confidence": 0.96,
+        "risk": "blocked",
+        "blocked_reason": "destructive_action_requires_manual_confirmation",
+        "target": {
+            "action": "confirm_button",
+            "label": "\u5141\u8bb8",
+            "center": {"x": 868, "y": 668},
+            "confidence": 0.96,
+            "risk": "blocked",
+        },
+        "targets": [
+            {
+                "action": "confirm_button",
+                "label": "\u5141\u8bb8",
+                "center": {"x": 868, "y": 668},
+                "confidence": 0.96,
+                "risk": "safe",
+                "reason": "\u5141\u8bb8 server.exe \u7f51\u7edc\u8bbf\u95ee\u4ee5\u7ee7\u7eed\u672c\u5730 Web \u5e94\u7528\u9884\u89c8",
+            },
+            {
+                "action": "cancel_button",
+                "label": "\u53d6\u6d88",
+                "center": {"x": 1066, "y": 668},
+                "confidence": 0.94,
+                "risk": "blocked",
+            },
+        ],
+        "evidence": [
+            "Windows \u5b89\u5168\u4e2d\u5fc3\u5f39\u7a97\u8be2\u95ee\u662f\u5426\u5141\u8bb8\u516c\u5171\u7f51\u7edc\u8bbf\u95ee server.exe",
+            "The app is a localhost development preview.",
+        ],
+    }
+
+    result = trae_ui_analyst._normalize_analysis(
+        data,
+        {"task": "wait_completion_state", "window": {"bounds": {"left": 0, "top": 0, "width": 1920, "height": 1032}}},
+    )
+
+    assert result["screen_state"] == "awaiting_confirm"
+    assert result["recommended_action"] == "click_confirm_button"
+    assert result["risk"] == "safe"
+    assert result["blocked_reason"] == ""
+    assert result["target"]["label"] == "\u5141\u8bb8"
+    assert result["target"]["risk"] == "safe"
+
+
 def test_trae_ui_analyst_normalizes_inner_panel_scroll_action():
     data = {
         "status": "partial",

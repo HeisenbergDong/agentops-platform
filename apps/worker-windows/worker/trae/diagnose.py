@@ -219,16 +219,16 @@ def diagnose_ui(
         confidence = float(visual_suggested.get("confidence") or 0.82)
         suggested = visual_suggested["suggested_intervention"]
         reason = str(visual_suggested.get("reason") or "ai_visual_type_continue")
-    elif local_visual_suggested:
-        state = str(local_visual_suggested.get("state") or "awaiting_local_visual_action")
-        confidence = float(local_visual_suggested.get("confidence") or 0.0)
-        suggested = local_visual_suggested["suggested_intervention"]
-        reason = str(local_visual_suggested.get("reason") or "local_visual_action_target")
     elif _is_direct_visual_action(visual_suggested):
         state = str(visual_suggested.get("state") or "awaiting_visual_action")
         confidence = float(visual_suggested.get("confidence") or 0.0)
         suggested = visual_suggested["suggested_intervention"]
         reason = str(visual_suggested.get("reason") or "ai_visual_action_target")
+    elif local_visual_suggested:
+        state = str(local_visual_suggested.get("state") or "awaiting_local_visual_action")
+        confidence = float(local_visual_suggested.get("confidence") or 0.0)
+        suggested = local_visual_suggested["suggested_intervention"]
+        reason = str(local_visual_suggested.get("reason") or "local_visual_action_target")
     elif collapsed_confirm_card := _collapsed_confirm_card_intervention(text, buttons, matches, window_rect, window):
         state = "awaiting_collapsed_confirm_card"
         confidence = float(collapsed_confirm_card.get("confidence") or 0.86)
@@ -818,6 +818,7 @@ def _visual_diagnosis_context(
             "If the confirmation card is collapsed and only the \u786e\u8ba4\u6267\u884c header is visible, return recommended_action=expand_confirm_card with the header target.",
             "If only part of the action card is visible below the viewport, return recommended_action=scroll_inner_panel instead of completed.",
             "Safe click actions are explicit run/continue/keep/save buttons and explicit Trae delete confirmations.",
+            "Windows Security or Defender Firewall Allow/允许 buttons for local development servers are safe confirm actions.",
         ],
         "required_json_shape": {
             "status": "found|partial|not_found",
@@ -855,6 +856,7 @@ def _visual_task_instructions(task: str) -> str:
         "Treat waiting-for-user-action cards as blockers, not completion evidence. "
         "If a visible confirmation card asks whether Trae can delete/remove something, return the delete button target with risk=safe. Keep discard/reset/cancel/clear prompts blocked unless explicitly safe. "
         "If a safe confirmation card asks to execute, continue, or keep/save changes, return the exact visible button target. "
+        "If Windows Security or Defender Firewall asks to allow network access for the current local development server, return the Allow/允许 button as click_confirm_button with risk=safe. "
         "If a \u786e\u8ba4\u6267\u884c confirmation card is collapsed and the execute button is hidden, target the card header with recommended_action=expand_confirm_card. "
         "Return JSON only."
     )
