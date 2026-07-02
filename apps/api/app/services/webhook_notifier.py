@@ -28,20 +28,7 @@ def notify_manual_required(
 
     text = _manual_required_text(job_id=job_id, round_id=round_id, message=message, details=details)
     payload = _webhook_payload(url, text)
-    secret = safe_open_secret(webhook_config.get("secret"))
-    if secret and not _is_flow_webhook(url):
-        timestamp = str(int(time.time()))
-        payload["timestamp"] = timestamp
-        payload["sign"] = _feishu_sign(secret, timestamp)
-
-    try:
-        response = httpx.post(url, json=payload, timeout=6)
-    except httpx.HTTPError as exc:
-        raise WebhookNotifyError(f"Webhook notification failed: {exc.__class__.__name__}") from exc
-
-    if response.status_code >= 400:
-        raise WebhookNotifyError(f"Webhook notification failed with status {response.status_code}: {response.text[:200]}")
-    return {"status": "sent", "http_status": response.status_code}
+    return _post_webhook(webhook_config, url, payload)
 
 
 def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
@@ -49,6 +36,10 @@ def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
     if not url:
         return {"status": "skipped", "reason": "missing_webhook_url"}
     payload = _webhook_payload(url, str(text or "").strip())
+    return _post_webhook(webhook_config, url, payload)
+
+
+def _post_webhook(webhook_config: dict[str, Any], url: str, payload: dict[str, Any]) -> dict[str, Any]:
     secret = safe_open_secret(webhook_config.get("secret"))
     if secret and not _is_flow_webhook(url):
         timestamp = str(int(time.time()))
@@ -60,7 +51,21 @@ def notify_text(webhook_config: dict[str, Any], text: str) -> dict[str, Any]:
         raise WebhookNotifyError(f"Webhook notification failed: {exc.__class__.__name__}") from exc
     if response.status_code >= 400:
         raise WebhookNotifyError(f"Webhook notification failed with status {response.status_code}: {response.text[:200]}")
-    return {"status": "sent", "http_status": response.status_code, "method": "flow_webhook" if _is_flow_webhook(url) else "webhook"}
+    response_payload = _response_payload(response)
+    _raise_for_webhook_business_error(response_payload, response.text)
+    result: dict[str, Any] = {"status": "sent", "http_status": response.status_code, "method": _webhook_method(url)}
+    if isinstance(response_payload, dict):
+        code = _response_code(response_payload)
+        message = _response_message(response_payload)
+        if code is not None:
+            result["response_code"] = code
+        if message:
+            result["response_message"] = str(message)[:300]
+    return result
+
+
+def _webhook_method(url: str) -> str:
+    return "flow_webhook" if _is_flow_webhook(url) else "webhook"
 
 
 def _is_flow_webhook(url: str) -> bool:
@@ -71,7 +76,52 @@ def _webhook_payload(url: str, text: str) -> dict[str, Any]:
     if not _is_flow_webhook(url):
         return {"msg_type": "text", "content": {"text": text}}
     title, reason = _split_title_reason(text)
-    return {"title": title, "reason": reason}
+    return {"title": title, "reason": reason, "text": text[:4000]}
+
+
+def _response_payload(response: httpx.Response) -> Any:
+    try:
+        return response.json()
+    except (AttributeError, TypeError, ValueError):
+        return None
+
+
+def _raise_for_webhook_business_error(response_payload: Any, response_text: str) -> None:
+    if not isinstance(response_payload, dict):
+        return
+    code = _response_code(response_payload)
+    if code is not None and not _is_success_code(code):
+        message = _response_message(response_payload)
+        raise WebhookNotifyError(
+            f"Webhook notification returned business error code={code}, message={message or '-'}, body={response_text[:300]}"
+        )
+    if response_payload.get("success") is False:
+        message = _response_message(response_payload)
+        raise WebhookNotifyError(f"Webhook notification returned success=false, message={message or '-'}, body={response_text[:300]}")
+
+
+def _response_code(response_payload: dict[str, Any]) -> Any:
+    for key in ("code", "StatusCode", "errcode"):
+        if key in response_payload:
+            return response_payload.get(key)
+    return None
+
+
+def _response_message(response_payload: dict[str, Any]) -> Any:
+    for key in ("msg", "message", "StatusMessage", "errmsg", "error"):
+        value = response_payload.get(key)
+        if value not in (None, ""):
+            return value
+    return ""
+
+
+def _is_success_code(code: Any) -> bool:
+    if isinstance(code, bool):
+        return code is False
+    try:
+        return int(code) == 0
+    except (TypeError, ValueError):
+        return str(code).strip().lower() in {"0", "ok", "success"}
 
 
 def _split_title_reason(text: str) -> tuple[str, str]:

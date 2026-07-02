@@ -3757,6 +3757,43 @@ def test_manual_required_sends_webhook_notification(monkeypatch):
     assert log.level == "info"
 
 
+def test_manual_required_webhook_business_error_logs_failure(monkeypatch):
+    db = _test_session()
+    job, _round, command = _create_capture_screenshot_rows(db)
+    db.add(UserConfig(user_id=job.user_id, category="webhook", data={"url": "https://open.feishu.cn/open-apis/bot/v2/hook/test"}))
+    db.commit()
+
+    def fake_post(url, json, timeout):
+        class Response:
+            status_code = 200
+            text = '{"code":19024,"msg":"sign match fail"}'
+
+            def json(self):
+                return {"code": 19024, "msg": "sign match fail"}
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    handle_worker_result(
+        db,
+        command,
+        WorkerResult(
+            command_id=command.id,
+            worker_id=command.worker_id,
+            status="failed",
+            error="Trae screenshot failed",
+            data={"quality": {"ok": False}},
+        ),
+    )
+
+    log = db.scalar(select(RuntimeLog).where(RuntimeLog.stage == "manual_required_notification"))
+    assert log is not None
+    assert log.level == "warning"
+    assert log.message == "Manual-required webhook notification failed."
+    assert "business error code=19024" in log.extra["error"]
+
+
 def test_flow_webhook_uses_title_reason_payload(monkeypatch):
     sent = {}
 
@@ -3778,7 +3815,28 @@ def test_flow_webhook_uses_title_reason_payload(monkeypatch):
     )
 
     assert result["method"] == "flow_webhook"
-    assert sent["json"] == {"title": "AgentOps 飞书写入失败，需要处理", "reason": "原因: HTTP 403"}
+    assert sent["json"] == {
+        "title": "AgentOps 飞书写入失败，需要处理",
+        "reason": "原因: HTTP 403",
+        "text": "AgentOps 飞书写入失败，需要处理\n原因: HTTP 403",
+    }
+
+
+def test_webhook_business_error_raises_even_with_http_200(monkeypatch):
+    def fake_post(url, json, timeout):
+        class Response:
+            status_code = 200
+            text = '{"code":19024,"msg":"sign match fail"}'
+
+            def json(self):
+                return {"code": 19024, "msg": "sign match fail"}
+
+        return Response()
+
+    monkeypatch.setattr(webhook_notifier.httpx, "post", fake_post)
+
+    with pytest.raises(webhook_notifier.WebhookNotifyError, match="business error code=19024"):
+        webhook_notifier.notify_text({"url": "https://open.feishu.cn/open-apis/bot/v2/hook/test"}, "AgentOps test")
 
 
 def test_feishu_failure_sends_flow_webhook_notification(monkeypatch, tmp_path):
