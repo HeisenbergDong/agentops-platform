@@ -47,6 +47,17 @@ router = APIRouter()
 RETRYABLE_COMMAND_STATES = {"failed", "manual_required", "cancelled"}
 RESUMABLE_COMMAND_STATES = RETRYABLE_COMMAND_STATES | {"completed"}
 ACTIVE_WORKER_COMMAND_STATES = {"queued", "claimed", "running"}
+CONTINUE_RESUME_JOB_STATES = {
+    JobState.PAUSED,
+    JobState.MANUAL_REQUIRED,
+    JobState.TRACE_MISSING_ABORT,
+}
+CONTINUE_OBSERVE_COMMAND_TYPES = {
+    WorkerCommandType.SEND_PROMPT.value,
+    WorkerCommandType.WAIT_COMPLETION.value,
+    WorkerCommandType.CLICK_CONTINUE.value,
+    WorkerCommandType.COPY_LATEST_REPLY.value,
+}
 RETRY_STAGE_BY_COMMAND_TYPE = {
     WorkerCommandType.SEND_PROMPT.value: JobState.SENDING_TO_WORKER,
     WorkerCommandType.WAIT_COMPLETION.value: JobState.WAITING_TRAE,
@@ -338,16 +349,17 @@ def continue_job(
     round_ = latest_round(db, job.id)
     if job.status == JobState.STOPPED:
         return {"status": "no_job", "message": "Stopped jobs cannot be continued; start a new job."}
-    if job.status == JobState.PAUSED:
-        active_command = latest_active_worker_command(db, job.id, round_.id if round_ else None)
+    round_id = round_.id if round_ else None
+    if job.status in CONTINUE_RESUME_JOB_STATES:
+        active_command = latest_active_worker_command(db, job.id, round_id)
         if active_command:
             raise HTTPException(
                 status_code=400,
                 detail=f"Worker command is still active: {active_command.command_type} / {active_command.status}",
             )
-        previous = latest_resumable_worker_command(db, job.id, round_.id if round_ else None)
+        previous = latest_continue_resume_worker_command(db, job.id, round_id)
         if previous:
-            stop_command = latest_stop_worker_command(db, job.id, round_.id if round_ else None)
+            stop_command = latest_stop_worker_command(db, job.id, round_id)
             _queue_resume_observation(db, user, job, round_, previous, stop_command)
             db.commit()
             db.refresh(job)
@@ -751,6 +763,79 @@ def latest_resumable_worker_command(db: Session, job_id: str, round_id: str | No
         if _command_has_stop_report(command):
             return command
     return None
+
+
+def latest_continue_resume_worker_command(db: Session, job_id: str, round_id: str | None) -> WorkerCommand | None:
+    query = select(WorkerCommand).where(WorkerCommand.job_id == job_id)
+    if round_id:
+        query = query.where(WorkerCommand.round_id == round_id)
+    commands = list(db.scalars(query.order_by(WorkerCommand.created_at.desc()).limit(30)).all())
+    for command in commands:
+        source = _continue_resume_source_command(db, command, job_id, round_id)
+        if source:
+            return source
+    return latest_resumable_worker_command(db, job_id, round_id)
+
+
+def _continue_resume_source_command(
+    db: Session,
+    command: WorkerCommand,
+    job_id: str,
+    round_id: str | None,
+) -> WorkerCommand | None:
+    if command.command_type == WorkerCommandType.STOP_CURRENT_TASK.value:
+        return None
+    if command.command_type == WorkerCommandType.DIAGNOSE_UI.value:
+        return _diagnose_source_command(db, command, job_id, round_id)
+    if command.command_type not in CONTINUE_OBSERVE_COMMAND_TYPES:
+        return None
+    if command.status in RETRYABLE_COMMAND_STATES:
+        return command
+    if command.status == "completed":
+        return command
+    return None
+
+
+def _diagnose_source_command(
+    db: Session,
+    command: WorkerCommand,
+    job_id: str,
+    round_id: str | None,
+) -> WorkerCommand | None:
+    payload = command.payload if isinstance(command.payload, dict) else {}
+    previous_type = str(payload.get("previous_command_type") or "").strip()
+    if previous_type not in CONTINUE_OBSERVE_COMMAND_TYPES:
+        return None
+    retry_of = str(payload.get("retry_of_command_id") or "").strip()
+    if retry_of:
+        source = db.get(WorkerCommand, retry_of)
+        if _is_resume_source_match(source, job_id, round_id, previous_type):
+            return source
+    query = select(WorkerCommand).where(
+        WorkerCommand.job_id == job_id,
+        WorkerCommand.command_type == previous_type,
+    )
+    if command.created_at:
+        query = query.where(WorkerCommand.created_at <= command.created_at)
+    if round_id:
+        query = query.where(WorkerCommand.round_id == round_id)
+    source = db.scalar(query.order_by(WorkerCommand.created_at.desc()).limit(1))
+    return source if _is_resume_source_match(source, job_id, round_id, previous_type) else None
+
+
+def _is_resume_source_match(
+    command: WorkerCommand | None,
+    job_id: str,
+    round_id: str | None,
+    command_type: str,
+) -> bool:
+    if not command:
+        return False
+    if command.job_id != job_id or command.command_type != command_type:
+        return False
+    if round_id and command.round_id != round_id:
+        return False
+    return command.status in RESUMABLE_COMMAND_STATES
 
 
 def _command_has_stop_report(command: WorkerCommand | None) -> bool:

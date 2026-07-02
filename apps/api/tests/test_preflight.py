@@ -1081,6 +1081,82 @@ def test_continue_paused_job_requeues_cancelled_worker_command():
     assert round_.status == JobState.WAITING_TRAE
 
 
+def test_continue_manual_required_with_worker_history_diagnoses_instead_of_resending_prompt():
+    db = _test_session()
+    user = _create_user(db, "user1")
+    _create_worker(db, user.id)
+    _save_required_settings(db, user.id, browser_url="http://localhost:5173", workspace_path="D:/mr-d")
+    job = Job(id="job1", user_id=user.id, status=JobState.MANUAL_REQUIRED, directions=["demo"], scope_text="demo")
+    project = Project(
+        id="project1",
+        job_id=job.id,
+        name="demo-project",
+        direction="demo",
+        workspace_path="D:/mr-d/demo-project",
+    )
+    round_ = TaskRound(
+        id="round1",
+        job_id=job.id,
+        project_id=project.id,
+        round_index=1,
+        status=JobState.MANUAL_REQUIRED,
+        prompt="demo prompt",
+    )
+    wait_command = WorkerCommand(
+        id="wait1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.WAIT_COMPLETION.value,
+        payload={"workspace_path": "D:/old/demo", "prompt": "demo prompt"},
+        status="completed",
+        created_at=now_utc() - timedelta(minutes=2),
+    )
+    diagnose_command = WorkerCommand(
+        id="diag1",
+        worker_id="worker1",
+        user_id=user.id,
+        job_id=job.id,
+        round_id=round_.id,
+        command_type=WorkerCommandType.DIAGNOSE_UI.value,
+        payload={
+            "previous_command_type": WorkerCommandType.WAIT_COMPLETION.value,
+            "retry_of_command_id": wait_command.id,
+            "workspace_path": "D:/old/demo",
+            "prompt": "demo prompt",
+        },
+        status="completed",
+        created_at=now_utc() - timedelta(minutes=1),
+    )
+    db.add_all([job, project, round_, wait_command, diagnose_command])
+    db.commit()
+
+    result = jobs_api.continue_job(user=user, db=db)
+
+    new_command = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.id.notin_([wait_command.id, diagnose_command.id]))
+        .order_by(WorkerCommand.created_at.desc())
+        .limit(1)
+    )
+    send_prompt = db.scalar(
+        select(WorkerCommand)
+        .where(WorkerCommand.command_type == WorkerCommandType.SEND_PROMPT.value)
+        .limit(1)
+    )
+    assert result["job"]["status"] == JobState.WAITING_TRAE
+    assert new_command is not None
+    assert new_command.command_type == WorkerCommandType.DIAGNOSE_UI.value
+    assert new_command.payload["retry_of_command_id"] == wait_command.id
+    assert new_command.payload["previous_command_type"] == WorkerCommandType.WAIT_COMPLETION.value
+    assert new_command.payload["resume_strategy"] == "observe_then_decide"
+    assert new_command.payload["workspace_path"] == "D:/mr-d/demo-project"
+    assert send_prompt is None
+    db.refresh(round_)
+    assert round_.status == JobState.WAITING_TRAE
+
+
 def test_continue_after_trae_stop_queues_resume_prompt_before_wait():
     db = _test_session()
     user = _create_user(db, "user1")
